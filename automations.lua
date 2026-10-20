@@ -38,6 +38,7 @@ local RUN_BUDGET = 12 * 1024
 local PAGE_BUDGET = 40 * 1024
 local MAX_NAME, MAX_TEXT, MAX_ERROR, MAX_SUMMARY = 60, 256, 512, 2000
 local MAX_INSTRUCTION, MAX_INSTRUCTION_ENCODED, MAX_ARGS_ENCODED = 4000, 8 * 1024, 512
+local MAX_TITLE_CHARS = 60
 
 local function size(v) return #rex.json.encode(v) end
 
@@ -211,7 +212,13 @@ local function check_action(a)
   if next(args) and size(args) > MAX_ARGS_ENCODED then fail('invalid_input', 'action.args is over ' .. MAX_ARGS_ENCODED .. ' bytes encoded') end
   local out = {profile = profile_id}
   if next(args) then out.args = args end
-  if a.title ~= nil and a.title ~= '' then out.title = text_arg(a.title, 'action.title', MAX_TEXT) end
+  if a.title ~= nil and a.title ~= '' then
+    out.title = text_arg(a.title, 'action.title', MAX_TEXT)
+    -- hub.spawn allows at most 60 characters (Unicode characters; hub workers.go at 06b22ca).
+    -- Save checks it, so the first start cannot fail on it (review of 3b2cba7, R2).
+    local _, chars = out.title:gsub('[^\128-\191]', '')
+    if chars > MAX_TITLE_CHARS then fail('invalid_input', 'action.title is at most ' .. MAX_TITLE_CHARS .. ' characters') end
+  end
   return out
 end
 
@@ -726,7 +733,7 @@ local agent_handlers = {
 local key_arg = {type = 'string', minLength = 1, maxLength = 128, description = 'Your operation key. Retry with the same key and content after an unknown outcome.'}
 local exports = {
   {name = 'automations.save', title = 'Create or change an automation',
-    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "daily", at = "HH:MM"} (local time). action: {profile (an agent profile from hub.profiles), args?, title?}. instruction: the task text for the agent. A run goes to the automation\'s worker if it runs, else the hub starts one from the profile.',
+    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "daily", at = "HH:MM"} (local time). action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters)}. instruction: the task text for the agent. A run goes to the automation\'s worker if it runs, else the hub starts one from the profile.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, if_rev = {type = 'string', minLength = 1},
       key = key_arg, name = {type = 'string', minLength = 1, maxLength = MAX_NAME}, enabled = {type = 'boolean'},
       trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION}},

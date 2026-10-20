@@ -65,6 +65,8 @@ cd ../../Automations && lazyrex-hub test
 - deliver.lua: a daily tick starts one worker, which reads and completes its task; a second run
   goes to the running worker; a lost `hub.spawn` reply starts one worker; `done` from another agent
   or for another attempt is refused.
+- save.lua: save checks the action against the hub contract (a tab title of at most 60
+  characters) and stores nothing when it refuses.
 - worker.lua: a failed observation (a hub call that fails) keeps the running worker, and the step
   tries again; a stopped worker is replaced.
 
