@@ -94,7 +94,8 @@ minute and never reads `isdst`.
 
 The exports are agent tools: `automations.save`, `automations.list`, `automations.run`,
 `automations.set_enabled`, `automations.delete`, `automations.retry`, `automations.cancel_run`,
-`automations.dismiss_start`, `automations.runs`, `automations.read` and `automations.done`. Each
+`automations.dismiss_start`, `automations.runs`, `automations.read` and `automations.done`. A list
+ page can be empty and still have `next`: follow `next` until it is absent. Each
 mutation takes `key`: a retry with the same key and content gives the same result; the same key
 with other content is a conflict.
 
@@ -123,6 +124,8 @@ cd ../../Automations && lazyrex-hub test
   listed and refuses changes; retry after a start failure (new spawn key) and an agent failure
   (attempt 2); disable keeps admitted runs and refuses run and retry; cancel of a queued run does
   not block the next run; `unknown_start` after 10 minutes, and dismiss lets the next run start.
+- list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
+  a page limited by bytes skips no automation.
 - reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
   worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
   reads its task; a hub crash after the loss moves the task once.

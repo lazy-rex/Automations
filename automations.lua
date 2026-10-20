@@ -1075,11 +1075,14 @@ local function watch_view(id, w)
 end
 
 local function list(_, args)
-  only(args, {after = true})
+  only(args, {after = true, limit = true})
   if args.after ~= nil then text_arg(args.after, 'after', 64) end
-  -- next is the last key in the page: scan's after is exclusive.
+  local limit = args.limit or 50
+  if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit is an integer from 1 to 50') end
+  -- next is the last key that the page consumed, also a deleted one: scan's after is exclusive.
+  -- A visible record that does not fit is not consumed, so the next page starts with it.
   local out, used, next_after, last = {}, 64, nil, args.after
-  local keys, records, more = scan('auto/', args.after, 50)
+  local keys, records, more = scan('auto/', args.after, limit)
   local listed = {}
   for _, w in ipairs(hub('hub.watch.list').watches or {}) do listed[w.key] = w end
   for _, key in ipairs(keys) do
@@ -1093,14 +1096,14 @@ local function list(_, args)
       if auto.trigger.kind == 'file' and auto.enabled then view.watch = watch_view(auto.id, listed[watch_key(auto.id, st.gen)]) end
       local n = size(view) + 1
       if used + n > PAGE_BUDGET then
-        if #out == 0 then fail('too_large', 'Automation ' .. auto.id .. ' is too large to list; use after = "' .. key .. '"') end
+        if last == args.after then fail('too_large', 'Automation ' .. auto.id .. ' is too large to list; use after = "' .. key .. '"') end
         next_after = last
         break
       end
       out[#out + 1] = view
       used = used + n
-      last = key
     end
+    last = key
   end
   if not next_after and type(more) == 'string' and more ~= '' then next_after = last end
   return {automations = out, next = next_after}
@@ -1440,8 +1443,8 @@ local exports = {
       trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION}},
       required = {'key', 'name', 'trigger', 'action', 'instruction'}, additionalProperties = false}},
   {name = 'automations.list', title = 'List automations',
-    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, worker, spawning and daily_high; for an enabled file automation, watch {state, error?, hint?} (state from the hub, refused with code, or pending). When more exist, next is set: pass it as after.',
-    args = {type = 'object', properties = {after = {type = 'string', minLength = 1}}, additionalProperties = false}},
+    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, worker, spawning and daily_high; for an enabled file automation, watch {state, error?, hint?} (state from the hub, refused with code, or pending). A deleted automation is not listed. Pages: limit (default 50, at most 50) and about 40 KB. When more exist, next is set: pass it as after. A page can be empty and still have next.',
+    args = {type = 'object', properties = {after = {type = 'string', minLength = 1}, limit = {type = 'integer', minimum = 1, maximum = 50}}, additionalProperties = false}},
   {name = 'automations.run', title = 'Run an automation now',
     description = 'Make a manual run of an enabled automation. It does not change the daily schedule. A disabled automation is refused.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
