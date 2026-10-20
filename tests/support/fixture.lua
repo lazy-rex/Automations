@@ -14,15 +14,17 @@ return function(H)
   -- The worker profile starts lazyrex-hub testagent in the spawned pane. It joins as the spawn's
   -- agent ID (LAZYREX_AGENT, set by the hub), and its client label names that ID, so a test can
   -- call as the worker. Profile commands are trusted test code (docs/testing.md, "Isolation").
-  function F.profiles()
-    H.write_profiles({profiles = {
+  -- profile_list is the base list; a test can add profiles to it and write it.
+  function F.profile_list()
+    return {
       {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c',
         'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin}},
       {id = 'tasked', name = 'Tasked', kind = 'agent', args = {{name = 'task', label = 'Task', required = true}},
         command = {'/bin/sh', '-c', 'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin, '${task}'}},
       {id = 'logtail', name = 'Log tail', kind = 'accessory', command = {'/bin/sh', '-c', 'exec tail -f /dev/null'}},
-    }})
+    }
   end
+  function F.profiles() H.write_profiles({profiles = F.profile_list()}) end
 
   function F.workers(profile)
     local out = {}
@@ -101,6 +103,51 @@ return function(H)
       return #runs >= n and runs
     end, timeout or 20)
   end
+
+  -- --- Views: the panel and the forms, through the hub's view path (H.user) ---
+
+  function F.items(tree, id)
+    local n = H.node(tree, id)
+    return n and n.items or {}
+  end
+  function F.item(tree, list, id)
+    for _, item in ipairs(F.items(tree, list)) do if item.id == id then return item end end
+  end
+  -- field returns a form field of a tree.
+  function F.field(tree, form, id)
+    local n = H.node(tree, form)
+    for _, f in ipairs(n and n.fields or {}) do if f.id == id then return f end end
+  end
+  -- ok checks that a view operation succeeded and that its effects ran; it returns the result.
+  function F.ok(op)
+    if op.status ~= 'succeeded' or op.effects == 'failed' then error('the view action failed: ' .. rex.json.encode(op), 2) end
+    return op.result or {}
+  end
+  -- view opens the view of a route that an effect opened, and renders it once (a render sets the
+  -- revision that an action sends).
+  function F.view_of(route)
+    local v = H.user:view(route)
+    return v, v:render()
+  end
+  function F.panel()
+    H.user:command('automations')
+    return F.view_of('/panels/automations')
+  end
+  -- open opens the view of one automation from the panel. It follows the panel pages until the
+  -- panel lists the automation.
+  function F.open(id)
+    local p, tree = F.panel()
+    for _ = 1, 20 do
+      if F.item(tree, 'automations', id) then
+        return F.view_of(F.ok(p:action('automations', 'open', {item_id = id})).form)
+      end
+      if not H.node(tree, 'next_page') then error('the panel does not list automation ' .. id, 2) end
+      p, tree = F.view_of(F.ok(p:action('next_page', 'next')).panel.route)
+    end
+    error('the panel has too many pages', 2)
+  end
+  -- size is the encoded size of a tree.
+  function F.size(tree) return #rex.json.encode(tree) end
 
   function F.run(key) return H.store(key).value end
   function F.wait_status(key, status, timeout)

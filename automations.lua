@@ -342,6 +342,19 @@ local S = {dirty = {}, pumping = false, retry_at = {}, ready = false, reconcile_
   watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}, dv_after = {}}
 
 local function mark(id) S.dirty[id] = true end
+
+-- ui_changed asks the hub to render the plugin's views again, for a change that is not in the
+-- store (a watch state, a worker). The hub renders them after each store commit by itself. One
+-- request at a time; a failure is only logged.
+local function ui_changed()
+  if S.ui_pending then return end
+  S.ui_pending = true
+  rex.after(0, function()
+    S.ui_pending = false
+    local ok, err = pcall(hub, 'hub.ui.invalidate', {})
+    if not ok then print('automations: invalidate: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end
+  end)
+end
 local pump -- forward
 
 local function each_auto(fn)
@@ -679,8 +692,13 @@ local function reconcile()
       errors[d.id] = {code = w.code, message = cut(tostring(w.message), MAX_ERROR)}
     end
   end
+  local sig = {}
+  for key, w in pairs(watches) do sig[key] = tostring(w.state) end
+  for id, e in pairs(errors) do sig['error/' .. id] = e.code .. ':' .. e.message end
   S.watches = watches
   S.watch_errors = errors
+  local text = canon(sig)
+  if text ~= S.watch_sig then S.watch_sig = text; ui_changed() end
 end
 
 -- file_run builds the run of a created row. A row whose run would pass the run budget gives a
@@ -742,6 +760,7 @@ local function drain_step(id)
     end
     error(page, 0)
   end
+  if w.state ~= page.state then ui_changed() end
   w.state = page.state
   local rows = page.rows or {}
   local mkeys = {}
@@ -1098,13 +1117,31 @@ local function check_file_limit(except_id)
   if others.n >= 8 then fail('limit', 'At most 8 enabled file automations are possible (the hub allows 8 watches per plugin)') end
 end
 
+-- Presets (the coordinator's accepted texts, 2026-10-20). A preset is a set of default fields; the
+-- user chooses the profile. preset/<name> = {id} says which automation installed it: a create
+-- with a preset writes it with if_rev '0' in the save batch, so a preset installs once. An edit
+-- keeps the preset. The delete fence deletes the record only when it names that automation.
+local PRESET_NAMES = {'vault-inbox', 'vault-health'}
+local PRESETS = {
+  ['vault-inbox'] = {name = 'Vault inbox', trigger = {kind = 'file', path = '~/knowledge/inbox', glob = '*.md'}, cwd = '~/knowledge',
+    about = 'A run for each new note in ~/knowledge/inbox.',
+    instruction = 'A new note arrived in the vault inbox. The task item has its name and path. Process it as this repository\'s instructions say. The same note can come again in a later run: if it is already processed, skip it. Call automations_done when you finish.'},
+  ['vault-health'] = {name = 'Vault health', trigger = {kind = 'daily', at = '22:00'}, cwd = '~/knowledge',
+    about = 'A run every day at 22:00 in ~/knowledge.',
+    instruction = 'The nightly vault health check is due. Run it as this repository\'s instructions say, and report the results. This run can come again: if tonight\'s check is already done, say so. Call automations_done when you finish.'},
+}
+local function preset_key(name) return 'preset/' .. name end
+
 local function save(caller, args)
-  only(args, {id = true, if_rev = true, key = true, name = true, enabled = true, trigger = true, action = true, instruction = true})
+  only(args, {id = true, if_rev = true, key = true, name = true, enabled = true, trigger = true, action = true, instruction = true, preset = true})
   local content = {}
   for k, v in pairs(args) do if k ~= 'key' then content[k] = v end end
   local fingerprint = 'save-v1/' .. canon(content)
   local prior = replay('save', caller, args.key, fingerprint)
   if prior then return prior end
+  if args.preset ~= nil and (type(args.preset) ~= 'string' or not PRESETS[args.preset]) then
+    fail('invalid_input', 'preset is ' .. table.concat(PRESET_NAMES, ' or '))
+  end
   local name = text_arg(args.name, 'name', MAX_NAME)
   local trigger = check_trigger(args.trigger)
   local action = check_action(args.action)
@@ -1127,8 +1164,10 @@ local function save(caller, args)
       st_rec = recs['state/' .. id]
       if not old or (state_of(st_rec) or {}).deleted then fail('not_found', 'No automation ' .. id) end
       if recs['auto/' .. id].rev ~= args.if_rev then fail('conflict', 'Automation ' .. id .. ' is at rev ' .. recs['auto/' .. id].rev) end
+      if args.preset ~= nil and args.preset ~= old.preset then fail('invalid_input', 'Automation ' .. id .. ' is not from preset ' .. args.preset) end
       auto_rev = args.if_rev
     end
+    local preset = old and old.preset or args.preset
     local st = state_of(st_rec) or {v = 1, gen = 0, next_q = 0, next_manual = 0}
     local trigger_changed = not old or canon(old.trigger) ~= canon(trigger)
     local enabling = enabled and (not old or not old.enabled)
@@ -1138,9 +1177,10 @@ local function save(caller, args)
     -- unrelated save keeps a due catch-up. daily_high is never cleared.
     if trigger.kind == 'daily' and enabled and (trigger_changed or enabling) then st.daily_base = slot(trigger.at, t) or '' end
     local auto = {v = 1, id = id, name = name, enabled = enabled, gen = st.gen, trigger = trigger, action = action,
-      instruction = instruction, by = old and old.by or caller.id, created_at = old and old.created_at or t, updated_at = t}
+      instruction = instruction, preset = preset, by = old and old.by or caller.id, created_at = old and old.created_at or t, updated_at = t}
     local ops = {{key = 'auto/' .. id, if_rev = auto_rev, value = auto}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}}
     if meta_op then ops[#ops + 1] = meta_op end
+    if preset and not old then ops[#ops + 1] = {key = preset_key(preset), if_rev = '0', value = {id = id}} end
     local stored = batch(ops, {key = op_key('save', caller.id, args.key), fingerprint = fingerprint, result = {id = id},
       result_revs = {rev = 'auto/' .. id}})
     local result, conflict = committed(stored, 'a save')
@@ -1154,6 +1194,10 @@ local function save(caller, args)
     end
     if conflict.kind == 'operation' then fail('conflict', 'The key ' .. args.key .. ' was used for other content') end
     if conflict.key == 'auto/' .. id and args.id then fail('conflict', 'Automation ' .. id .. ' is at rev ' .. tostring(conflict.rev)) end
+    if preset and conflict.key == preset_key(preset) then
+      local installed = state_of(get1(preset_key(preset)))
+      fail('conflict', 'Preset ' .. preset .. ' is installed as automation ' .. tostring(installed and installed.id or '(unknown)'))
+    end
   end
   fail('unavailable', 'The automations changed during the save; try again')
 end
@@ -1176,8 +1220,9 @@ local function watch_view(id, w)
 end
 
 local function list(_, args)
-  only(args, {after = true, limit = true})
+  only(args, {after = true, limit = true, deleted = true})
   if args.after ~= nil then text_arg(args.after, 'after', 64) end
+  if args.deleted ~= nil and type(args.deleted) ~= 'boolean' then fail('invalid_input', 'deleted is true or false') end
   local limit = args.limit or 50
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit is an integer from 1 to 50') end
   -- next is the last key that the page consumed, also a deleted one: scan's after is exclusive.
@@ -1188,13 +1233,14 @@ local function list(_, args)
   for _, w in ipairs(hub('hub.watch.list').watches or {}) do listed[w.key] = w end
   for _, key in ipairs(keys) do
     local auto = records[key].value
-    -- A deleted automation (a tombstone until its cleanup ends) is not listed.
-    if type(auto) == 'table' and not auto.deleted then
+    -- A deleted automation (a tombstone until its cleanup ends) is listed only with deleted = true.
+    if type(auto) == 'table' and (args.deleted or not auto.deleted) then
       local st = state_of(get1('state/' .. auto.id)) or {}
       local view = {id = auto.id, rev = records[key].rev, name = auto.name, enabled = auto.enabled, trigger = auto.trigger,
-        action = auto.action, instruction = auto.instruction, worker = st.worker, spawning = st.spawning and st.spawning.run or nil,
-        daily_high = st.daily_high}
-      if auto.trigger.kind == 'file' and auto.enabled then view.watch = watch_view(auto.id, listed[watch_key(auto.id, st.gen)]) end
+        action = auto.action, instruction = auto.instruction, preset = auto.preset, worker = st.worker,
+        spawning = st.spawning and st.spawning.run or nil, daily_high = st.daily_high}
+      if auto.deleted then view.status = 'deleting'
+      elseif auto.trigger.kind == 'file' and auto.enabled then view.watch = watch_view(auto.id, listed[watch_key(auto.id, st.gen)]) end
       local n = size(view) + 1
       if used + n > PAGE_BUDGET then
         if last == args.after then fail('too_large', 'Automation ' .. auto.id .. ' is too large to list; use after = "' .. key .. '"') end
@@ -1210,33 +1256,118 @@ local function list(_, args)
   return {automations = out, next = next_after}
 end
 
--- runs lists the runs of one automation in run key order (kind, then key). It changes nothing.
--- A newest-first order comes with the panel (design v2 section 9).
+-- presets lists each preset with its fields and the automation that installed it (one get).
+local function presets(_, args)
+  only(args, {})
+  local keys = {}
+  for _, n in ipairs(PRESET_NAMES) do keys[#keys + 1] = preset_key(n) end
+  local recs = get(keys)
+  local out = {}
+  for _, n in ipairs(PRESET_NAMES) do
+    local p, installed = PRESETS[n], state_of(recs[preset_key(n)])
+    out[#out + 1] = {preset = n, name = p.name, about = p.about, trigger = p.trigger, action = {cwd = p.cwd}, instruction = p.instruction,
+      fill = {'action.profile'}, installed = installed and installed.id or nil}
+  end
+  return {presets = out}
+end
+
+-- runs lists the runs of one automation by phase (6b plan, amendments 1 and 2). Each run is in
+-- one phase by its status: S, the run of state.spawning (starting or unknown_start); D, the dv/
+-- index (delivered); Q, the q/ index in queue order (queued, without the S run); T, the t/ index
+-- (terminal, the newest end first). An index entry whose run has another status is skipped; the
+-- engine repairs it. The cursor is the last consumed position: '<P>' (phase P, nothing consumed
+-- yet) or '<P>:<key>' ('S:1' for the spawning item). One request consumes at most READ_LIMIT
+-- entries. A visible run that does not fit the byte budget is not consumed, so it comes first on
+-- the next page. It changes nothing.
+local READ_LIMIT = 50
+local PHASE_PREFIX = {D = 'dv/', Q = 'q/', T = 't/'}
+local PHASE_NEXT = {S = 'D', D = 'Q', Q = 'T'}
+local function run_view(run_key, run)
+  return {run_key = run_key, kind = run.kind, status = run.status, at = run.at, slot = run.slot, item = run.item, by = run.by,
+    attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary,
+    retries = run.retries, dismissed = run.dismissed}
+end
+local function runs_cursor(id, after)
+  if after == nil then return 'S', nil end
+  after = text_arg(after, 'after', MAX_PATH + 64)
+  local p, rest = after:match('^([SDQT])(.*)$')
+  if not p then fail('invalid_input', 'after is a cursor from automations.runs') end
+  if rest == '' then return p, nil end
+  if p == 'S' then
+    if rest ~= ':1' then fail('invalid_input', 'after is a cursor from automations.runs') end
+    return 'D', nil
+  end
+  local key, prefix = rest:match('^:(.+)$'), PHASE_PREFIX[p] .. id .. '/'
+  if not key or #key <= #prefix or key:sub(1, #prefix) ~= prefix then fail('invalid_input', 'after is a cursor of this automation from automations.runs') end
+  return p, key
+end
 local function runs(_, args)
   only(args, {id = true, after = true, limit = true})
   local id = text_arg(args.id, 'id', 32)
   local limit = args.limit or 20
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit is an integer from 1 to 50') end
-  local prefix = run_prefix(id)
-  if args.after ~= nil and text_arg(args.after, 'after', 1024):sub(1, #prefix) ~= prefix then fail('invalid_input', 'after is a run key of this automation') end
-  local keys, records, more = scan(prefix, args.after, limit)
-  local out, used, cursor = {}, 64, nil
-  for _, key in ipairs(keys) do
-    local run = records[key].value
-    local view = {run_key = key, kind = run.kind, status = run.status, at = run.at, slot = run.slot, item = run.item, by = run.by,
-      attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary,
-      retries = run.retries, dismissed = run.dismissed}
+  local phase, pos = runs_cursor(id, args.after)
+  local st = state_of(get1('state/' .. id)) or {}
+  local spawning = type(st.spawning) == 'table' and st.spawning.run or nil
+  local C = {out = {}, used = 64, reads = 0}
+  local function at(p, key) return key and (p .. ':' .. key) or p end
+  local function full() return #C.out >= limit or C.reads >= READ_LIMIT end
+  -- add returns false when the run does not fit the page.
+  local function add(run_key, run, own)
+    local view = run_view(run_key, run)
     local n = size(view) + 1
-    if used + n > PAGE_BUDGET then
-      if #out == 0 then fail('too_large', 'Run ' .. key .. ' is too large to list; use after = "' .. key .. '"') end
-      cursor = out[#out].run_key
-      break
+    if C.used + n > PAGE_BUDGET then
+      if #C.out == 0 then fail('too_large', 'Run ' .. run_key .. ' is too large to list; use after = "' .. own .. '"') end
+      return false
     end
-    out[#out + 1] = view
-    used = used + n
+    C.out[#C.out + 1] = view
+    C.used = C.used + n
+    return true
   end
-  if not cursor and #out > 0 and type(more) == 'string' and more ~= '' then cursor = out[#out].run_key end
-  return {runs = out, next = cursor}
+  while phase do
+    if phase == 'S' then
+      if full() then return {runs = C.out, next = 'S'} end
+      if spawning then
+        local run = state_of(get1(spawning))
+        if run and (run.status == 'starting' or run.status == 'unknown_start') and not add(spawning, run, 'S:1') then
+          return {runs = C.out, next = 'S'}
+        end
+      end
+      C.reads = C.reads + 1
+      phase, pos = 'D', nil
+    else
+      local prefix, rp = PHASE_PREFIX[phase] .. id .. '/', run_prefix(id)
+      local ended = false
+      while not ended do
+        if full() then return {runs = C.out, next = at(phase, pos)} end
+        local keys, records, more = scan(prefix, pos, READ_LIMIT - C.reads)
+        local named, want, seen = {}, {}, {}
+        for _, k in ipairs(keys) do
+          local v = records[k].value
+          local rk = phase == 'D' and k:sub(#prefix + 1) or (type(v) == 'table' and v.run or nil)
+          if type(rk) == 'string' and rk:sub(1, #rp) == rp then
+            named[k] = rk
+            if not seen[rk] then seen[rk] = true; want[#want + 1] = rk end
+          end
+        end
+        local recs = #want > 0 and get(want) or {}
+        for _, k in ipairs(keys) do
+          if #C.out >= limit then return {runs = C.out, next = at(phase, pos)} end
+          local rk = named[k]
+          local run = rk and state_of(recs[rk]) or nil
+          local visible = run ~= nil and ((phase == 'D' and run.status == 'delivered')
+            or (phase == 'Q' and run.status == 'queued' and rk ~= spawning)
+            or (phase == 'T' and TERMINAL[run.status] and run.t == k))
+          if visible and not add(rk, run, phase .. ':' .. k) then return {runs = C.out, next = at(phase, pos)} end
+          C.reads = C.reads + 1
+          pos = k
+        end
+        if #keys == 0 or type(more) ~= 'string' or more == '' then ended = true end
+      end
+      phase, pos = PHASE_NEXT[phase], nil
+    end
+  end
+  return {runs = C.out}
 end
 
 local function run_now(caller, args)
@@ -1265,8 +1396,10 @@ local function managed(id)
   if not auto or not st or auto.deleted or st.deleted then fail('not_found', 'No automation ' .. id) end
   return auto, st, recs['auto/' .. id].rev, recs['state/' .. id].rev
 end
-local function commit_managed(id, auto, auto_rev, st, st_rev, op)
-  local stored = batch({{key = 'auto/' .. id, if_rev = auto_rev, value = auto}, {key = 'state/' .. id, if_rev = st_rev, value = st}}, op)
+local function commit_managed(id, auto, auto_rev, st, st_rev, op, extra)
+  local ops = {{key = 'auto/' .. id, if_rev = auto_rev, value = auto}, {key = 'state/' .. id, if_rev = st_rev, value = st}}
+  for _, o in ipairs(extra or {}) do ops[#ops + 1] = o end
+  local stored = batch(ops, op)
   local result, conflict = committed(stored, op.key)
   if result then
     mark(id)
@@ -1310,6 +1443,8 @@ end
 -- delete is the fence of B3: one batch marks auto/<id> (the tombstone) and state/<id> deleted,
 -- with a new gen. Every admission batch has if_rev on state/<id>, so no new run, start or delivery
 -- of a queued run commits after it. The cleanup runs in later steps (cancel_step, purge_step).
+-- The fence also deletes preset/<name> when it names this automation (with the observed rev), so
+-- the preset can install again at once; purge_step never touches preset/ records.
 local function delete(caller, args)
   only(args, {id = true, key = true})
   local fingerprint = 'delete-v1/' .. canon({id = args.id})
@@ -1318,11 +1453,16 @@ local function delete(caller, args)
   local id = text_arg(args.id, 'id', 32)
   for _ = 1, 5 do
     local auto, st, auto_rev, st_rev = managed(id)
+    local extra = {}
+    if auto.preset then
+      local p = get1(preset_key(auto.preset))
+      if state_of(p) and p.value.id == id then extra[1] = {key = preset_key(auto.preset), if_rev = p.rev, delete = true} end
+    end
     st.deleted = true
     st.gen = (st.gen or 0) + 1
     auto.deleted, auto.gen, auto.deleted_at, auto.deleted_by = true, st.gen, now(), caller.id
     local result = commit_managed(id, auto, auto_rev, st, st_rev, {key = op_key('delete', caller.id, args.key), fingerprint = fingerprint,
-      result = {id = id, status = 'deleting'}})
+      result = {id = id, status = 'deleting'}}, extra)
     if result then return {id = id, status = 'deleting'} end
   end
   fail('unavailable', 'The automation changed during the delete; try again')
@@ -1544,20 +1684,36 @@ local agent_handlers = {
   ['automations.cancel_run'] = cancel_run,
   ['automations.dismiss_start'] = dismiss_start,
   ['automations.runs'] = runs,
+  ['automations.presets'] = presets,
   ['automations.read'] = read,
   ['automations.done'] = done,
 }
+-- The panel and forms are a sibling file (the Templates pattern): debug.getinfo gives the
+-- script's absolute path.
+local here = debug.getinfo(1, 'S').source:gsub('^@', '')
+local views = dofile(assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute') .. '/automations_view.lua')({
+  fail = fail, hub = hub, get = get, get1 = get1, scan = scan, size = size, cut = cut, state_of = state_of, USER = USER,
+  PAGE_BUDGET = PAGE_BUDGET, PRESETS = PRESETS, PRESET_NAMES = PRESET_NAMES, preset_key = preset_key, run_prefix = run_prefix,
+  watch_view = watch_view, watch_key = watch_key, save = save, runs = runs, run_now = run_now, set_enabled = set_enabled,
+  delete = delete, retry = retry, cancel_run = cancel_run, dismiss_start = dismiss_start,
+})
+
 local key_arg = {type = 'string', minLength = 1, maxLength = 128, description = 'Your operation key. Retry with the same key and content after an unknown outcome.'}
 local exports = {
   {name = 'automations.save', title = 'Create or change an automation',
-    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "file", path, glob?} (a new file in one directory, not recursive; path is absolute or starts with ~/; glob matches the file name, default *; at most 8 enabled file automations) or {kind = "daily", at = "HH:MM"} (local time). A file automation makes one run for each appearance of a matching file; files that exist when the watch starts make none. action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters), cwd? (the worker\'s directory: absolute or ~/, and it must exist)}. instruction: the task text for the agent. A run goes to the automation\'s current worker if it runs and was started with the same profile, args and cwd; else the hub starts a new worker. After a change of those, the old worker finishes the tasks that it has and gets no new ones.',
+    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "file", path, glob?} (a new file in one directory, not recursive; path is absolute or starts with ~/; glob matches the file name, default *; at most 8 enabled file automations) or {kind = "daily", at = "HH:MM"} (local time). A file automation makes one run for each appearance of a matching file; files that exist when the watch starts make none. action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters), cwd? (the worker\'s directory: absolute or ~/, and it must exist)}. instruction: the task text for the agent. A run goes to the automation\'s current worker if it runs and was started with the same profile, args and cwd; else the hub starts a new worker. After a change of those, the old worker finishes the tasks that it has and gets no new ones. preset: "vault-inbox" or "vault-health" (automations.presets) on a create installs that preset; a preset installs once (a second install is a conflict that names the automation), and its delete makes it available again. An edit keeps the preset.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, if_rev = {type = 'string', minLength = 1},
       key = key_arg, name = {type = 'string', minLength = 1, maxLength = MAX_NAME}, enabled = {type = 'boolean'},
-      trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION}},
+      trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION},
+      preset = {type = 'string', enum = PRESET_NAMES}},
       required = {'key', 'name', 'trigger', 'action', 'instruction'}, additionalProperties = false}},
   {name = 'automations.list', title = 'List automations',
-    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, worker, spawning and daily_high; for an enabled file automation, watch {state, error?, hint?} (state from the hub, refused with code, or pending). A deleted automation is not listed. Pages: limit (default 50, at most 50) and about 40 KB. When more exist, next is set: pass it as after. A page can be empty and still have next.',
-    args = {type = 'object', properties = {after = {type = 'string', minLength = 1}, limit = {type = 'integer', minimum = 1, maximum = 50}}, additionalProperties = false}},
+    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, preset, worker, spawning and daily_high; for an enabled file automation, watch {state, error?, hint?} (state from the hub, refused with code, or pending). A deleted automation is listed only with deleted = true, with status deleting, until its cleanup ends. Pages: limit (default 50, at most 50) and about 40 KB. When more exist, next is set: pass it as after. A page can be empty and still have next.',
+    args = {type = 'object', properties = {after = {type = 'string', minLength = 1}, limit = {type = 'integer', minimum = 1, maximum = 50},
+      deleted = {type = 'boolean'}}, additionalProperties = false}},
+  {name = 'automations.presets', title = 'List the automation presets',
+    description = 'List the presets: preset (the name for automations.save preset), name, about, trigger, action.cwd and instruction (the defaults), fill (the fields that you choose: action.profile, an agent profile from hub.profiles), and installed (the id of the automation that installed it, if one did). To install, call automations.save with these fields, your profile and preset.',
+    args = {type = 'object', properties = {}, additionalProperties = false}},
   {name = 'automations.run', title = 'Run an automation now',
     description = 'Make a manual run of an enabled automation. It does not change the daily schedule. A disabled automation is refused.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
@@ -1578,7 +1734,7 @@ local exports = {
     description = 'End a run whose worker start has no outcome after 10 minutes (status unknown_start). The plugin never uses that start again, and the next run starts a new worker. Warning: the pane of the dismissed start can still appear, and it can be a duplicate worker. It stays in hub.workers; stop it with hub.stop. The run keeps the dismissed spawn key in dismissed.',
     args = {type = 'object', properties = {run_key = {type = 'string', minLength = 1}, key = key_arg}, required = {'run_key', 'key'}, additionalProperties = false}},
   {name = 'automations.runs', title = 'List the runs of an automation',
-    description = 'List the runs of one automation in run key order: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome, summary, retries and dismissed (the spawn keys of dismissed starts). Reading changes nothing. Pages: limit (default 20, at most 50) and about 40 KB; pass next as after.',
+    description = 'List the runs of one automation: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome, summary, retries and dismissed (the spawn keys of dismissed starts). Order: the starting run first, then delivered, queued (queue order) and ended runs (the newest end first). Reading changes nothing. Pages: limit (default 20, at most 50), about 40 KB, and at most 50 index entries read; pass next as after. A page can be empty and still have next: follow next until it is absent. A run that changes status between pages can come twice or not at all; for one consistent view, read again from the first page.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, after = {type = 'string', minLength = 1},
       limit = {type = 'integer', minimum = 1, maximum = 50}}, required = {'id'}, additionalProperties = false}},
   {name = 'automations.read', title = 'Read your automation tasks',
@@ -1604,7 +1760,13 @@ actions[#actions + 1] = {name = 'hub.forward', kind = 'client', title = 'Forward
   args = {type = 'object', properties = {action = {type = 'string'}, args = {type = 'object'}, requester_pid = {type = 'integer'}},
     required = {'action', 'args', 'requester_pid'}, additionalProperties = false}}
 rex.call('client.keymap', {actions = actions})
-hub('hub.register', {plugin = 'automations', instance_id = instance_id, exports = export_names})
+hub('hub.register', {plugin = 'automations', instance_id = instance_id, exports = export_names, commands = {
+  {id = 'automations', title = 'Automations…', description = 'List the automations and their runs, and add a preset', keywords = {'schedule', 'watch'},
+    surface = 'panel', landing = true, route = '/panels/automations', user_only = 'navigation'},
+  {id = 'new_automation', title = 'New Automation…', description = 'Create an automation: a new file or a daily time starts an agent task',
+    keywords = {'schedule', 'watch'}, route = '/forms/automation/new', action = 'automations.save'}}})
+-- Automations has no tab: a palette command and a side panel.
+hub('hub.ui.tabs', {tabs = {}})
 
 rex.on('client_perform_requested', function(ctx, ev)
   local call_id = ev.call_id
@@ -1616,12 +1778,15 @@ rex.on('client_perform_requested', function(ctx, ev)
       if not handler then fail('refused', 'The forwarded action is not exported') end
       return handler(agent_caller(args.requester_pid), type(args.args) == 'table' and args.args or {})
     end
+    if ev.action == 'view.render' then return views.render(args) end
+    if ev.action == 'view.action' then return views.action(args) end
     if ev.action == 'hub.changed' then
       -- A worker change can finish a pending start or show a lost worker. Reply first; the steps
       -- run in later callbacks.
       if args.what == 'workers' then
         each_auto(function(id) mark(id); S.retry_at[id] = nil end)
         pump()
+        ui_changed()
       end
       -- A watch nudge: drain that automation's watch. The drain reads the watch_id from the
       -- reconcile, so a nudge for an old watch_id changes nothing.

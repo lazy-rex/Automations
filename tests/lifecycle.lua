@@ -282,7 +282,8 @@ test('a start without an outcome for 10 minutes is unknown_start; dismiss lets t
   local two = F.wait_status(second, 'delivered')
   expect(two.starts).to_be(1)
   expect_error(function() alice:call('automations.dismiss_start', {run_key = second, key = 'dismiss-delivered'}) end, 'not_dismissable')
-  local runs = alice:call('automations.runs', {id = id}).runs
-  expect(runs[1].dismissed[1].key).to_be(spawn_key(first))
+  local dismissed
+  for _, r in ipairs(alice:call('automations.runs', {id = id}).runs) do if r.run_key == first then dismissed = r end end
+  expect(dismissed.dismissed[1].key).to_be(spawn_key(first))
   F.set_clock(T0)
 end)

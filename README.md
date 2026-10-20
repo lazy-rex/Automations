@@ -7,8 +7,8 @@ A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. An automation is a trig
   automation's agent profile, then deliver.
 
 Status: in progress. Built: file and daily triggers, manual runs, the worker start, the delivery,
-enable and disable, delete, retry, cancel, dismiss and run retention. Not built yet: the panel and
-forms, and presets.
+enable and disable, delete, retry, cancel, dismiss, run retention, the panel and forms, and the
+presets.
 
 ## Install
 
@@ -22,6 +22,40 @@ Check this repository out next to LazyRex, and add the plugin to the hub config:
 
 A file automation can watch only a directory inside `watch_roots`. The hub reads the config at
 start, so restart the hub after a change. `automations.list` shows a refused watch with a hint.
+The hub refuses a directory that does not exist (`watch_missing`) before it checks the grant.
+
+## Panel and forms
+
+The palette command "Automations…" opens the side panel. "New Automation…" opens the form.
+
+- The panel lists 20 automations a page (Next page, First page). Each item shows the trigger, the
+  watch state, a start that needs action, the queued runs and the last run. A deleting automation
+  shows as "<name> (deleting)". The panel also lists the presets, with Add.
+- The automation view has Run now, Enable or Disable, Edit…, Delete… and a page of 20 runs. A run
+  has one action: Cancel (queued), Dismiss pending start (unknown_start) or Retry (failed,
+  dismissed or cancelled). Retry is disabled while the automation is disabled, and for a file run
+  without a path. A deleting automation shows only its runs, with Cancel and Dismiss.
+- A form has two steps: step 1 chooses the agent profile (50 a page), step 2 has the fields and
+  that profile's args. "Change profile…" goes back to step 1 and does not keep the entered fields.
+  A profile whose form is over 40 KB gets a refusal: use `automations.save`.
+- The edit route carries the rev. A save after another change is refused (conflict), and the
+  message says to reopen the automation.
+- Delete asks for confirmation and says that the run history goes too.
+- Each view action calls the same handler as its agent tool, with the user as the caller. The
+  hub keeps each view operation durable; the plugin replays it by its operation key.
+
+## Presets
+
+`automations.presets` lists the presets with their fields. Install one with `automations.save`
+and `preset`, or with Add on the panel. You choose the profile.
+
+- Vault inbox (`vault-inbox`): a run for each new `*.md` file in `~/knowledge/inbox`, in
+  `~/knowledge`. The live hub must grant `~/knowledge/inbox` in `watch_roots`.
+- Vault health (`vault-health`): a run every day at 22:00, in `~/knowledge`.
+
+A preset installs once: `preset/<name>` names the automation that installed it, and a second
+install is a conflict. An edit keeps the preset. Delete makes it available again at once; the old
+automation's cleanup never removes a newer install.
 
 ## How a run reaches an agent
 
@@ -82,7 +116,7 @@ minute and never reads `isdst`.
 
 - Disable stops new runs and new starts. Runs already queued, starting or delivered continue.
   Enable starts the schedule from now and makes a new file watch, so the disabled time makes no run.
-- Delete also deletes the run history. The delete commits a fence first: the automation record
+- Delete also deletes the run history, and frees its preset. The delete commits a fence first: the automation record
   stays as a tombstone, and no new run, start or delivery of a queued run commits after it. Then
   the plugin cancels the queued runs. A run that is starting or delivered continues until it ends;
   a lost worker's run is cancelled, not requeued. Then the plugin deletes the markers, the runs and
@@ -113,8 +147,11 @@ store.
 
 The exports are agent tools: `automations.save`, `automations.list`, `automations.run`,
 `automations.set_enabled`, `automations.delete`, `automations.retry`, `automations.cancel_run`,
-`automations.dismiss_start`, `automations.runs`, `automations.read` and `automations.done`. A list
- page can be empty and still have `next`: follow `next` until it is absent. Each
+`automations.dismiss_start`, `automations.runs`, `automations.presets`, `automations.read` and
+`automations.done`. A list page can be empty and still have `next`: follow `next` until it is
+absent. `automations.list` with `deleted = true` also lists the deleting automations.
+`automations.runs` gives the starting run first, then the delivered, queued and ended runs (the
+newest end first); its cursor is the last index entry that a page read. Each
 mutation takes `key`: a retry with the same key and content gives the same result; the same key
 with other content is a conflict.
 
@@ -146,6 +183,22 @@ cd ../../Automations && lazyrex-hub test
   not block the next run; `unknown_start` after 10 minutes, and dismiss lets the next run start.
 - list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
   a page limited by bytes skips no automation.
+- panel.lua: the panel pages 25 automations, and a run of one on page 2 is cancelled from its
+  view; a view with 25 queued runs reaches the last one on its second page; retry is disabled while
+  the automation is disabled; an edit after another change is refused and says to reopen, and a
+  current edit saves; a deleting automation shows only its runs, and dismiss from its view ends the
+  cleanup.
+- forms.lua: a new automation in two steps (profile, then the fields and its args), a refused
+  submit, and Change profile; a profile that is not an agent profile shows a warning; 120 agent
+  profiles in pages of at most 50; a profile with 400 args gets a refusal; an edit form with a
+  4000-byte instruction and full args fits the budget.
+- presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
+  preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
+  old cleanup waits for a run; the preset through the forms and Run now starts its worker in
+  `~/knowledge`; the vault inbox watch shows the grant hint.
+- runs.lua: a mixed set over byte-limited pages gives every run once, in phase order; a page of
+  only skipped entries is empty and has `next`; the cursor crosses an empty phase; malformed cursors
+  are refused.
 - retention.lua: the newest 100 terminal runs stay and an older active run stays; a retry takes
   a new sequence; a clock moved back keeps the latest run; done takes a sequence, and its replay
   gives the same result; a file run pruned before its ack makes no second run; a crash between
@@ -175,6 +228,9 @@ cd ../../Automations && lazyrex-hub test
   and lost remove and ensure replies, converge; files from a disabled time make no run.
 - worker.lua: a failed observation (a hub call that fails) keeps the running worker, and the step
   tries again; a stopped worker is replaced.
+
+The parity fixture (`tests/parity_fixture.lua`, manifest `test.parity_fixture`) renders the
+views that open only from another view; `test.parity_routes` lists them.
 
 The test manifest sets the plugin args `clock_file` (a file with epoch seconds: the test clock),
 `tick` and `recheck` (seconds), and `settle_ms` (the watch settle time). It grants the watch root

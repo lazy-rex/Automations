@@ -10,6 +10,14 @@
    "automations": {"clock_file": "${LAB}/clock", "tick": "1", "recheck": "1", "settle_ms": "200"}
   },
   "watch_roots": {"automations": ["${LAB}/inbox"]},
-  "env": {"TZ": "PST8PDT"}
+  "env": {"TZ": "PST8PDT"},
+  "parity_fixture": "tests/parity_fixture.lua",
+  "parity_routes": [
+   "/forms/automation/1",
+   "/forms/automation/delete/1",
+   "/forms/automation/new?profile=worker",
+   "/forms/automation/preset/vault-health",
+   "/forms/automation/preset/vault-health?profile=worker"
+  ]
  }
 }
