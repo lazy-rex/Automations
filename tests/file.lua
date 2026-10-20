@@ -134,6 +134,8 @@ test('a file whose run passes the budget gives one failed run without the path',
   expect(runs[1].item.path_bytes).to_be(#dir + 1 + #name)
   expect(#runs[1].item.name <= 256).to_be(true)
   expect(marker(id, runs[1]).rev).not_to_be('0')
+  -- The run has no path, so a retry would fail again.
+  expect_error(function() alice:call('automations.retry', {run_key = runs[1].run_key, key = 'long-retry'}) end, 'not_retryable')
   F.put(dir .. '/' .. name, 'changed')
   rex.sleep(3)
   expect(#F.runs(alice, id, 'f')).to_be(1)

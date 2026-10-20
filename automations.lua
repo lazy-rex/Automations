@@ -315,7 +315,8 @@ local function box_key(agent, run_key) return 'box/' .. agent .. '/' .. run_key 
 local function delivered_key(id, run_key) return 'dv/' .. id .. '/' .. run_key end
 
 -- The engine's per-automation fence is state/<id>: every batch that creates, starts or delivers
--- a run writes it with if_rev. A save writes it too, so the engine sees gen, enabled and the
+-- a run writes it with if_rev. Every management change (save, set_enabled, delete, retry,
+-- cancel_run, dismiss_start) writes it too, so the engine sees gen, enabled, deleted and the
 -- schedule baseline of the record that it acts on.
 local function state_of(record) return type(record.value) == 'table' and record.value or nil end
 
@@ -513,8 +514,26 @@ local function requeue_ops(id, st, run_key, run_rec)
   }
 end
 
--- lost_step requeues one delivered run whose worker is gone: a run of an older worker, or any
--- run when the current worker definitely does not run (then the worker is forgotten). It returns
+-- lost_ops: after a delete, a lost worker's run is cancelled, not requeued (B3): no new worker
+-- starts for a deleted automation. Its box entry and the notice change in the same batch.
+local function lost_ops(id, st, run_key, run_rec)
+  if not st.deleted then return requeue_ops(id, st, run_key, run_rec) end
+  local run = run_rec.value
+  local agent = run.agent
+  local box = box_key(agent, run_key)
+  run.lost = {agent = agent, spawn_id = run.spawn_id, attempt = run.attempt, at = now()}
+  run.status, run.error = 'cancelled', 'worker lost after delete'
+  return {
+    {key = run_key, if_rev = run_rec.rev, value = run},
+    {key = delivered_key(id, run_key), delete = true},
+    {key = box, delete = true},
+    {notify = {agent = agent, pending = other_box(agent, box)}},
+  }
+end
+
+-- lost_step requeues one delivered run whose worker is gone (after a delete it cancels it): a
+-- run of an older worker, or any run when the current worker definitely does not run (then the
+-- worker is forgotten). It returns
 -- nil when every delivered run belongs to a running worker. An uncertain observation raises
 -- (worker_runs), so nothing is requeued on a guess.
 local function lost_step(id, st_rec)
@@ -534,7 +553,7 @@ local function lost_step(id, st_rec)
       return true
     end
     if run_rec.value.spawn_id ~= current then
-      local ops = requeue_ops(id, st, run_key, run_rec)
+      local ops = lost_ops(id, st, run_key, run_rec)
       ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
       batch(ops)
       return true
@@ -542,7 +561,7 @@ local function lost_step(id, st_rec)
     if runs == nil then runs = worker_runs(st.worker) end
     if not runs then
       st.worker = nil
-      local ops = requeue_ops(id, st, run_key, run_rec)
+      local ops = lost_ops(id, st, run_key, run_rec)
       ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
       batch(ops)
       return true
@@ -767,6 +786,78 @@ local function sweep_step(id)
   return #ops > 0
 end
 
+-- --- Delete cleanup (amendment 1, B3; the coordinator's decision, 2026-10-20: a delete also
+-- deletes the run history) ---
+
+local CLEANUP_RUNS, CLEANUP_KEYS = 20, 50
+
+-- fenced is a batch of independent ops that ends with the state fence. fits adds ops while the
+-- complete encoded batch stays in the budget; the counts are only upper bounds.
+local function fenced(id, st_rec)
+  local fence = {key = 'state/' .. id, if_rev = st_rec.rev, value = st_rec.value}
+  return {ops = {}, used = 1024 + size(fence) + 1, fence = fence, n = 0}
+end
+local function fits(B, ops)
+  local n = 0
+  for _, op in ipairs(ops) do n = n + size(op) + 1 end
+  if B.used + n > REQUEST_BUDGET - 2048 then return false end
+  for _, op in ipairs(ops) do B.ops[#B.ops + 1] = op end
+  B.used = B.used + n
+  B.n = B.n + 1
+  return true
+end
+local function send_fenced(B)
+  B.ops[#B.ops + 1] = B.fence
+  batch(B.ops)
+end
+
+-- cancel_step cancels the queued runs of a deleted automation, one batch for each step. A queue
+-- entry of a starting or unknown_start run stays: that run continues (design v2, 5f). It returns
+-- nil when no queued run is left.
+local function cancel_step(id, st_rec)
+  local keys, records = scan('q/' .. id .. '/', nil, CLEANUP_RUNS + 1)
+  if #keys == 0 then return nil end
+  local run_keys = {}
+  for _, key in ipairs(keys) do run_keys[#run_keys + 1] = records[key].value.run end
+  local runs = get(run_keys)
+  local B = fenced(id, st_rec)
+  for i, key in ipairs(keys) do
+    local run_rec = runs[run_keys[i]]
+    if run_rec.rev ~= '0' and run_rec.value.status == 'queued' then
+      local run = run_rec.value
+      run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
+      if B.n >= CLEANUP_RUNS or not fits(B, {{key = run_keys[i], if_rev = run_rec.rev, value = run}, {key = key, delete = true}}) then break end
+    end
+  end
+  if B.n == 0 then return nil end
+  send_fenced(B)
+  return true
+end
+
+-- purge_step deletes the records of a deleted automation when no run is active: markers, rt
+-- entries, queue entries left over, and the terminal runs. The last batch deletes the state and
+-- the auto tombstone.
+local PURGE = {'seen/', 'rt/', 'q/', 'run/'}
+local ACTIVE = {queued = true, starting = true, unknown_start = true, delivered = true}
+local function purge_step(id, st_rec)
+  for _, p in ipairs(PURGE) do
+    local prefix = p .. id .. '/'
+    local keys, records = scan(prefix, nil, CLEANUP_KEYS)
+    if #keys > 0 then
+      local B = fenced(id, st_rec)
+      for _, key in ipairs(keys) do
+        local v = records[key].value
+        if p == 'run/' and type(v) == 'table' and ACTIVE[v.status] then fail('internal', 'Run ' .. key .. ' is ' .. v.status .. ' after the cleanup') end
+        if not fits(B, {{key = key, delete = true}}) then break end
+      end
+      send_fenced(B)
+      return true
+    end
+  end
+  batch({{key = 'state/' .. id, if_rev = st_rec.rev, delete = true}, {key = 'auto/' .. id, delete = true}})
+  return false
+end
+
 -- step does one unit of work for one automation and says whether more work may follow now.
 -- File work comes first: it only creates runs and deletes markers, so it never waits on a start.
 -- Each file stage clears its flag when it ends, and a later step does the engine work.
@@ -777,9 +868,19 @@ local function step(id)
   local st_rec = get1('state/' .. id)
   local st = state_of(st_rec)
   if not st then return false end
+  -- After a delete: queued runs are cancelled first. A pending start still replays and delivers
+  -- its run, and a delivered run stays until done or a worker loss. Then the records go.
+  if st.deleted then
+    local cancelled = cancel_step(id, st_rec)
+    if cancelled ~= nil then return cancelled end
+  end
   if st.spawning then return spawn_step(id, st_rec) end
   local lost = lost_step(id, st_rec)
   if lost ~= nil then return lost end
+  if st.deleted then
+    if #scan('dv/' .. id .. '/', nil, 1) > 0 then return false end
+    return purge_step(id, st_rec)
+  end
   local keys, records = scan('q/' .. id .. '/', nil, 1)
   if #keys == 0 then return false end
   local run_key = records[keys[1]].value.run
@@ -860,7 +961,7 @@ local function tick()
   local t = now()
   each_auto(function(id, rec)
     local auto = rec.value
-    if type(auto) == 'table' and auto.enabled and auto.trigger.kind == 'daily' then
+    if type(auto) == 'table' and auto.enabled and not auto.deleted and auto.trigger.kind == 'daily' then
       local s = slot(auto.trigger.at, t)
       local st = state_of(get1('state/' .. id))
       if s and st and s > (st.daily_high or '') and s > (st.daily_base or '') then
@@ -886,6 +987,16 @@ local function next_id()
   return tostring(n), {key = 'meta/next_id', if_rev = rec.rev, value = {n = n}}
 end
 
+-- The hub allows 8 watches per plugin, one for each enabled file automation.
+local function check_file_limit(except_id)
+  local others = {n = 0}
+  each_auto(function(id, rec)
+    local a = rec.value
+    if id ~= except_id and type(a) == 'table' and a.enabled and not a.deleted and a.trigger.kind == 'file' then others.n = others.n + 1 end
+  end)
+  if others.n >= 8 then fail('limit', 'At most 8 enabled file automations are possible (the hub allows 8 watches per plugin)') end
+end
+
 local function save(caller, args)
   only(args, {id = true, if_rev = true, key = true, name = true, enabled = true, trigger = true, action = true, instruction = true})
   local content = {}
@@ -898,15 +1009,7 @@ local function save(caller, args)
   local action = check_action(args.action)
   local instruction = check_instruction(args.instruction)
   local enabled = args.enabled ~= false
-  -- The hub allows 8 watches per plugin, one for each enabled file automation.
-  if enabled and trigger.kind == 'file' then
-    local others = {n = 0}
-    each_auto(function(id, rec)
-      local a = rec.value
-      if id ~= args.id and type(a) == 'table' and a.enabled and not a.deleted and a.trigger.kind == 'file' then others.n = others.n + 1 end
-    end)
-    if others.n >= 8 then fail('limit', 'At most 8 enabled file automations are possible (the hub allows 8 watches per plugin)') end
-  end
+  if enabled and trigger.kind == 'file' then check_file_limit(args.id) end
   local t = now()
   for _ = 1, 5 do
     local id, meta_op, auto_rev, old, st_rec = args.id, nil, '0', nil, nil
@@ -981,7 +1084,8 @@ local function list(_, args)
   for _, w in ipairs(hub('hub.watch.list').watches or {}) do listed[w.key] = w end
   for _, key in ipairs(keys) do
     local auto = records[key].value
-    if type(auto) == 'table' then
+    -- A deleted automation (a tombstone until its cleanup ends) is not listed.
+    if type(auto) == 'table' and not auto.deleted then
       local st = state_of(get1('state/' .. auto.id)) or {}
       local view = {id = auto.id, rev = records[key].rev, name = auto.name, enabled = auto.enabled, trigger = auto.trigger,
         action = auto.action, instruction = auto.instruction, worker = st.worker, spawning = st.spawning and st.spawning.run or nil,
@@ -1016,7 +1120,8 @@ local function runs(_, args)
   for _, key in ipairs(keys) do
     local run = records[key].value
     local view = {run_key = key, kind = run.kind, status = run.status, at = run.at, slot = run.slot, item = run.item, by = run.by,
-      attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary}
+      attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary,
+      retries = run.retries, dismissed = run.dismissed}
     local n = size(view) + 1
     if used + n > PAGE_BUDGET then
       if #out == 0 then fail('too_large', 'Run ' .. key .. ' is too large to list; use after = "' .. key .. '"') end
@@ -1046,6 +1151,168 @@ local function run_now(caller, args)
   if stored and stored.op_exists == nil and stored.revs == nil then return stored end -- a replay result
   pump()
   return {run_key = run_key}
+end
+
+-- managed reads auto/<id> and state/<id> for a management change, and refuses a deleted
+-- automation. commit_managed sends the change with if_rev on both records and the op record.
+local function managed(id)
+  local recs = get({'auto/' .. id, 'state/' .. id})
+  local auto, st = state_of(recs['auto/' .. id]), state_of(recs['state/' .. id])
+  if not auto or not st or auto.deleted or st.deleted then fail('not_found', 'No automation ' .. id) end
+  return auto, st, recs['auto/' .. id].rev, recs['state/' .. id].rev
+end
+local function commit_managed(id, auto, auto_rev, st, st_rev, op)
+  local stored = batch({{key = 'auto/' .. id, if_rev = auto_rev, value = auto}, {key = 'state/' .. id, if_rev = st_rev, value = st}}, op)
+  local result, conflict = committed(stored, op.key)
+  if result then
+    mark(id)
+    S.reconcile_due = true
+    S.reconcile_at = nil
+    pump()
+    if result.revs then return {id = id, rev = result.revs['auto/' .. id]} end
+    return result
+  end
+  if conflict.kind == 'operation' then fail('conflict', 'The operation key was used for other content') end
+  return nil
+end
+
+-- set_enabled changes only the flag. A change makes a new gen: disable stops new admission (a new
+-- run, a new start), and the runs already admitted continue. Enable moves the daily baseline (B4)
+-- and makes a new watch, so files from the disabled time make no run.
+local function set_enabled(caller, args)
+  only(args, {id = true, enabled = true, key = true})
+  if type(args.enabled) ~= 'boolean' then fail('invalid_input', 'enabled is true or false') end
+  local fingerprint = 'enable-v1/' .. canon({id = args.id, enabled = args.enabled})
+  local prior = replay('enable', caller, args.key, fingerprint)
+  if prior then return prior end
+  local id = text_arg(args.id, 'id', 32)
+  for _ = 1, 5 do
+    local auto, st, auto_rev, st_rev = managed(id)
+    if args.enabled and not auto.enabled and auto.trigger.kind == 'file' then check_file_limit(id) end
+    if auto.enabled ~= args.enabled then
+      local t = now()
+      st.gen = (st.gen or 0) + 1
+      st.enabled = args.enabled
+      if args.enabled and auto.trigger.kind == 'daily' then st.daily_base = slot(auto.trigger.at, t) or '' end
+      auto.gen, auto.enabled, auto.updated_at = st.gen, args.enabled, t
+    end
+    local result = commit_managed(id, auto, auto_rev, st, st_rev, {key = op_key('enable', caller.id, args.key), fingerprint = fingerprint,
+      result = {id = id}, result_revs = {rev = 'auto/' .. id}})
+    if result then return result end
+  end
+  fail('unavailable', 'The automation changed during the change; try again')
+end
+
+-- delete is the fence of B3: one batch marks auto/<id> (the tombstone) and state/<id> deleted,
+-- with a new gen. Every admission batch has if_rev on state/<id>, so no new run, start or delivery
+-- of a queued run commits after it. The cleanup runs in later steps (cancel_step, purge_step).
+local function delete(caller, args)
+  only(args, {id = true, key = true})
+  local fingerprint = 'delete-v1/' .. canon({id = args.id})
+  local prior = replay('delete', caller, args.key, fingerprint)
+  if prior then return prior end
+  local id = text_arg(args.id, 'id', 32)
+  for _ = 1, 5 do
+    local auto, st, auto_rev, st_rev = managed(id)
+    st.deleted = true
+    st.gen = (st.gen or 0) + 1
+    auto.deleted, auto.gen, auto.deleted_at, auto.deleted_by = true, st.gen, now(), caller.id
+    local result = commit_managed(id, auto, auto_rev, st, st_rev, {key = op_key('delete', caller.id, args.key), fingerprint = fingerprint,
+      result = {id = id, status = 'deleting'}})
+    if result then return {id = id, status = 'deleting'} end
+  end
+  fail('unavailable', 'The automation changed during the delete; try again')
+end
+
+-- run_change applies a keyed change to one run. change(run, st, auto) changes the run and the
+-- state, or refuses; it returns the extra ops. The batch has if_rev on the run and on
+-- state/<id> (the fence), so a step that moved the run or the state makes it read again.
+local MAX_DISMISSED = 10
+local function run_change(kind, caller, args, change)
+  only(args, {run_key = true, key = true})
+  local fingerprint = kind .. '-v1/' .. canon({run_key = args.run_key})
+  local prior = replay(kind, caller, args.key, fingerprint)
+  if prior then return prior end
+  local run_key = text_arg(args.run_key, 'run_key', 1024)
+  local id = run_key:match('^run/(%d+)/[dfm]/')
+  if not id then fail('invalid_input', 'run_key is a run key from automations.runs') end
+  for _ = 1, 5 do
+    local recs = get({run_key, 'auto/' .. id, 'state/' .. id})
+    local run_rec, st_rec = recs[run_key], recs['state/' .. id]
+    if run_rec.rev == '0' or type(run_rec.value) ~= 'table' then fail('not_found', 'No run ' .. run_key) end
+    local st = state_of(st_rec)
+    if not st then fail('not_found', 'No automation ' .. id) end
+    local run = run_rec.value
+    local ops = change(run, st, state_of(recs['auto/' .. id]), run_key, id)
+    ops[#ops + 1] = {key = run_key, if_rev = run_rec.rev, value = run}
+    ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
+    local stored = batch(ops, {key = op_key(kind, caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
+    local result, conflict = committed(stored, kind)
+    if result then
+      mark(id)
+      pump()
+      if result.revs then return {run_key = run_key, status = run.status} end
+      return result
+    end
+    if conflict.kind == 'operation' then fail('conflict', 'The key ' .. args.key .. ' was used for other content') end
+  end
+  fail('unavailable', 'The run changed during the change; try again')
+end
+
+-- retry is a new admission (design v2, B7): a failed, dismissed or cancelled run goes back to the
+-- queue with a new queue entry. It keeps attempt and starts, so its next delivery has attempt + 1
+-- and its next start has a new spawn key. A disabled or deleted automation refuses it.
+local function retry(caller, args)
+  return run_change('retry', caller, args, function(run, st, auto, run_key, id)
+    if st.deleted or not auto or auto.deleted then fail('not_found', 'No automation ' .. id) end
+    if not st.enabled then fail('disabled', 'Automation ' .. id .. ' is disabled') end
+    if run.status ~= 'failed' and run.status ~= 'dismissed' and run.status ~= 'cancelled' then
+      fail('not_retryable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; retry takes a failed, dismissed or cancelled run')
+    end
+    if run.kind == 'f' and type(run.item) == 'table' and run.item.path == nil then
+      fail('not_retryable', 'Run ' .. run_key .. ' has no file path (path too long), so a retry fails again')
+    end
+    local n = (st.next_q or 0) + 1
+    st.next_q = n
+    run.status, run.error, run.outcome, run.summary, run.done_at = 'queued', nil, nil, nil, nil
+    run.q = queue_key(id, n)
+    run.retries = (run.retries or 0) + 1
+    run.retried = {by = caller.id, at = now()}
+    return {{key = run.q, if_rev = '0', value = {run = run_key}}}
+  end)
+end
+
+-- cancel_run takes only a queued run: no side effect has started (design v2, section 9).
+local function cancel_run(caller, args)
+  return run_change('cancel', caller, args, function(run, _, _, run_key)
+    if run.status ~= 'queued' then fail('not_cancellable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only a queued run can be cancelled') end
+    local q = run.q
+    run.status, run.q, run.error = 'cancelled', nil, nil
+    run.cancelled = {by = caller.id, at = now()}
+    return {{key = q, delete = true}}
+  end)
+end
+
+-- dismiss_start ends an unknown_start run (design v2, 5g). The plugin never replays that spawn
+-- key again, so it never adopts that pane; the next queued run starts a new worker. The run
+-- keeps every dismissed key (the recovery reference), and the state keeps the newest.
+local function dismiss_start(caller, args)
+  return run_change('dismiss', caller, args, function(run, st, _, run_key)
+    if run.status ~= 'unknown_start' or type(st.spawning) ~= 'table' or st.spawning.run ~= run_key then
+      fail('not_dismissable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only an unknown_start run can be dismissed')
+    end
+    local ref = {key = st.spawning.request.key, at = now(), by = caller.id}
+    local list = run.dismissed or {}
+    list[#list + 1] = ref
+    while #list > MAX_DISMISSED do table.remove(list, 1) end
+    run.dismissed = list
+    st.dismissed_spawn = {run = run_key, key = ref.key, at = ref.at}
+    st.spawning = nil
+    local q = run.q
+    run.status, run.q = 'dismissed', nil
+    if q then return {{key = q, delete = true}} end
+    return {}
+  end)
 end
 
 local function task_view(run_key, run)
@@ -1140,6 +1407,9 @@ local function done(caller, args)
     }, {key = op_key('done', caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
     local result, conflict = committed(stored, 'done')
     if result then
+      -- A delete cleanup can wait for this run.
+      mark(run.auto)
+      pump()
       if result.revs then return {run_key = run_key, status = run.status} end
       return result
     end
@@ -1152,6 +1422,11 @@ local agent_handlers = {
   ['automations.save'] = save,
   ['automations.list'] = list,
   ['automations.run'] = run_now,
+  ['automations.set_enabled'] = set_enabled,
+  ['automations.delete'] = delete,
+  ['automations.retry'] = retry,
+  ['automations.cancel_run'] = cancel_run,
+  ['automations.dismiss_start'] = dismiss_start,
   ['automations.runs'] = runs,
   ['automations.read'] = read,
   ['automations.done'] = done,
@@ -1170,8 +1445,24 @@ local exports = {
   {name = 'automations.run', title = 'Run an automation now',
     description = 'Make a manual run of an enabled automation. It does not change the daily schedule. A disabled automation is refused.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
+  {name = 'automations.set_enabled', title = 'Enable or disable an automation',
+    description = 'Enable or disable an automation (id, enabled). Disable stops new runs and new starts; runs already queued, starting or delivered continue. Enable starts the schedule from now (no catch-up for the disabled time) and a new file watch (files from the disabled time make no run). At most 8 enabled file automations.',
+    args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, enabled = {type = 'boolean'}, key = key_arg},
+      required = {'id', 'enabled', 'key'}, additionalProperties = false}},
+  {name = 'automations.delete', title = 'Delete an automation and its run history',
+    description = 'Delete an automation. This also deletes its run history. At once: no new run, start or delivery, and its queued runs are cancelled. A run that is starting or delivered continues until it ends; then the plugin deletes the runs and the automation. The result status is deleting.',
+    args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
+  {name = 'automations.retry', title = 'Retry a run',
+    description = 'Queue a failed, dismissed or cancelled run again (run_key from automations.runs). Its next start uses a new spawn key, and its next delivery has attempt + 1. A disabled automation is refused (disabled). A file run without a path (path too long) is refused (not_retryable).',
+    args = {type = 'object', properties = {run_key = {type = 'string', minLength = 1}, key = key_arg}, required = {'run_key', 'key'}, additionalProperties = false}},
+  {name = 'automations.cancel_run', title = 'Cancel a queued run',
+    description = 'Cancel a queued run (run_key from automations.runs). Only a queued run: a run that is starting or delivered is refused (not_cancellable).',
+    args = {type = 'object', properties = {run_key = {type = 'string', minLength = 1}, key = key_arg}, required = {'run_key', 'key'}, additionalProperties = false}},
+  {name = 'automations.dismiss_start', title = 'Dismiss a pending start',
+    description = 'End a run whose worker start has no outcome after 10 minutes (status unknown_start). The plugin never uses that start again, and the next run starts a new worker. Warning: the pane of the dismissed start can still appear, and it can be a duplicate worker. It stays in hub.workers; stop it with hub.stop. The run keeps the dismissed spawn key in dismissed.',
+    args = {type = 'object', properties = {run_key = {type = 'string', minLength = 1}, key = key_arg}, required = {'run_key', 'key'}, additionalProperties = false}},
   {name = 'automations.runs', title = 'List the runs of an automation',
-    description = 'List the runs of one automation in run key order: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome and summary. Reading changes nothing. Pages: limit (default 20, at most 50) and about 40 KB; pass next as after.',
+    description = 'List the runs of one automation in run key order: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome, summary, retries and dismissed (the spawn keys of dismissed starts). Reading changes nothing. Pages: limit (default 20, at most 50) and about 40 KB; pass next as after.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, after = {type = 'string', minLength = 1},
       limit = {type = 'integer', minimum = 1, maximum = 50}}, required = {'id'}, additionalProperties = false}},
   {name = 'automations.read', title = 'Read your automation tasks',
