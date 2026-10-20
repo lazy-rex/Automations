@@ -101,7 +101,8 @@ cd ../../Automations && lazyrex-hub test
   characters) and stores nothing when it refuses; the 9th enabled file automation is refused; `~`
   expands with HOME, and a path outside `watch_roots` shows the grant hint.
 - start.lua: an unknown start outcome (client_unavailable from `hub.spawn`) keeps the stored
-  request and replays its key, so one worker starts; a definite refusal fails the run.
+  request and replays its key, so one worker starts; a definite refusal fails the run; a profile
+  that is no longer an agent profile fails the run before a start, and the next run is not blocked.
 - watch_reconcile.lua: a directory change moves the watch, and old watches are removed (ten
   changes stay under the limit of 8); a crash after the save, after the remove and after the ensure,
   and lost remove and ensure replies, converge; files from a disabled time make no run.

@@ -215,7 +215,7 @@ local function check_trigger(t)
 end
 
 -- check_action validates the profile now: it must exist, be an agent profile, have every
--- required arg, and declare every given arg. The same check runs again at each start.
+-- required arg, and declare every given arg. The same check runs again at each new start.
 local function check_action(a)
   if type(a) ~= 'table' then fail('invalid_input', 'action is required') end
   only(a, {profile = true, args = true, title = true})
@@ -439,6 +439,15 @@ local function spawn_request(run_key, starts, task)
   if task.args and next(task.args) then r.args = task.args end
   r.title = task.title or nil
   return r
+end
+
+-- profile_problem checks a stored task against the current profiles, as save does. It returns
+-- the refusal text, or nil. A failed hub.profiles read raises, so the step tries again later.
+local function profile_problem(task)
+  local ok, err = pcall(check_action, {profile = task.profile, args = task.args, title = task.title})
+  if ok then return nil end
+  if type(err) == 'table' and err.code == 'invalid_input' then return err.message end
+  error(err, 0)
 end
 
 -- --- Engine steps (design v2 section 5; amendment 1, B1) ---
@@ -783,7 +792,18 @@ local function step(id)
     return true
   end
   -- Start admission: a new start counter gives a new key; the request is stored before the call.
+  -- The profile can change after save, so a new start checks it again (design v2, 5d). A replay
+  -- in spawn_step does not: its earlier effect may already exist.
   local run = run_rec.value
+  local problem = profile_problem(run.task)
+  if problem then
+    run.status = 'failed'
+    run.error = cut(problem, MAX_ERROR)
+    local q = run.q
+    run.q = nil
+    batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+    return true
+  end
   run.starts = (run.starts or 0) + 1
   run.status = 'starting'
   st.spawning = {run = run_key, since = now(), request = spawn_request(run_key, run.starts, run.task)}

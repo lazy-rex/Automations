@@ -48,3 +48,25 @@ test('a refused start fails its run, and the next run starts with a new key', fu
   expect(run.starts).to_be(1)
   expect(F.running('worker')).to_be(before + 1)
 end)
+
+-- New start admission checks the profile again (design v2, 5d): a saved profile can change or
+-- disappear. Here it becomes an accessory profile between save and the first run. The run fails
+-- without a hub.spawn call, and its queue entry goes, so the next run is not blocked.
+test('a profile that is no longer an agent profile fails the run before a start', function()
+  local id = automation('changed')
+  local before = #F.workers()
+  H.write_profiles({profiles = {
+    {id = 'worker', name = 'Worker', kind = 'accessory', command = {'/bin/sh', '-c', 'exec tail -f /dev/null'}},
+  }})
+  local first = alice:call('automations.run', {id = id, key = 'changed-1'})
+  local failed = F.wait_status(first.run_key, 'failed')
+  expect(failed.error).to_match('not an agent profile')
+  expect(failed.starts or 0).to_be(0)
+  expect(store('state/' .. id).value.spawning).to_be(nil)
+  expect(store('q/' .. id .. '/000000000001').rev).to_be('0')
+  rex.sleep(2)
+  expect(#F.workers()).to_be(before)
+  F.profiles()
+  local second = alice:call('automations.run', {id = id, key = 'changed-2'})
+  expect(F.wait_status(second.run_key, 'delivered').starts).to_be(1)
+end)
