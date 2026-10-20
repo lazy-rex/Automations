@@ -366,6 +366,17 @@ local function worker_runs(worker)
   fail('unavailable', 'hub.agents does not list ' .. resolved.id .. ' yet')
 end
 
+-- other_box says whether the agent ID has a box entry other than box. A notice row belongs to one
+-- agent ID (the hub keeps one per plugin and ID), and each box is keyed by the ID that got the
+-- delivery, so the row stays pending exactly while that box is not empty.
+local function other_box(agent, box)
+  local keys = scan('box/' .. agent .. '/', nil, 2)
+  for _, k in ipairs(keys) do
+    if k ~= box then return true end
+  end
+  return false
+end
+
 -- deliver_ops: the run becomes delivered to agent, with a new attempt; its box entry and the
 -- notice intent commit with it. The queue entry goes; dv/ lists the delivered run.
 local function deliver_ops(id, run_key, run_rec, agent, spawn_id)
@@ -432,12 +443,74 @@ local function spawn_step(id, st_rec)
   return true
 end
 
+-- requeue_ops: a delivered run whose worker no longer runs goes back to the queue (design v2,
+-- 5e). Its box entry goes, and the old agent's notice row follows its remaining box. The run
+-- keeps its attempt, so the next delivery has attempt + 1 and a done of the old attempt is
+-- refused. It also keeps starts: a later start uses a new key.
+local function requeue_ops(id, st, run_key, run_rec)
+  local run = run_rec.value
+  local box = box_key(run.agent, run_key)
+  local n = (st.next_q or 0) + 1
+  st.next_q = n
+  run.lost = {agent = run.agent, spawn_id = run.spawn_id, attempt = run.attempt, at = now()}
+  local agent = run.agent
+  run.status, run.agent, run.spawn_id, run.delivered_at = 'queued', nil, nil, nil
+  run.q = queue_key(id, n)
+  return {
+    {key = run_key, if_rev = run_rec.rev, value = run},
+    {key = run.q, if_rev = '0', value = {run = run_key}},
+    {key = delivered_key(id, run_key), delete = true},
+    {key = box, delete = true},
+    {notify = {agent = agent, pending = other_box(agent, box)}},
+  }
+end
+
+-- lost_step requeues one delivered run whose worker is gone: a run of an older worker, or any
+-- run when the current worker definitely does not run (then the worker is forgotten). It returns
+-- nil when every delivered run belongs to a running worker. An uncertain observation raises
+-- (worker_runs), so nothing is requeued on a guess.
+local function lost_step(id, st_rec)
+  local st = st_rec.value
+  local prefix = 'dv/' .. id .. '/'
+  local keys = scan(prefix, nil, 20)
+  if #keys == 0 then return nil end
+  local current = type(st.worker) == 'table' and st.worker.spawn_id or nil
+  local runs = nil
+  for _, key in ipairs(keys) do
+    local run_key = key:sub(#prefix + 1)
+    local run_rec = get1(run_key)
+    if run_rec.rev == '0' or run_rec.value.status ~= 'delivered' then
+      -- An index entry whose run is not delivered. done and requeue delete the entry in their
+      -- own batch, so this is only a repair: remove it under the fence.
+      batch({{key = key, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+      return true
+    end
+    if run_rec.value.spawn_id ~= current then
+      local ops = requeue_ops(id, st, run_key, run_rec)
+      ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
+      batch(ops)
+      return true
+    end
+    if runs == nil then runs = worker_runs(st.worker) end
+    if not runs then
+      st.worker = nil
+      local ops = requeue_ops(id, st, run_key, run_rec)
+      ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
+      batch(ops)
+      return true
+    end
+  end
+  return nil
+end
+
 -- step does one unit of work for one automation and says whether more work may follow now.
 local function step(id)
   local st_rec = get1('state/' .. id)
   local st = state_of(st_rec)
   if not st then return false end
   if st.spawning then return spawn_step(id, st_rec) end
+  local lost = lost_step(id, st_rec)
+  if lost ~= nil then return lost end
   local keys, records = scan('q/' .. id .. '/', nil, 1)
   if #keys == 0 then return false end
   local run_key = records[keys[1]].value.run
@@ -708,11 +781,8 @@ local function done(caller, args)
       local over = size(run) - RUN_BUDGET
       if over > 0 then run.summary = cut(run.summary, math.max(16, #run.summary - over - 8)) end
     end
-    -- The notice stays pending while this agent ID has another box entry (not this one).
     local box = box_key(run.agent, run_key)
-    local keys = scan('box/' .. run.agent .. '/', nil, 2)
-    local others = false
-    for _, k in ipairs(keys) do if k ~= box then others = true end end
+    local others = other_box(run.agent, box)
     local stored = batch({
       {key = run_key, if_rev = run_rec.rev, value = run},
       {key = box, delete = true},

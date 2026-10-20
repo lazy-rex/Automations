@@ -33,6 +33,9 @@ notice text into the worker's pane when the worker is ready. The worker reads it
   the spawn request before the call and replays it with the same key after a lost reply, so a lost
   reply never starts a second worker.
 - A task has an attempt. `automations.done` needs the current attempt.
+- When the worker no longer runs, its delivered tasks go back to the queue and to the next worker
+  with attempt + 1. Only a definite answer counts as "no longer runs": a failed lookup keeps the
+  worker, and the plugin tries again later.
 
 ## Daily schedule
 
@@ -65,6 +68,9 @@ cd ../../Automations && lazyrex-hub test
 - deliver.lua: a daily tick starts one worker, which reads and completes its task; a second run
   goes to the running worker; a lost `hub.spawn` reply starts one worker; `done` from another agent
   or for another attempt is refused.
+- reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
+  worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
+  reads its task; a hub crash after the loss moves the task once.
 - save.lua: save checks the action against the hub contract (a tab title of at most 60
   characters) and stores nothing when it refuses.
 - start.lua: an unknown start outcome (client_unavailable from `hub.spawn`) keeps the stored

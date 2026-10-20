@@ -47,7 +47,12 @@ return function(H)
       local s = H.perform(client, 'agent.status', {})
       return s.joined
     end, 20)
-    return {id = agent_id, call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end}
+    return {id = agent_id,
+      call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end,
+      -- report sends hub.identity.report from a new process in the worker's pane, as an agent hook.
+      report = function(_, kind, conversation_id)
+        return H.perform(client, 'agent.report', {args = {kind = kind, conversation_id = conversation_id, source = 'startup'}}, 20000)
+      end}
   end
 
   function F.run(key) return H.store(key).value end
