@@ -114,7 +114,8 @@ cd ../../Automations && lazyrex-hub test
   goes to the running worker; a lost `hub.spawn` reply starts one worker; `done` from another agent
   or for another attempt is refused.
 - file.lua: one run for each new matching file, none for an existing file or another name; a
-  failed ack, a change before the ack and created_removed give no second run; a marker retires
+  failed ack, a change before the ack and created_removed give no second run; a refused ack
+  does not hold the delivery; a marker retires
   after its removal is acknowledged, also after a lost ack reply and a crash; a run over the budget
   fails without the path; a backlog of 120 files gives 120 runs.
 - lifecycle.lua: a hub crash between delete cleanup batches (near-limit runs, a gate on the third

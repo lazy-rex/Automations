@@ -728,7 +728,16 @@ local function drain_step(id)
   end
   if not commit_ops(id, B) then return true end
   if type(page.next) == 'string' and page.next ~= '' then
-    local acked = hub('hub.watch.ack', {key = key, watch_id = w.watch_id, through = page.next})
+    -- The page's runs and markers committed, so a failed ack loses nothing: the rows come again,
+    -- and the markers stop a second run. The drain stops here, so the engine can deliver; the
+    -- recheck tick drains again.
+    local ok_ack, acked = pcall(hub, 'hub.watch.ack', {key = key, watch_id = w.watch_id, through = page.next})
+    if not ok_ack then
+      print('automations: ack ' .. key .. ': ' .. (type(acked) == 'table' and tostring(acked.message) or tostring(acked)))
+      if type(acked) == 'table' and acked.code == 'stale_watch' then S.watches[key] = nil; S.reconcile_due = true end
+      S.drain[id] = nil
+      return true
+    end
     w.cursor = acked.cursor
     S.retire[id] = S.retire[id] or true
   end

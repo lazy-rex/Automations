@@ -61,6 +61,21 @@ test('a failed ack gives no second run', function()
   expect(F.wait_status(runs[1].run_key, 'delivered').attempt).to_be(1)
 end)
 
+-- The ack is refused for as long as a gate is closed. The page's run and marker committed, so
+-- the run goes on to its worker: a refused ack does not hold the delivery.
+test('a refused ack does not hold the delivery of the run', function()
+  local dir = F.dir('held')
+  local id = automation('held', dir)
+  local gate = fault({point = 'action', action = 'hub.watch.ack', when = 'before', mode = 'gate', key = wkey(id)})
+  F.put(dir .. '/h.md')
+  local runs = F.wait_runs(alice, id, 1)
+  wait('the gated ack', function() return fault_fired(gate) end, 10)
+  expect(F.wait_status(runs[1].run_key, 'delivered').attempt).to_be(1)
+  fault_release(gate)
+  rex.sleep(3)
+  expect(#F.runs(alice, id, 'f')).to_be(1)
+end)
+
 -- The reviewer's case for B2: the file changes after its run and before the ack. The next read
 -- returns created again, with the same appearance_key. The marker stops a second run.
 test('a file that changes before the ack gives no second run', function()
