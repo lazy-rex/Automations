@@ -175,8 +175,34 @@ local function only(args, allowed)
   end
 end
 
+-- watch_path expands a leading ~ with HOME (the hub does not expand it) and requires an
+-- absolute, clean path: hub.watch.ensure refuses any other.
+local MAX_PATH = 1024
+local function watch_path(p)
+  if p == '~' or p:sub(1, 2) == '~/' then
+    local home = os.getenv('HOME')
+    if type(home) ~= 'string' or home:sub(1, 1) ~= '/' then fail('invalid_input', 'HOME is not set, so ~ cannot be expanded') end
+    if home ~= '/' then home = home:gsub('/+$', '') end
+    p = home .. p:sub(2)
+  end
+  if p:sub(1, 1) ~= '/' then fail('invalid_input', 'trigger.path is an absolute directory path or starts with ~/') end
+  if #p > MAX_PATH then fail('invalid_input', 'trigger.path is at most ' .. MAX_PATH .. ' bytes') end
+  if p ~= '/' and (p:find('//', 1, true) or p:sub(-1) == '/' or (p .. '/'):find('/%.%.?/')) then
+    fail('invalid_input', 'trigger.path must be clean: no //, no /./ or /../ part, no / at the end')
+  end
+  return p
+end
+
 local function check_trigger(t)
   if type(t) ~= 'table' then fail('invalid_input', 'trigger is required') end
+  if t.kind == 'file' then
+    only(t, {kind = true, path = true, glob = true})
+    local path = watch_path(text_arg(t.path, 'trigger.path', MAX_PATH))
+    local glob = '*'
+    if t.glob ~= nil and t.glob ~= '' then glob = text_arg(t.glob, 'trigger.glob', MAX_TEXT) end
+    if glob:find('/', 1, true) then fail('invalid_input', 'trigger.glob matches a file name, so it has no /') end
+    return {kind = 'file', path = path, glob = glob}
+  end
   if t.kind == 'daily' then
     only(t, {kind = true, at = true})
     local at = t.at
@@ -185,7 +211,7 @@ local function check_trigger(t)
     end
     return {kind = 'daily', at = at}
   end
-  fail('invalid_input', 'trigger.kind must be daily')
+  fail('invalid_input', 'trigger.kind must be file or daily')
 end
 
 -- check_action validates the profile now: it must exist, be an agent profile, have every
@@ -293,10 +319,23 @@ local function delivered_key(id, run_key) return 'dv/' .. id .. '/' .. run_key e
 -- schedule baseline of the record that it acts on.
 local function state_of(record) return type(record.value) == 'table' and record.value or nil end
 
-local S = {dirty = {}, pumping = false, retry_at = {}, ready = false}
+-- S.watches: the plugin's watches by key, from the last reconcile (hub.watch.list, then ensure).
+-- S.watch_errors: the refused ensure of an automation. S.drain, S.retire and S.sweep: file work
+-- that waits for an automation (section 6 below).
+local S = {dirty = {}, pumping = false, retry_at = {}, ready = false, reconcile_due = true,
+  watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}}
 
 local function mark(id) S.dirty[id] = true end
 local pump -- forward
+
+local function each_auto(fn)
+  local after
+  repeat
+    local keys, records, next_after = scan('auto/', after, 100)
+    for _, key in ipairs(keys) do fn(key:sub(6), records[key]) end
+    after = next_after
+  until type(after) ~= 'string' or after == ''
+end
 
 -- --- Run creation (design v2 section 4) ---
 
@@ -503,8 +542,229 @@ local function lost_step(id, st_rec)
   return nil
 end
 
+-- --- File watches (design v2 section 6; amendment 1, B1 and B2) ---
+
+-- Each trigger generation has its own watch key, so a changed trigger never meets the old spec
+-- (watch_conflict). settle_ms is fixed per plugin run: a test sets it short (manifest).
+local SETTLE_MS = tonumber(rex.args.settle_ms) or 1000
+local WATCH_PAGE = 50
+local function watch_key(id, gen) return 'a-' .. id .. '-' .. tostring(gen) end
+local function watch_owner(key) return key:match('^a%-(%d+)%-%d+$') end
+-- The marker seen/<id>/<appearance_key> = {run} is the proof that an appearance has its run.
+-- rt/<id>/<appearance_key> = {seq} says that a removed or created_removed row of it was read.
+local function marker_key(id, ak) return 'seen/' .. id .. '/' .. ak end
+local function retire_key(id, ak) return 'rt/' .. id .. '/' .. ak end
+-- appearance_key is watch_id:created_seq, and a watch_id is hex (hub watchsvc.go at 06b22ca).
+local function appearance_watch(ak) return ak:match('^(%x+):%d+$') end
+
+local function drain_later(id)
+  S.drain[id] = (S.drain[id] or 0) + 1
+  mark(id)
+end
+
+local function desired_watches()
+  local out = {}
+  each_auto(function(id, rec)
+    local auto = rec.value
+    if type(auto) == 'table' and auto.enabled and not auto.deleted and auto.trigger.kind == 'file' then
+      out[watch_key(id, auto.gen)] = {id = id, path = auto.trigger.path, glob = auto.trigger.glob}
+    end
+  end)
+  return out
+end
+
+-- reconcile makes the hub's watches match the enabled file automations. It removes every watch
+-- whose key is not desired first, by its exact watch_id, so the 8-watch limit counts only
+-- desired watches. Then it ensures each desired watch: the same spec gives the same watch_id, so
+-- a lost reply is safe. It keeps no watch_id across runs; a crash repeats it from the list.
+local function reconcile()
+  local listed = hub('hub.watch.list').watches or {}
+  local want = desired_watches()
+  local watches = {}
+  for _, w in ipairs(listed) do
+    if want[w.key] then
+      watches[w.key] = w
+    else
+      hub('hub.watch.remove', {key = w.key, watch_id = w.watch_id})
+      -- The rows of the removed watch cannot come again, so its markers retire (B2, rule 2).
+      local owner = watch_owner(w.key)
+      if owner then S.sweep[owner] = true; mark(owner) end
+    end
+  end
+  local keys = {}
+  for key in pairs(want) do keys[#keys + 1] = key end
+  table.sort(keys)
+  local errors = {}
+  for _, key in ipairs(keys) do
+    local d = want[key]
+    local ok, w = pcall(hub, 'hub.watch.ensure', {key = key, path = d.path, glob = d.glob, settle_ms = SETTLE_MS, emit_existing = false})
+    if ok then
+      local row = watches[key] or {key = key, path = d.path, glob = d.glob}
+      row.watch_id, row.state, row.cursor, row.watermark = w.watch_id, w.state, w.cursor, w.watermark
+      watches[key] = row
+      drain_later(d.id)
+    else
+      if type(w) ~= 'table' or w.code == 'unavailable' then error(w, 0) end
+      errors[d.id] = {code = w.code, message = cut(tostring(w.message), MAX_ERROR)}
+    end
+  end
+  S.watches = watches
+  S.watch_errors = errors
+end
+
+-- file_run builds the run of a created row. A row whose run would pass the run budget gives a
+-- failed run without the path (amendment 1, detail 1); it still has its marker.
+local function file_run(id, auto, row, n)
+  local run = {v = 1, auto = id, name = auto.name, kind = 'f', by = 'watch', at = now(),
+    item = {name = row.name, path = row.path, seq = row.seq, watch_id = appearance_watch(row.appearance_key)},
+    task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title},
+    status = 'queued', attempt = 0, starts = 0, q = queue_key(id, n)}
+  if size(run) <= RUN_BUDGET then return run end
+  run.item = {seq = row.seq, watch_id = run.item.watch_id, path_bytes = #tostring(row.path), name = cut(tostring(row.name), MAX_TEXT)}
+  run.status, run.error, run.q = 'failed', 'path too long', nil
+  return run
+end
+
+-- commit_ops sends the collected ops of a page with the state fence. It returns false when the
+-- state changed (a save or another step): the page is read again later.
+local function commit_ops(id, B)
+  if #B.ops == 0 then return true end
+  B.st.next_q = B.next_q
+  B.ops[#B.ops + 1] = {key = 'state/' .. id, if_rev = B.rev, value = B.st}
+  local stored = batch(B.ops)
+  B.ops, B.used = {}, 1024
+  if stored.conflict then return false end
+  if type(stored.revs) ~= 'table' or type(stored.revs['state/' .. id]) ~= 'string' then fail('internal', 'Invalid store result for a watch page') end
+  B.rev = stored.revs['state/' .. id]
+  return true
+end
+
+local function add_ops(id, B, ops)
+  local n = 0
+  for _, op in ipairs(ops) do n = n + size(op) + 1 end
+  if B.used + n > REQUEST_BUDGET - 2048 and not commit_ops(id, B) then return false end
+  for _, op in ipairs(ops) do B.ops[#B.ops + 1] = op end
+  B.used = B.used + n
+  return true
+end
+
+-- drain_step reads one page of the automation's desired watch. A created row without a marker
+-- gets its run and marker (if_rev '0' on both). A removed or created_removed row of a marked
+-- appearance gets its rt entry. The ack (through = next) follows only when every op committed.
+local function drain_step(id)
+  local asked = S.drain[id]
+  local recs = get({'auto/' .. id, 'state/' .. id})
+  local auto, st_rec = state_of(recs['auto/' .. id]), recs['state/' .. id]
+  local st = state_of(st_rec)
+  if not auto or not st or st.deleted or not st.enabled or auto.trigger.kind ~= 'file' then S.drain[id] = nil; return false end
+  local key = watch_key(id, st.gen)
+  local w = S.watches[key]
+  -- No known watch: the reconcile ensures it and asks for the drain again.
+  if not w then S.drain[id] = nil; S.reconcile_due = true; return false end
+  local ok, page = pcall(hub, 'hub.watch.read', {key = key, watch_id = w.watch_id, limit = WATCH_PAGE})
+  if not ok then
+    if type(page) == 'table' and page.code == 'stale_watch' then
+      S.watches[key] = nil
+      S.drain[id] = nil
+      S.reconcile_due = true
+      return false
+    end
+    error(page, 0)
+  end
+  w.state = page.state
+  local rows = page.rows or {}
+  local mkeys = {}
+  for _, row in ipairs(rows) do
+    if type(row.appearance_key) ~= 'string' or appearance_watch(row.appearance_key) ~= w.watch_id then
+      fail('internal', 'A watch row has no valid appearance_key')
+    end
+    mkeys[#mkeys + 1] = marker_key(id, row.appearance_key)
+  end
+  local markers = #mkeys > 0 and get(mkeys) or {}
+  local B = {ops = {}, used = 1024, rev = st_rec.rev, st = st, next_q = st.next_q or 0}
+  for _, row in ipairs(rows) do
+    local mk = marker_key(id, row.appearance_key)
+    if row.kind == 'created' and markers[mk].rev == '0' then
+      local run_key = run_prefix(id) .. 'f/' .. row.appearance_key
+      local n = B.next_q + 1
+      local run = file_run(id, auto, row, n)
+      local ops = {{key = run_key, if_rev = '0', value = run}, {key = mk, if_rev = '0', value = {run = run_key}}}
+      if run.q then ops[#ops + 1] = {key = run.q, if_rev = '0', value = {run = run_key}} end
+      -- add_ops may first commit the earlier ops, with the earlier next_q.
+      if not add_ops(id, B, ops) then return true end
+      if run.q then B.next_q = n end
+      markers[mk] = {rev = 'new'}
+    elseif (row.kind == 'removed' or row.kind == 'created_removed') and markers[mk].rev ~= '0' then
+      if not add_ops(id, B, {{key = retire_key(id, row.appearance_key), value = {seq = row.seq}}}) then return true end
+    end
+  end
+  if not commit_ops(id, B) then return true end
+  if type(page.next) == 'string' and page.next ~= '' then
+    local acked = hub('hub.watch.ack', {key = key, watch_id = w.watch_id, through = page.next})
+    w.cursor = acked.cursor
+    S.retire[id] = S.retire[id] or true
+  end
+  if page.more then return true end
+  if S.drain[id] == asked then S.drain[id] = nil end
+  return true
+end
+
+-- retire_step deletes each marker whose removal row is acknowledged: its rt seq is at or below
+-- the watch's cursor. Then the hub has deleted that tombstone, and a new file of that name gets a
+-- new created_seq (docs/hub.md, "Rows and kinds"). After a crash between the ack and the
+-- delete, the cursor still proves it.
+local function retire_step(id)
+  local prefix = 'rt/' .. id .. '/'
+  local after = type(S.retire[id]) == 'string' and S.retire[id] or nil
+  local keys, records, more = scan(prefix, after, WATCH_PAGE)
+  local cursors = {}
+  for _, w in pairs(S.watches) do cursors[w.watch_id] = tonumber(w.cursor) end
+  local ops = {}
+  for _, k in ipairs(keys) do
+    local ak = k:sub(#prefix + 1)
+    local cursor = cursors[appearance_watch(ak) or '']
+    local seq = type(records[k].value) == 'table' and tonumber(records[k].value.seq) or nil
+    if cursor and seq and seq <= cursor then
+      ops[#ops + 1] = {key = marker_key(id, ak), delete = true}
+      ops[#ops + 1] = {key = k, delete = true}
+    end
+  end
+  if #ops > 0 then batch(ops) end
+  if #keys > 0 and type(more) == 'string' and more ~= '' then S.retire[id] = keys[#keys]; return true end
+  S.retire[id] = nil
+  return #ops > 0
+end
+
+-- sweep_step deletes the markers (and rt entries) of watches that the hub no longer lists
+-- (B2, rule 2). Steps run one at a time, so no drain makes a marker between the list and the
+-- delete.
+local function sweep_step(id)
+  local live = {}
+  for _, w in ipairs(hub('hub.watch.list').watches or {}) do live[w.watch_id] = true end
+  local prefix = 'seen/' .. id .. '/'
+  local after = type(S.sweep[id]) == 'string' and S.sweep[id] or nil
+  local keys, _, more = scan(prefix, after, WATCH_PAGE)
+  local ops = {}
+  for _, k in ipairs(keys) do
+    local ak = k:sub(#prefix + 1)
+    if not live[appearance_watch(ak) or ''] then
+      ops[#ops + 1] = {key = k, delete = true}
+      ops[#ops + 1] = {key = retire_key(id, ak), delete = true}
+    end
+  end
+  if #ops > 0 then batch(ops) end
+  if #keys > 0 and type(more) == 'string' and more ~= '' then S.sweep[id] = keys[#keys]; return true end
+  S.sweep[id] = nil
+  return #ops > 0
+end
+
 -- step does one unit of work for one automation and says whether more work may follow now.
+-- File work comes first: it only creates runs and deletes markers, so it never waits on a start.
+-- Each file stage clears its flag when it ends, and a later step does the engine work.
 local function step(id)
+  if S.drain[id] then drain_step(id); return true end
+  if S.retire[id] then retire_step(id); return true end
+  if S.sweep[id] then sweep_step(id); return true end
   local st_rec = get1('state/' .. id)
   local st = state_of(st_rec)
   if not st then return false end
@@ -532,9 +792,26 @@ local function step(id)
 end
 
 -- pump runs one step per callback, so hub requests and other callbacks do not wait long.
+-- The reconcile runs as a pump job too, so it never runs between the list and the delete of a
+-- sweep step.
 pump = function()
   if S.pumping or not S.ready then return end
   local t = wall()
+  if S.reconcile_due and (not S.reconcile_at or S.reconcile_at <= t) then
+    S.pumping = true
+    S.reconcile_due = false
+    rex.after(0, function()
+      local ok, err = pcall(reconcile)
+      if not ok then
+        print('automations: reconcile: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err)))
+        S.reconcile_due = true
+        S.reconcile_at = wall() + RECHECK
+      end
+      S.pumping = false
+      pump()
+    end)
+    return
+  end
   local id
   for candidate in pairs(S.dirty) do
     if not S.retry_at[candidate] or S.retry_at[candidate] <= t then id = candidate break end
@@ -559,15 +836,6 @@ end
 
 -- --- Schedule tick ---
 
-local function each_auto(fn)
-  local after
-  repeat
-    local keys, records, next_after = scan('auto/', after, 100)
-    for _, key in ipairs(keys) do fn(key:sub(6), records[key]) end
-    after = next_after
-  until type(after) ~= 'string' or after == ''
-end
-
 local function tick()
   local t = now()
   each_auto(function(id, rec)
@@ -580,9 +848,11 @@ local function tick()
       end
     end
   end)
-  -- Due rechecks (a pending spawn) and every automation with work: the recheck interval.
+  -- Due rechecks (a pending spawn), every automation with work, the watch reconcile and a drain
+  -- of every desired watch (the reconcile asks for them): the recheck interval.
   if not S.last_sweep or wall() - S.last_sweep >= RECHECK then
     S.last_sweep = wall()
+    S.reconcile_due = true
     each_auto(function(id) mark(id) end)
   end
   pump()
@@ -608,6 +878,15 @@ local function save(caller, args)
   local action = check_action(args.action)
   local instruction = check_instruction(args.instruction)
   local enabled = args.enabled ~= false
+  -- The hub allows 8 watches per plugin, one for each enabled file automation.
+  if enabled and trigger.kind == 'file' then
+    local others = {n = 0}
+    each_auto(function(id, rec)
+      local a = rec.value
+      if id ~= args.id and type(a) == 'table' and a.enabled and not a.deleted and a.trigger.kind == 'file' then others.n = others.n + 1 end
+    end)
+    if others.n >= 8 then fail('limit', 'At most 8 enabled file automations are possible (the hub allows 8 watches per plugin)') end
+  end
   local t = now()
   for _ = 1, 5 do
     local id, meta_op, auto_rev, old, st_rec = args.id, nil, '0', nil, nil
@@ -627,7 +906,7 @@ local function save(caller, args)
       auto_rev = args.if_rev
     end
     local st = state_of(st_rec) or {v = 1, gen = 0, next_q = 0, next_manual = 0}
-    local trigger_changed = not old or old.trigger.kind ~= trigger.kind or old.trigger.at ~= trigger.at
+    local trigger_changed = not old or canon(old.trigger) ~= canon(trigger)
     local enabling = enabled and (not old or not old.enabled)
     if trigger_changed or (old and old.enabled ~= enabled) then st.gen = (st.gen or 0) + 1 end
     st.enabled = enabled
@@ -644,6 +923,8 @@ local function save(caller, args)
     if result then
       if result.op_exists == nil and result.revs then result = {id = id, rev = result.revs['auto/' .. id]} end
       mark(id)
+      S.reconcile_due = true
+      S.reconcile_at = nil
       pump()
       return result
     end
@@ -653,12 +934,31 @@ local function save(caller, args)
   fail('unavailable', 'The automations changed during the save; try again')
 end
 
+-- watch_view is the watch state of an enabled file automation: the hub's state of its watch, or
+-- the error of its refused ensure, or pending (the reconcile has not run yet).
+local GRANT_HINT = 'Add the directory, or a parent, to plugins[automations].watch_roots in the hub config, then restart the hub.'
+local function watch_view(id, w)
+  local view
+  if w then
+    view = {state = w.state}
+    if type(w.last_error) == 'string' and w.last_error ~= '' then view.error = cut(w.last_error, MAX_ERROR) end
+  elseif S.watch_errors[id] then
+    view = {state = 'refused', code = S.watch_errors[id].code, error = S.watch_errors[id].message}
+  else
+    view = {state = 'pending'}
+  end
+  if view.state == 'not_granted' or view.code == 'watch_not_granted' then view.hint = GRANT_HINT end
+  return view
+end
+
 local function list(_, args)
   only(args, {after = true})
   if args.after ~= nil then text_arg(args.after, 'after', 64) end
   -- next is the last key in the page: scan's after is exclusive.
   local out, used, next_after, last = {}, 64, nil, args.after
   local keys, records, more = scan('auto/', args.after, 50)
+  local listed = {}
+  for _, w in ipairs(hub('hub.watch.list').watches or {}) do listed[w.key] = w end
   for _, key in ipairs(keys) do
     local auto = records[key].value
     if type(auto) == 'table' then
@@ -666,6 +966,7 @@ local function list(_, args)
       local view = {id = auto.id, rev = records[key].rev, name = auto.name, enabled = auto.enabled, trigger = auto.trigger,
         action = auto.action, instruction = auto.instruction, worker = st.worker, spawning = st.spawning and st.spawning.run or nil,
         daily_high = st.daily_high}
+      if auto.trigger.kind == 'file' and auto.enabled then view.watch = watch_view(auto.id, listed[watch_key(auto.id, st.gen)]) end
       local n = size(view) + 1
       if used + n > PAGE_BUDGET then
         if #out == 0 then fail('too_large', 'Automation ' .. auto.id .. ' is too large to list; use after = "' .. key .. '"') end
@@ -679,6 +980,34 @@ local function list(_, args)
   end
   if not next_after and type(more) == 'string' and more ~= '' then next_after = last end
   return {automations = out, next = next_after}
+end
+
+-- runs lists the runs of one automation in run key order (kind, then key). It changes nothing.
+-- A newest-first order comes with the panel (design v2 section 9).
+local function runs(_, args)
+  only(args, {id = true, after = true, limit = true})
+  local id = text_arg(args.id, 'id', 32)
+  local limit = args.limit or 20
+  if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit is an integer from 1 to 50') end
+  local prefix = run_prefix(id)
+  if args.after ~= nil and text_arg(args.after, 'after', 1024):sub(1, #prefix) ~= prefix then fail('invalid_input', 'after is a run key of this automation') end
+  local keys, records, more = scan(prefix, args.after, limit)
+  local out, used, cursor = {}, 64, nil
+  for _, key in ipairs(keys) do
+    local run = records[key].value
+    local view = {run_key = key, kind = run.kind, status = run.status, at = run.at, slot = run.slot, item = run.item, by = run.by,
+      attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary}
+    local n = size(view) + 1
+    if used + n > PAGE_BUDGET then
+      if #out == 0 then fail('too_large', 'Run ' .. key .. ' is too large to list; use after = "' .. key .. '"') end
+      cursor = out[#out].run_key
+      break
+    end
+    out[#out + 1] = view
+    used = used + n
+  end
+  if not cursor and #out > 0 and type(more) == 'string' and more ~= '' then cursor = out[#out].run_key end
+  return {runs = out, next = cursor}
 end
 
 local function run_now(caller, args)
@@ -803,23 +1132,28 @@ local agent_handlers = {
   ['automations.save'] = save,
   ['automations.list'] = list,
   ['automations.run'] = run_now,
+  ['automations.runs'] = runs,
   ['automations.read'] = read,
   ['automations.done'] = done,
 }
 local key_arg = {type = 'string', minLength = 1, maxLength = 128, description = 'Your operation key. Retry with the same key and content after an unknown outcome.'}
 local exports = {
   {name = 'automations.save', title = 'Create or change an automation',
-    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "daily", at = "HH:MM"} (local time). action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters)}. instruction: the task text for the agent. A run goes to the automation\'s worker if it runs, else the hub starts one from the profile.',
+    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "file", path, glob?} (a new file in one directory, not recursive; path is absolute or starts with ~/; glob matches the file name, default *; at most 8 enabled file automations) or {kind = "daily", at = "HH:MM"} (local time). A file automation makes one run for each appearance of a matching file; files that exist when the watch starts make none. action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters)}. instruction: the task text for the agent. A run goes to the automation\'s worker if it runs, else the hub starts one from the profile.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, if_rev = {type = 'string', minLength = 1},
       key = key_arg, name = {type = 'string', minLength = 1, maxLength = MAX_NAME}, enabled = {type = 'boolean'},
       trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION}},
       required = {'key', 'name', 'trigger', 'action', 'instruction'}, additionalProperties = false}},
   {name = 'automations.list', title = 'List automations',
-    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, worker, spawning and daily_high. When more exist, next is set: pass it as after.',
+    description = 'List the automations, at most about 40 KB a page: id, rev, name, enabled, trigger, action, instruction, worker, spawning and daily_high; for an enabled file automation, watch {state, error?, hint?} (state from the hub, refused with code, or pending). When more exist, next is set: pass it as after.',
     args = {type = 'object', properties = {after = {type = 'string', minLength = 1}}, additionalProperties = false}},
   {name = 'automations.run', title = 'Run an automation now',
     description = 'Make a manual run of an enabled automation. It does not change the daily schedule. A disabled automation is refused.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
+  {name = 'automations.runs', title = 'List the runs of an automation',
+    description = 'List the runs of one automation in run key order: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome and summary. Reading changes nothing. Pages: limit (default 20, at most 50) and about 40 KB; pass next as after.',
+    args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, after = {type = 'string', minLength = 1},
+      limit = {type = 'integer', minimum = 1, maximum = 50}}, required = {'id'}, additionalProperties = false}},
   {name = 'automations.read', title = 'Read your automation tasks',
     description = 'List the tasks delivered to you: run_key, attempt, token, automation, kind, slot, item and task (instruction, profile, args, title). Reading changes nothing. A task can come again after a worker loss: skip work that is already done. Pages: limit (default 20, at most 50) and about 40 KB; pass next as after.',
     args = {type = 'object', properties = {after = {type = 'string', minLength = 1}, limit = {type = 'integer', minimum = 1, maximum = 50}}, additionalProperties = false}},
@@ -862,6 +1196,12 @@ rex.on('client_perform_requested', function(ctx, ev)
         each_auto(function(id) mark(id); S.retry_at[id] = nil end)
         pump()
       end
+      -- A watch nudge: drain that automation's watch. The drain reads the watch_id from the
+      -- reconcile, so a nudge for an old watch_id changes nothing.
+      if args.what == 'watch' and type(args.key) == 'string' then
+        local owner = watch_owner(args.key)
+        if owner then drain_later(owner); pump() end
+      end
       return {}
     end
     if ev.action == 'view.seen' then return {} end
@@ -876,7 +1216,8 @@ rex.call('client.set_label', {label = 'lazyrex-plugin:automations'})
 rex.after(0, function()
   local ok, err = pcall(function()
     S.ready = true
-    each_auto(function(id) mark(id) end)
+    -- A crash can come after a watch remove and before its markers retire: sweep them all once.
+    each_auto(function(id) mark(id); S.sweep[id] = true end)
     S.last_sweep = wall()
     tick()
   end)

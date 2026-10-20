@@ -7,7 +7,8 @@
    {"id": "alice", "name": "Alice"}
   ],
   "args": {
-   "automations": {"clock_file": "${LAB}/clock", "tick": "1", "recheck": "1"}
-  }
+   "automations": {"clock_file": "${LAB}/clock", "tick": "1", "recheck": "1", "settle_ms": "200"}
+  },
+  "watch_roots": {"automations": ["${LAB}/inbox"]}
  }
 }

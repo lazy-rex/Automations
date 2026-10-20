@@ -55,6 +55,53 @@ return function(H)
       end}
   end
 
+  -- Files: the manifest grants LAB/inbox (test.watch_roots). dir makes a directory under it.
+  function F.dir(name)
+    local d = H.args.lab .. '/inbox/' .. name
+    local r, err = rex.exec({'mkdir', '-p', d})
+    assert(r and r.ok, 'mkdir failed: ' .. tostring(err or (r and r.stderr)))
+    return d
+  end
+  function F.put(path, text)
+    local f = assert(io.open(path, 'w'))
+    f:write(text or 'note')
+    f:close()
+  end
+  function F.remove(path) assert(os.remove(path)) end
+
+  function F.view(caller, id)
+    for _, a in ipairs(caller:call('automations.list', {}).automations) do
+      if a.id == id then return a end
+    end
+  end
+  -- watching waits until the automation's current watch is active: files that exist before
+  -- that are the baseline and make no run.
+  function F.watching(caller, id)
+    return H.wait('the watch of automation ' .. id .. ' to be active', function()
+      local a = F.view(caller, id)
+      return a and a.watch and a.watch.state == 'active' and a
+    end, 20)
+  end
+
+  -- runs lists every run of an automation (automations.runs, all pages).
+  function F.runs(caller, id, kind)
+    local out, after = {}, nil
+    repeat
+      local page = caller:call('automations.runs', {id = id, after = after, limit = 50})
+      for _, r in ipairs(page.runs) do
+        if not kind or r.kind == kind then out[#out + 1] = r end
+      end
+      after = page.next
+    until not after
+    return out
+  end
+  function F.wait_runs(caller, id, n, timeout)
+    return H.wait(n .. ' file runs of automation ' .. id, function()
+      local runs = F.runs(caller, id, 'f')
+      return #runs >= n and runs
+    end, timeout or 20)
+  end
+
   function F.run(key) return H.store(key).value end
   function F.wait_status(key, status, timeout)
     return H.wait('run ' .. key .. ' to be ' .. status, function()
