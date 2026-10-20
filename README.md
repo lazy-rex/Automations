@@ -197,6 +197,10 @@ cd ../../Automations && lazyrex-hub test
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in
   `~/knowledge`; the vault inbox watch shows the grant hint.
+- restart.lua (blocked-commit recovery, not an outage: an injection fails each batch of the due
+  run until a crash): a blocked daily slot runs exactly once after the restart, also after a
+  second crash; after a jump over several dates only the newest date is tried and runs once; a
+  crash after a delete and a preset reinstall ends the old cleanup and keeps the new reservation.
 - runs.lua: a mixed set over byte-limited pages gives every run once, in phase order; a page of
   only skipped entries is empty and has `next`; the cursor crosses an empty phase; malformed cursors
   are refused.
