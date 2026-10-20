@@ -889,7 +889,10 @@ local function purge_step(id, st_rec)
   return false
 end
 
--- prune_step keeps the newest KEEP_RUNS terminal runs. It reads the entries after the newest
+-- prune_step keeps the newest KEEP_RUNS terminal runs. It reads state/<id> first: every change of
+-- the terminal set (a terminal change, a retry) writes it, and the prune batch writes it back
+-- unchanged with the observed rev. So a change after the read makes the batch fail, and the next
+-- step computes the cutoff again (review of 451691c, R1). Then it reads the entries after the newest
 -- KEEP_RUNS (the scan gives each entry's rev) and gets their runs. A run whose run.t is that
 -- entry and that is terminal goes with its entry; any other entry is stale and goes alone. Each
 -- delete has the observed rev, so a run that a retry made active, or a changed entry, stays: the
@@ -898,6 +901,8 @@ local KEEP_RUNS, PRUNE_PAGE = 100, 50
 local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
 local function prune_step(id)
   local prefix = 't/' .. id .. '/'
+  local st_rec = get1('state/' .. id)
+  if not state_of(st_rec) then S.prune[id] = nil; return false end
   local keep, _, more = scan(prefix, nil, KEEP_RUNS)
   if #keep < KEEP_RUNS or type(more) ~= 'string' or more == '' then S.prune[id] = nil; return false end
   local old, records = scan(prefix, keep[#keep], PRUNE_PAGE)
@@ -912,7 +917,7 @@ local function prune_step(id)
     end
   end
   local runs = #run_keys > 0 and get(run_keys) or {}
-  local B = {ops = {}, used = 1024, n = 0}
+  local B = fenced(id, st_rec)
   for _, k in ipairs(old) do
     local v = records[k].value
     local rr = type(v) == 'table' and runs[v.run] or nil
@@ -922,7 +927,7 @@ local function prune_step(id)
     end
     if not fits(B, ops) then break end
   end
-  batch(B.ops)
+  send_fenced(B)
   return true
 end
 

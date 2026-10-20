@@ -190,3 +190,46 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   for n = 11, 60 do expect(exists(rk(n))).to_be(false) end
   expect(store('state/' .. id).value.next_t).to_be(160)
 end)
+
+-- The reviewer's race (review of 451691c, R1): the prune chose sequence 1 from 101 entries, and a
+-- retry makes sequence 101 active before the prune batch commits. Then 100 terminal runs are
+-- left, so sequence 1 must stay. The injection commits the retry's records just before the
+-- batch that deletes entry 1; the retry writes state/<id>, so the prune's state fence fails.
+test('a retry between the prune read and its batch keeps the oldest run', function()
+  local id = automation('race')
+  local gate = hold(id, 'race')
+  local function rk(n) return 'run/' .. id .. '/m/' .. string.format('%06d', 500 + n) end
+  local function cancelled(n)
+    return {v = 1, auto = id, name = 'Keep race', kind = 'm', by = 'alice', at = T0, task = {instruction = 'Keep task.', profile = 'worker'},
+      status = 'cancelled', attempt = 0, starts = 0, cancelled = {by = 'alice', at = T0}, t = tkey(id, n), tseq = n}
+  end
+  for lo = 1, 81, 40 do
+    local ops = {}
+    for n = lo, math.min(lo + 39, 100) do
+      ops[#ops + 1] = {key = rk(n), if_rev = '0', value = cancelled(n)}
+      ops[#ops + 1] = {key = tkey(id, n), if_rev = '0', value = {run = rk(n), seq = n}}
+    end
+    write(ops)
+  end
+  local rec = store('state/' .. id)
+  local st = rec.value
+  st.next_t = 101
+  write({{key = 'state/' .. id, if_rev = rec.rev, value = st}})
+  -- The retry of run 101: queued with a queue entry, its entry deleted, and the state written.
+  local retried = cancelled(101)
+  retried.status, retried.t, retried.tseq, retried.retries = 'queued', nil, nil, 1
+  retried.q = string.format('q/%s/%012d', id, 2)
+  local after = store('state/' .. id).value
+  after.next_q = 2
+  local race = inject({match = {writes = tkey(id, 1)}, ops = {
+    {key = rk(101), value = retried}, {key = tkey(id, 101), delete = true},
+    {key = retried.q, value = {run = rk(101)}}, {key = 'state/' .. id, value = after}}})
+  write({{key = rk(101), if_rev = '0', value = cancelled(101)}, {key = tkey(id, 101), if_rev = '0', value = {run = rk(101), seq = 101}}})
+  wait('the concurrent retry', function() return injection(race).consumed == 1 end, 20)
+  rex.sleep(2)
+  expect(store(rk(101)).value.status).to_be('queued')
+  expect(exists(rk(1))).to_be(true)
+  expect(exists(tkey(id, 1))).to_be(true)
+  for n = 2, 100 do expect(exists(rk(n))).to_be(true) end
+  fault_release(gate)
+end)

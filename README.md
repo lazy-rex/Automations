@@ -142,7 +142,7 @@ cd ../../Automations && lazyrex-hub test
   a new sequence; a clock moved back keeps the latest run; done takes a sequence, and its replay
   gives the same result; a file run pruned before its ack makes no second run; a crash between
   prune batches (a backlog from the harness `write`, an injection that fails the second batch)
-  leaves exactly the newest 100.
+  leaves exactly the newest 100; a retry between the prune read and its batch keeps the oldest run.
 - reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
   worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
   reads its task; a hub crash after the loss (fixed by a gate on the second start) moves the task
