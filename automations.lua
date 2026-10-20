@@ -1413,8 +1413,8 @@ local function commit_managed(id, auto, auto_rev, st, st_rev, op, extra)
   return nil
 end
 
--- set_enabled changes only the flag. A change makes a new gen: disable stops new admission (a new
--- run, a new start), and the runs already admitted continue. Enable moves the daily baseline (B4)
+-- set_enabled changes only the flag. A change makes a new gen: disable stops new run admission,
+-- and the runs already admitted continue (a queued run can still start a worker). Enable moves the daily baseline (B4)
 -- and makes a new watch, so files from the disabled time make no run.
 local function set_enabled(caller, args)
   only(args, {id = true, enabled = true, key = true})
@@ -1718,7 +1718,7 @@ local exports = {
     description = 'Make a manual run of an enabled automation. It does not change the daily schedule. A disabled automation is refused.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, key = key_arg}, required = {'id', 'key'}, additionalProperties = false}},
   {name = 'automations.set_enabled', title = 'Enable or disable an automation',
-    description = 'Enable or disable an automation (id, enabled). Disable stops new runs and new starts; runs already queued, starting or delivered continue. Enable starts the schedule from now (no catch-up for the disabled time) and a new file watch (files from the disabled time make no run). At most 8 enabled file automations.',
+    description = 'Enable or disable an automation (id, enabled). Disable stops new run admission (no new run); runs already admitted continue: a queued run can still start a worker and be delivered. Enable starts the schedule from now (no catch-up for the disabled time) and a new file watch (files from the disabled time make no run). At most 8 enabled file automations.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, enabled = {type = 'boolean'}, key = key_arg},
       required = {'id', 'enabled', 'key'}, additionalProperties = false}},
   {name = 'automations.delete', title = 'Delete an automation and its run history',

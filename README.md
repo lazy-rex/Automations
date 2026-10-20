@@ -114,7 +114,8 @@ minute and never reads `isdst`.
 
 ## Lifecycle
 
-- Disable stops new runs and new starts. Runs already queued, starting or delivered continue.
+- Disable stops new run admission: no new run is made. Runs already admitted continue: a queued
+  run can still start a worker and be delivered, and a starting or delivered run goes on.
   Enable starts the schedule from now and makes a new file watch, so the disabled time makes no run.
 - Delete also deletes the run history, and frees its preset. The delete commits a fence first: the automation record
   stays as a tombstone, and no new run, start or delivery of a queued run commits after it. Then
