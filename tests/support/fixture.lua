@@ -1,0 +1,55 @@
+-- The shared lab fixture: the test clock, an agent profile whose worker is a real test agent, and
+-- calls as that worker. Load it with loadfile(...)(H).
+return function(H)
+  local F = {}
+
+  -- The plugin reads LAB/clock (manifest test.args clock_file) at each 1 s tick.
+  function F.set_clock(t)
+    local f = assert(io.open(H.args.lab .. '/clock', 'w'))
+    f:write(tostring(t))
+    f:close()
+  end
+  function F.at(y, m, d, hh, mm) return os.time({year = y, month = m, day = d, hour = hh, min = mm, sec = 0}) end
+
+  -- The worker profile starts lazyrex-hub testagent in the spawned pane. It joins as the spawn's
+  -- agent ID (LAZYREX_AGENT, set by the hub), and its client label names that ID, so a test can
+  -- call as the worker. Profile commands are trusted test code (docs/testing.md, "Isolation").
+  function F.profiles()
+    H.write_profiles({profiles = {
+      {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c',
+        'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin}},
+      {id = 'tasked', name = 'Tasked', kind = 'agent', args = {{name = 'task', label = 'Task', required = true}},
+        command = {'/bin/sh', '-c', 'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin, '${task}'}},
+      {id = 'logtail', name = 'Log tail', kind = 'accessory', command = {'/bin/sh', '-c', 'exec tail -f /dev/null'}},
+    }})
+  end
+
+  function F.workers(profile)
+    local out = {}
+    for _, w in ipairs(H.hub('hub.workers', {}).workers) do
+      if not profile or w.profile == profile then out[#out + 1] = w end
+    end
+    return out
+  end
+
+  -- worker returns a caller for the test agent in a spawned pane: call goes through the agent
+  -- face (the MCP path), as an agent's tool call.
+  function F.worker(agent_id)
+    local client = H.wait('the worker ' .. agent_id .. ' to start', function() return H.resolve('lazyrex-testagent:' .. agent_id) end, 20)
+    H.wait('the worker ' .. agent_id .. ' to join', function()
+      local s = H.perform(client, 'agent.status', {})
+      return s.joined
+    end, 20)
+    return {id = agent_id, call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end}
+  end
+
+  function F.run(key) return H.store(key).value end
+  function F.wait_status(key, status, timeout)
+    return H.wait('run ' .. key .. ' to be ' .. status, function()
+      local run = H.store(key).value
+      return run and run.status == status and run
+    end, timeout or 20)
+  end
+
+  return F
+end

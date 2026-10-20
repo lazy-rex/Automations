@@ -1,0 +1,13 @@
+{
+ "name": "automations",
+ "main": "automations.lua",
+ "notice": "Automation task. Call automations_read.",
+ "test": {
+  "agents": [
+   {"id": "alice", "name": "Alice"}
+  ],
+  "args": {
+   "automations": {"clock_file": "${LAB}/clock", "tick": "1", "recheck": "1"}
+  }
+ }
+}
