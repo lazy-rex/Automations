@@ -176,19 +176,21 @@ local function only(args, allowed)
 end
 
 -- watch_path expands a leading ~ with HOME (the hub does not expand it) and requires an
--- absolute, clean path: hub.watch.ensure refuses any other.
+-- absolute, clean path: hub.watch.ensure and hub.spawn {cwd} refuse any other. name is the
+-- argument for the error text.
 local MAX_PATH = 1024
-local function watch_path(p)
+local function watch_path(p, name)
+  name = name or 'trigger.path'
   if p == '~' or p:sub(1, 2) == '~/' then
     local home = os.getenv('HOME')
     if type(home) ~= 'string' or home:sub(1, 1) ~= '/' then fail('invalid_input', 'HOME is not set, so ~ cannot be expanded') end
     if home ~= '/' then home = home:gsub('/+$', '') end
     p = home .. p:sub(2)
   end
-  if p:sub(1, 1) ~= '/' then fail('invalid_input', 'trigger.path is an absolute directory path or starts with ~/') end
-  if #p > MAX_PATH then fail('invalid_input', 'trigger.path is at most ' .. MAX_PATH .. ' bytes') end
+  if p:sub(1, 1) ~= '/' then fail('invalid_input', name .. ' is an absolute directory path or starts with ~/') end
+  if #p > MAX_PATH then fail('invalid_input', name .. ' is at most ' .. MAX_PATH .. ' bytes') end
   if p ~= '/' and (p:find('//', 1, true) or p:sub(-1) == '/' or (p .. '/'):find('/%.%.?/')) then
-    fail('invalid_input', 'trigger.path must be clean: no //, no /./ or /../ part, no / at the end')
+    fail('invalid_input', name .. ' must be clean: no //, no /./ or /../ part, no / at the end')
   end
   return p
 end
@@ -214,11 +216,23 @@ local function check_trigger(t)
   fail('invalid_input', 'trigger.kind must be file or daily')
 end
 
+-- existing_dir checks the directory with /bin/test -d (argv, no shell). Observed on Rex
+-- 0.0.1792158932-g88fd41 (lab, rex do): code 0 for a directory, code 1 for a missing path or a
+-- file, and nil plus an error when the program cannot run. Only code 1 is a definite no; any
+-- other result is uncertain, so save fails with unavailable and stores nothing. The hub checks
+-- the directory again at each start (hub.spawn {cwd}).
+local function existing_dir(p)
+  local r, err = rex.exec({'/bin/test', '-d', p})
+  if type(r) == 'table' and r.code == 0 then return p end
+  if type(r) == 'table' and r.code == 1 then fail('invalid_input', 'action.cwd is not an existing directory: ' .. p) end
+  fail('unavailable', 'The directory check failed: ' .. tostring(err or (type(r) == 'table' and r.code)))
+end
+
 -- check_action validates the profile now: it must exist, be an agent profile, have every
 -- required arg, and declare every given arg. The same check runs again at each new start.
 local function check_action(a)
   if type(a) ~= 'table' then fail('invalid_input', 'action is required') end
-  only(a, {profile = true, args = true, title = true})
+  only(a, {profile = true, args = true, title = true, cwd = true})
   local profile_id = text_arg(a.profile, 'action.profile', 32)
   local profile
   for _, p in ipairs(hub('hub.profiles').profiles or {}) do
@@ -244,6 +258,7 @@ local function check_action(a)
   if next(args) and size(args) > MAX_ARGS_ENCODED then fail('invalid_input', 'action.args is over ' .. MAX_ARGS_ENCODED .. ' bytes encoded') end
   local out = {profile = profile_id}
   if next(args) then out.args = args end
+  if a.cwd ~= nil and a.cwd ~= '' then out.cwd = existing_dir(watch_path(text_arg(a.cwd, 'action.cwd', MAX_PATH), 'action.cwd')) end
   if a.title ~= nil and a.title ~= '' then
     out.title = text_arg(a.title, 'action.title', MAX_TEXT)
     -- hub.spawn allows at most 60 characters (Unicode characters; hub workers.go at 06b22ca).
@@ -324,7 +339,7 @@ local function state_of(record) return type(record.value) == 'table' and record.
 -- S.watch_errors: the refused ensure of an automation. S.drain, S.retire and S.sweep: file work
 -- that waits for an automation (section 6 below).
 local S = {dirty = {}, pumping = false, retry_at = {}, ready = false, reconcile_due = true,
-  watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}}
+  watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}, dv_after = {}}
 
 local function mark(id) S.dirty[id] = true end
 local pump -- forward
@@ -355,7 +370,7 @@ local function create_run(id, gen, kind, k, extra, op)
     if existing.rev ~= '0' then return run_key, 'exists' end
     local n = (st.next_q or 0) + 1
     local run = {v = 1, auto = id, name = auto.name, kind = kind, by = op and op.by or 'schedule', at = now(),
-      task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title},
+      task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title, cwd = auto.action.cwd},
       status = 'queued', attempt = 0, starts = 0, q = queue_key(id, n)}
     if kind == 'd' then run.slot = k end
     if size(run) > RUN_BUDGET then fail('internal', 'The run record is over ' .. RUN_BUDGET .. ' bytes encoded') end
@@ -439,8 +454,14 @@ local function spawn_request(run_key, starts, task)
   local r = {['for'] = 'user', profile = task.profile, key = 'automations/spawn/' .. run_key .. '/' .. starts}
   if task.args and next(task.args) then r.args = task.args end
   r.title = task.title or nil
+  r.cwd = task.cwd or nil
   return r
 end
+
+-- spec is what a worker was started with: a run goes to the current worker only when its spec
+-- is the same (the coordinator's rule, 2026-10-20: one current worker for each automation).
+-- The title is not part of it.
+local function spec(task) return canon({profile = task.profile, args = task.args or {}, cwd = task.cwd or ''}) end
 
 -- profile_problem checks a stored task against the current profiles, as save does. It returns
 -- the refusal text, or nil. A failed hub.profiles read raises, so the step tries again later.
@@ -482,7 +503,7 @@ local function spawn_step(id, st_rec)
     result = {status = 'failed', error = type(result) == 'table' and result.message or tostring(result)}
   end
   if result.status == 'open' and type(result.agent_id) == 'string' and result.agent_id ~= '' then
-    st.worker = {spawn_id = result.spawn_id, agent_id = result.agent_id}
+    st.worker = {spawn_id = result.spawn_id, agent_id = result.agent_id, spec = spec(run_rec.value.task)}
     st.spawning = nil
     local ops = deliver_ops(id, sp.run, run_rec, result.agent_id, result.spawn_id)
     ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
@@ -549,18 +570,22 @@ local function lost_ops(id, st, run_key, run_rec)
   }
 end
 
--- lost_step requeues one delivered run whose worker is gone (after a delete it cancels it): a
--- run of an older worker, or any run when the current worker definitely does not run (then the
--- worker is forgotten). It returns
--- nil when every delivered run belongs to a running worker. An uncertain observation raises
--- (worker_runs), so nothing is requeued on a guess.
+-- lost_step requeues one delivered run whose worker is gone (after a delete it cancels it). A
+-- run of an older worker (an action change starts a new current worker) is checked against its
+-- own spawn: that worker finishes the tasks that it has. When the current worker definitely does
+-- not run, it is forgotten. An uncertain observation raises (worker_runs), so nothing is
+-- requeued on a guess.
+-- The scan goes one page at a time from S.dv_after[id] and wraps at the end, so a page of live
+-- tasks never hides a later lost one (review of the 6a plan, point 2). A page with a requeue or a
+-- repair is read again by the next step. It returns nil when the page has no lost run.
+local DV_PAGE = 20
 local function lost_step(id, st_rec)
   local st = st_rec.value
   local prefix = 'dv/' .. id .. '/'
-  local keys = scan(prefix, nil, 20)
-  if #keys == 0 then return nil end
+  local keys, _, more = scan(prefix, S.dv_after[id], DV_PAGE)
+  if #keys == 0 then S.dv_after[id] = nil; return nil end
   local current = type(st.worker) == 'table' and st.worker.spawn_id or nil
-  local runs = nil
+  local seen = {}
   for _, key in ipairs(keys) do
     local run_key = key:sub(#prefix + 1)
     local run_rec = get1(run_key)
@@ -570,21 +595,21 @@ local function lost_step(id, st_rec)
       batch({{key = key, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
       return true
     end
-    if run_rec.value.spawn_id ~= current then
-      local ops = lost_ops(id, st, run_key, run_rec)
-      ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
-      batch(ops)
-      return true
+    local run = run_rec.value
+    local sid = tostring(run.spawn_id)
+    if seen[sid] == nil then
+      if run.spawn_id == current then seen[sid] = worker_runs(st.worker)
+      else seen[sid] = worker_runs({spawn_id = run.spawn_id, agent_id = run.agent}) end
     end
-    if runs == nil then runs = worker_runs(st.worker) end
-    if not runs then
-      st.worker = nil
+    if not seen[sid] then
+      if run.spawn_id == current then st.worker = nil end
       local ops = lost_ops(id, st, run_key, run_rec)
       ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
       batch(ops)
       return true
     end
   end
+  if type(more) == 'string' and more ~= '' then S.dv_after[id] = keys[#keys] else S.dv_after[id] = nil end
   return nil
 end
 
@@ -663,7 +688,7 @@ end
 local function file_run(id, auto, row, n)
   local run = {v = 1, auto = id, name = auto.name, kind = 'f', by = 'watch', at = now(),
     item = {name = row.name, path = row.path, seq = row.seq, watch_id = appearance_watch(row.appearance_key)},
-    task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title},
+    task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title, cwd = auto.action.cwd},
     status = 'queued', attempt = 0, starts = 0, q = queue_key(id, n)}
   if size(run) <= RUN_BUDGET then return run end
   run.item = {seq = row.seq, watch_id = run.item.watch_id, path_bytes = #tostring(row.path), name = cut(tostring(row.name), MAX_TEXT)}
@@ -952,15 +977,16 @@ local function step(id)
   local lost = lost_step(id, st_rec)
   if lost ~= nil then return lost end
   if st.deleted then
-    if #scan('dv/' .. id .. '/', nil, 1) > 0 then return false end
+    if #scan('dv/' .. id .. '/', nil, 1) > 0 then return S.dv_after[id] ~= nil end
     return purge_step(id, st_rec)
   end
   local keys, records = scan('q/' .. id .. '/', nil, 1)
-  if #keys == 0 then return false end
+  -- A delivered-run pass that is not at its end continues in the next step.
+  if #keys == 0 then return S.dv_after[id] ~= nil end
   local run_key = records[keys[1]].value.run
   local run_rec = get1(run_key)
   if run_rec.rev == '0' or run_rec.value.status ~= 'queued' then fail('internal', 'Queue entry ' .. keys[1] .. ' names no queued run') end
-  if worker_runs(st.worker) then
+  if type(st.worker) == 'table' and st.worker.spec == spec(run_rec.value.task) and worker_runs(st.worker) then
     local ops = deliver_ops(id, run_key, run_rec, st.worker.agent_id, st.worker.spawn_id)
     ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
     batch(ops)
@@ -1524,7 +1550,7 @@ local agent_handlers = {
 local key_arg = {type = 'string', minLength = 1, maxLength = 128, description = 'Your operation key. Retry with the same key and content after an unknown outcome.'}
 local exports = {
   {name = 'automations.save', title = 'Create or change an automation',
-    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "file", path, glob?} (a new file in one directory, not recursive; path is absolute or starts with ~/; glob matches the file name, default *; at most 8 enabled file automations) or {kind = "daily", at = "HH:MM"} (local time). A file automation makes one run for each appearance of a matching file; files that exist when the watch starts make none. action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters)}. instruction: the task text for the agent. A run goes to the automation\'s worker if it runs, else the hub starts one from the profile.',
+    description = 'Create an automation (no id) or change one (id and if_rev from automations.list). trigger: {kind = "file", path, glob?} (a new file in one directory, not recursive; path is absolute or starts with ~/; glob matches the file name, default *; at most 8 enabled file automations) or {kind = "daily", at = "HH:MM"} (local time). A file automation makes one run for each appearance of a matching file; files that exist when the watch starts make none. action: {profile (an agent profile from hub.profiles), args?, title? (the tab title, at most 60 characters), cwd? (the worker\'s directory: absolute or ~/, and it must exist)}. instruction: the task text for the agent. A run goes to the automation\'s current worker if it runs and was started with the same profile, args and cwd; else the hub starts a new worker. After a change of those, the old worker finishes the tasks that it has and gets no new ones.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, if_rev = {type = 'string', minLength = 1},
       key = key_arg, name = {type = 'string', minLength = 1, maxLength = MAX_NAME}, enabled = {type = 'boolean'},
       trigger = {type = 'object'}, action = {type = 'object'}, instruction = {type = 'string', minLength = 1, maxLength = MAX_INSTRUCTION}},

@@ -30,8 +30,16 @@ plugin's store), and the same store batch sets a hub notice for the worker. The 
 notice text into the worker's pane when the worker is ready. The worker reads its tasks with
 `automations.read` and completes each one with `automations.done`.
 
-- Each automation keeps its own worker (the spawn that it started). It never chooses an agent by
-  profile.
+- Each automation keeps one current worker (the spawn that it started). It never chooses an agent
+  by profile. A run goes to the current worker only when the worker was started with the same
+  profile, args and working directory (`action.cwd`) as the run. After a change of those, the next
+  run starts a new worker, and the old worker finishes the tasks that it has and gets no new ones.
+  A change back to an earlier action also starts a new worker.
+- `action.cwd` is the worker's directory. Save expands a leading `~` with `HOME` and checks that
+  the directory exists (`/bin/test -d`); the hub checks it again at each start. A run keeps the
+  action of its time, and a pending start replays its stored request.
+- The plugin checks the delivered runs a page at a time and wraps at the end, so a page of live
+  tasks never hides a lost one.
 - A worker runs when its `hub.workers` row has state `running` and its agent is current. In
   `hub.workers`, `status` is the pane's program status; the row's lifecycle is `state`.
 - The plugin starts a worker with `hub.spawn` and `for: "user"`, from its own timer. It stores
@@ -157,6 +165,11 @@ cd ../../Automations && lazyrex-hub test
 - start.lua: an unknown start outcome (client_unavailable from `hub.spawn`) keeps the stored
   request and replays its key, so one worker starts; a definite refusal fails the run; a profile
   that is no longer an agent profile fails the run before a start, and the next run is not blocked.
+- action.lua: save checks `action.cwd`; a run starts its worker in that directory; a changed
+  cwd or changed args start a new worker, and the old worker keeps its task; a pending start
+  across an edit opens with its stored request; an old worker's lost task starts a worker with its
+  own spec; A, B, then A again starts a third worker; a lost task after 20 live tasks moves, and a
+  crash keeps every holder.
 - watch_reconcile.lua: a directory change moves the watch, and old watches are removed (ten
   changes stay under the limit of 8); a crash after the save, after the remove and after the ensure,
   and lost remove and ensure replies, converge; files from a disabled time make no run.
