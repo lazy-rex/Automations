@@ -113,6 +113,10 @@ local function now()
   end
   return os.time()
 end
+-- wall is the real clock. Retry and recheck times use it, so a step that failed is tried again
+-- also while a test holds the test clock still. Schedules, run times and the unknown_start age
+-- use now().
+local function wall() return os.time() end
 local TICK = tonumber(rex.args.tick) or 60
 local RECHECK = tonumber(rex.args.recheck) or 300
 local UNKNOWN_AFTER = 600
@@ -377,7 +381,7 @@ local function spawn_step(id, st_rec)
   local ok, result = pcall(hub, 'hub.spawn', sp.request)
   if not ok then
     local code = type(result) == 'table' and result.code or 'unavailable'
-    if code == 'unavailable' then S.retry_at[id] = now() + RECHECK; return false end
+    if code == 'unavailable' then S.retry_at[id] = wall() + RECHECK; return false end
     result = {status = 'failed', error = type(result) == 'table' and result.message or tostring(result)}
   end
   if result.status == 'open' and type(result.agent_id) == 'string' and result.agent_id ~= '' then
@@ -394,7 +398,7 @@ local function spawn_step(id, st_rec)
       run.status = 'unknown_start'
       batch({{key = sp.run, if_rev = run_rec.rev, value = run}})
     end
-    S.retry_at[id] = now() + RECHECK
+    S.retry_at[id] = wall() + RECHECK
     return false
   end
   local run = run_rec.value
@@ -436,7 +440,7 @@ end
 -- pump runs one step per callback, so hub requests and other callbacks do not wait long.
 pump = function()
   if S.pumping or not S.ready then return end
-  local t = now()
+  local t = wall()
   local id
   for candidate in pairs(S.dirty) do
     if not S.retry_at[candidate] or S.retry_at[candidate] <= t then id = candidate break end
@@ -449,7 +453,7 @@ pump = function()
     local ok, more = pcall(step, id)
     if not ok then
       print('automations: step ' .. id .. ': ' .. (type(more) == 'table' and tostring(more.message) or tostring(more)))
-      S.retry_at[id] = now() + RECHECK
+      S.retry_at[id] = wall() + RECHECK
       S.dirty[id] = true
     elseif more or S.retry_at[id] then
       S.dirty[id] = true
@@ -483,8 +487,8 @@ local function tick()
     end
   end)
   -- Due rechecks (a pending spawn) and every automation with work: the recheck interval.
-  if not S.last_sweep or t - S.last_sweep >= RECHECK then
-    S.last_sweep = t
+  if not S.last_sweep or wall() - S.last_sweep >= RECHECK then
+    S.last_sweep = wall()
     each_auto(function(id) mark(id) end)
   end
   pump()
@@ -782,7 +786,7 @@ rex.after(0, function()
   local ok, err = pcall(function()
     S.ready = true
     each_auto(function(id) mark(id) end)
-    S.last_sweep = now()
+    S.last_sweep = wall()
     tick()
   end)
   if not ok then print('automations: startup: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end

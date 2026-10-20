@@ -65,7 +65,10 @@ cd ../../Automations && lazyrex-hub test
 - deliver.lua: a daily tick starts one worker, which reads and completes its task; a second run
   goes to the running worker; a lost `hub.spawn` reply starts one worker; `done` from another agent
   or for another attempt is refused.
+- worker.lua: a failed observation (a hub call that fails) keeps the running worker, and the step
+  tries again; a stopped worker is replaced.
 
 The test manifest sets the plugin args `clock_file` (a file with epoch seconds: the test clock),
-`tick` and `recheck` (seconds). `tests/support/fixture.lua` writes an agent profile whose worker is
+`tick` and `recheck` (seconds). Retries use the real clock, so they continue while a test holds
+the test clock still. `tests/support/fixture.lua` writes an agent profile whose worker is
 a real test agent (`lazyrex-hub testagent`), so a test can call the plugin as the worker.
