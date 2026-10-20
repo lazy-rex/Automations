@@ -334,15 +334,23 @@ local function worker_runs(worker)
   -- In hub.workers, state is the row's lifecycle (starting, running, exited, failed); status is
   -- the pane's program status, not the spawn row's (hub/cmd/hub/workers.go at 06b22ca).
   if not row or row.state ~= 'running' then return false end
+  -- Only a definite answer says that the agent is gone: the hub knows no such agent, or the
+  -- identity is not current. Any other failure raises, so the step keeps the worker and tries
+  -- again later (review of 3b2cba7, R1). hub.workers and hub.agents raise the same way.
   local ok, resolved = pcall(hub, 'hub.agents.resolve', {to = worker.agent_id})
-  if not ok or type(resolved.id) ~= 'string' then return false end
+  if not ok then
+    local message = type(resolved) == 'table' and tostring(resolved.message) or tostring(resolved)
+    if message:find('no agent matches', 1, true) then return false end
+    error(resolved, 0)
+  end
+  if type(resolved.id) ~= 'string' or resolved.id == '' then fail('internal', 'hub.agents.resolve gave no id') end
   for _, a in ipairs(hub('hub.agents', {all = true}).agents or {}) do
     if a.id == resolved.id then
       if a.legacy then return a.alias_of == nil end
       return a.state == 'current'
     end
   end
-  return false
+  fail('unavailable', 'hub.agents does not list ' .. resolved.id .. ' yet')
 end
 
 -- deliver_ops: the run becomes delivered to agent, with a new attempt; its box entry and the
