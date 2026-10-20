@@ -324,7 +324,7 @@ local function state_of(record) return type(record.value) == 'table' and record.
 -- S.watch_errors: the refused ensure of an automation. S.drain, S.retire and S.sweep: file work
 -- that waits for an automation (section 6 below).
 local S = {dirty = {}, pumping = false, retry_at = {}, ready = false, reconcile_due = true,
-  watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}}
+  watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}}
 
 local function mark(id) S.dirty[id] = true end
 local pump -- forward
@@ -451,6 +451,22 @@ local function profile_problem(task)
   error(err, 0)
 end
 
+-- --- Run retention (design v2 section 10; retention amendment 1) ---
+
+-- Every batch that makes a run terminal takes the next terminal sequence from state.next_t (the
+-- batch has the state fence) and writes the index entry t/<id>/<inv> = {run, seq}. inv counts
+-- down from MAX_T, so a scan gives the newest first. The order never depends on the clock.
+local MAX_T = 999999999999
+local function terminal_op(st, id, run_key, run)
+  local n = (st.next_t or 0) + 1
+  if n > MAX_T then fail('internal', 'Automation ' .. id .. ' has used every terminal sequence') end
+  st.next_t = n
+  local key = string.format('t/%s/%012d', id, MAX_T - n)
+  run.t, run.tseq = key, n
+  S.prune[id] = true
+  return {key = key, if_rev = '0', value = {run = run_key, seq = n}}
+end
+
 -- --- Engine steps (design v2 section 5; amendment 1, B1) ---
 
 -- spawn_step replays the stored spawn request (never a new key) and applies its result.
@@ -488,7 +504,8 @@ local function spawn_step(id, st_rec)
   local q = run.q
   run.q = nil
   st.spawning = nil
-  batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+  local t_op = terminal_op(st, id, sp.run, run)
+  batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, t_op, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
   return true
 end
 
@@ -524,6 +541,7 @@ local function lost_ops(id, st, run_key, run_rec)
   run.lost = {agent = agent, spawn_id = run.spawn_id, attempt = run.attempt, at = now()}
   run.status, run.error = 'cancelled', 'worker lost after delete'
   return {
+    terminal_op(st, id, run_key, run),
     {key = run_key, if_rev = run_rec.rev, value = run},
     {key = delivered_key(id, run_key), delete = true},
     {key = box, delete = true},
@@ -718,6 +736,7 @@ local function drain_step(id)
       local run = file_run(id, auto, row, n)
       local ops = {{key = run_key, if_rev = '0', value = run}, {key = mk, if_rev = '0', value = {run = run_key}}}
       if run.q then ops[#ops + 1] = {key = run.q, if_rev = '0', value = {run = run_key}} end
+      if run.status == 'failed' then ops[#ops + 1] = terminal_op(B.st, id, run_key, run) end
       -- add_ops may first commit the earlier ops, with the earlier next_q.
       if not add_ops(id, B, ops) then return true end
       if run.q then B.next_q = n end
@@ -835,7 +854,10 @@ local function cancel_step(id, st_rec)
     if run_rec.rev ~= '0' and run_rec.value.status == 'queued' then
       local run = run_rec.value
       run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
-      if B.n >= CLEANUP_RUNS or not fits(B, {{key = run_keys[i], if_rev = run_rec.rev, value = run}, {key = key, delete = true}}) then break end
+      if B.n >= CLEANUP_RUNS then break end
+      -- A run that does not fit keeps its sequence unused: a gap, never a reuse.
+      local t_op = terminal_op(st_rec.value, id, run_keys[i], run)
+      if not fits(B, {{key = run_keys[i], if_rev = run_rec.rev, value = run}, {key = key, delete = true}, t_op}) then break end
     end
   end
   if B.n == 0 then return nil end
@@ -846,7 +868,7 @@ end
 -- purge_step deletes the records of a deleted automation when no run is active: markers, rt
 -- entries, queue entries left over, and the terminal runs. The last batch deletes the state and
 -- the auto tombstone.
-local PURGE = {'seen/', 'rt/', 'q/', 'run/'}
+local PURGE = {'seen/', 'rt/', 'q/', 't/', 'run/'}
 local ACTIVE = {queued = true, starting = true, unknown_start = true, delivered = true}
 local function purge_step(id, st_rec)
   for _, p in ipairs(PURGE) do
@@ -867,6 +889,43 @@ local function purge_step(id, st_rec)
   return false
 end
 
+-- prune_step keeps the newest KEEP_RUNS terminal runs. It reads the entries after the newest
+-- KEEP_RUNS (the scan gives each entry's rev) and gets their runs. A run whose run.t is that
+-- entry and that is terminal goes with its entry; any other entry is stale and goes alone. Each
+-- delete has the observed rev, so a run that a retry made active, or a changed entry, stays: the
+-- batch commits nothing, and a later step reads again. Markers are never touched (B2).
+local KEEP_RUNS, PRUNE_PAGE = 100, 50
+local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
+local function prune_step(id)
+  local prefix = 't/' .. id .. '/'
+  local keep, _, more = scan(prefix, nil, KEEP_RUNS)
+  if #keep < KEEP_RUNS or type(more) ~= 'string' or more == '' then S.prune[id] = nil; return false end
+  local old, records = scan(prefix, keep[#keep], PRUNE_PAGE)
+  if #old == 0 then S.prune[id] = nil; return false end
+  local run_keys, seen = {}, {}
+  for _, k in ipairs(old) do
+    local v = records[k].value
+    local rk = type(v) == 'table' and v.run or nil
+    if type(rk) == 'string' and rk:sub(1, #run_prefix(id)) == run_prefix(id) and not seen[rk] then
+      seen[rk] = true
+      run_keys[#run_keys + 1] = rk
+    end
+  end
+  local runs = #run_keys > 0 and get(run_keys) or {}
+  local B = {ops = {}, used = 1024, n = 0}
+  for _, k in ipairs(old) do
+    local v = records[k].value
+    local rr = type(v) == 'table' and runs[v.run] or nil
+    local ops = {{key = k, if_rev = records[k].rev, delete = true}}
+    if rr and rr.rev ~= '0' and type(rr.value) == 'table' and rr.value.t == k and TERMINAL[rr.value.status] then
+      ops[2] = {key = v.run, if_rev = rr.rev, delete = true}
+    end
+    if not fits(B, ops) then break end
+  end
+  batch(B.ops)
+  return true
+end
+
 -- step does one unit of work for one automation and says whether more work may follow now.
 -- File work comes first: it only creates runs and deletes markers, so it never waits on a start.
 -- Each file stage clears its flag when it ends, and a later step does the engine work.
@@ -874,6 +933,7 @@ local function step(id)
   if S.drain[id] then drain_step(id); return true end
   if S.retire[id] then retire_step(id); return true end
   if S.sweep[id] then sweep_step(id); return true end
+  if S.prune[id] then prune_step(id); return true end
   local st_rec = get1('state/' .. id)
   local st = state_of(st_rec)
   if not st then return false end
@@ -911,7 +971,8 @@ local function step(id)
     run.error = cut(problem, MAX_ERROR)
     local q = run.q
     run.q = nil
-    batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+    local t_op = terminal_op(st, id, run_key, run)
+    batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, t_op, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
     return true
   end
   run.starts = (run.starts or 0) + 1
@@ -983,7 +1044,7 @@ local function tick()
   if not S.last_sweep or wall() - S.last_sweep >= RECHECK then
     S.last_sweep = wall()
     S.reconcile_due = true
-    each_auto(function(id) mark(id) end)
+    each_auto(function(id) mark(id); S.prune[id] = true end)
   end
   pump()
 end
@@ -1290,18 +1351,22 @@ local function retry(caller, args)
     run.q = queue_key(id, n)
     run.retries = (run.retries or 0) + 1
     run.retried = {by = caller.id, at = now()}
-    return {{key = run.q, if_rev = '0', value = {run = run_key}}}
+    local ops = {{key = run.q, if_rev = '0', value = {run = run_key}}}
+    -- The run is active again: its terminal entry goes, and its next end gets a new sequence.
+    if run.t then ops[2] = {key = run.t, delete = true} end
+    run.t, run.tseq = nil, nil
+    return ops
   end)
 end
 
 -- cancel_run takes only a queued run: no side effect has started (design v2, section 9).
 local function cancel_run(caller, args)
-  return run_change('cancel', caller, args, function(run, _, _, run_key)
+  return run_change('cancel', caller, args, function(run, st, _, run_key, id)
     if run.status ~= 'queued' then fail('not_cancellable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only a queued run can be cancelled') end
     local q = run.q
     run.status, run.q, run.error = 'cancelled', nil, nil
     run.cancelled = {by = caller.id, at = now()}
-    return {{key = q, delete = true}}
+    return {{key = q, delete = true}, terminal_op(st, id, run_key, run)}
   end)
 end
 
@@ -1309,7 +1374,7 @@ end
 -- key again, so it never adopts that pane; the next queued run starts a new worker. The run
 -- keeps every dismissed key (the recovery reference), and the state keeps the newest.
 local function dismiss_start(caller, args)
-  return run_change('dismiss', caller, args, function(run, st, _, run_key)
+  return run_change('dismiss', caller, args, function(run, st, _, run_key, id)
     if run.status ~= 'unknown_start' or type(st.spawning) ~= 'table' or st.spawning.run ~= run_key then
       fail('not_dismissable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only an unknown_start run can be dismissed')
     end
@@ -1322,8 +1387,9 @@ local function dismiss_start(caller, args)
     st.spawning = nil
     local q = run.q
     run.status, run.q = 'dismissed', nil
-    if q then return {{key = q, delete = true}} end
-    return {}
+    local ops = {terminal_op(st, id, run_key, run)}
+    if q then ops[2] = {key = q, delete = true} end
+    return ops
   end)
 end
 
@@ -1395,10 +1461,14 @@ local function done(caller, args)
   local outcome = args.outcome or 'done'
   if outcome ~= 'done' and outcome ~= 'failed' then fail('invalid_input', 'outcome is done or failed') end
   if args.summary ~= nil and type(args.summary) ~= 'string' then fail('invalid_input', 'summary is text') end
+  local id = run_key:match('^run/(%d+)/[dfm]/')
+  if not id then fail('not_found', 'No run ' .. run_key) end
   for _ = 1, 5 do
-    local run_rec = get1(run_key)
-    local run = run_rec.value
-    if run_rec.rev == '0' then fail('not_found', 'No run ' .. run_key) end
+    -- done ends the run, so it takes a terminal sequence under the state fence.
+    local recs = get({run_key, 'state/' .. id})
+    local run_rec, st_rec = recs[run_key], recs['state/' .. id]
+    local run, st = run_rec.value, state_of(st_rec)
+    if run_rec.rev == '0' or not st then fail('not_found', 'No run ' .. run_key) end
     if run.status ~= 'delivered' or run.attempt ~= args.attempt or not holds(caller, run.agent) then
       fail('stale_delivery', 'Run ' .. run_key .. ' attempt ' .. tostring(args.attempt) .. ' is not your current task')
     end
@@ -1411,16 +1481,19 @@ local function done(caller, args)
     end
     local box = box_key(run.agent, run_key)
     local others = other_box(run.agent, box)
+    local t_op = terminal_op(st, id, run_key, run)
     local stored = batch({
       {key = run_key, if_rev = run_rec.rev, value = run},
       {key = box, delete = true},
-      {key = delivered_key(run.auto, run_key), delete = true},
+      {key = delivered_key(id, run_key), delete = true},
       {notify = {agent = run.agent, pending = others}},
+      t_op,
+      {key = 'state/' .. id, if_rev = st_rec.rev, value = st},
     }, {key = op_key('done', caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
     local result, conflict = committed(stored, 'done')
     if result then
       -- A delete cleanup can wait for this run.
-      mark(run.auto)
+      mark(id)
       pump()
       if result.revs then return {run_key = run_key, status = run.status} end
       return result
@@ -1540,7 +1613,7 @@ rex.after(0, function()
   local ok, err = pcall(function()
     S.ready = true
     -- A crash can come after a watch remove and before its markers retire: sweep them all once.
-    each_auto(function(id) mark(id); S.sweep[id] = true end)
+    each_auto(function(id) mark(id); S.sweep[id] = true; S.prune[id] = true end)
     S.last_sweep = wall()
     tick()
   end)

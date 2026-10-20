@@ -7,8 +7,8 @@ A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. An automation is a trig
   automation's agent profile, then deliver.
 
 Status: in progress. Built: file and daily triggers, manual runs, the worker start, the delivery,
-enable and disable, delete, retry, cancel and dismiss. Not built yet: the panel and forms, presets
-and run retention.
+enable and disable, delete, retry, cancel, dismiss and run retention. Not built yet: the panel and
+forms, and presets.
 
 ## Install
 
@@ -90,6 +90,17 @@ minute and never reads `isdst`.
 - Each new start checks the profile again. A profile that is no longer an agent profile fails the
   run before `hub.spawn`.
 
+## Run retention
+
+Each automation keeps its newest 100 terminal runs (done, failed, cancelled, dismissed). "Newest"
+is the order in which runs ended: each terminal change takes the next sequence from the
+automation's state record, in the same batch, so a clock change cannot reorder them. A retry
+removes the run from that order; when the run ends again, it is the newest. Active runs are never
+pruned, and pruning never deletes a file marker, so a pruned file run cannot come again.
+
+This store layout came before the first release: a lab store from an earlier commit needs a fresh
+store.
+
 ## Agents
 
 The exports are agent tools: `automations.save`, `automations.list`, `automations.run`,
@@ -127,6 +138,11 @@ cd ../../Automations && lazyrex-hub test
   not block the next run; `unknown_start` after 10 minutes, and dismiss lets the next run start.
 - list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
   a page limited by bytes skips no automation.
+- retention.lua: the newest 100 terminal runs stay and an older active run stays; a retry takes
+  a new sequence; a clock moved back keeps the latest run; done takes a sequence, and its replay
+  gives the same result; a file run pruned before its ack makes no second run; a crash between
+  prune batches (a backlog from the harness `write`, an injection that fails the second batch)
+  leaves exactly the newest 100.
 - reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
   worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
   reads its task; a hub crash after the loss (fixed by a gate on the second start) moves the task
