@@ -128,7 +128,8 @@ cd ../../Automations && lazyrex-hub test
   a page limited by bytes skips no automation.
 - reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
   worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
-  reads its task; a hub crash after the loss moves the task once.
+  reads its task; a hub crash after the loss (fixed by a gate on the second start) moves the task
+  once.
 - save.lua: save checks the action against the hub contract (a tab title of at most 60
   characters) and stores nothing when it refuses; the 9th enabled file automation is refused; `~`
   expands with HOME, and a path outside `watch_roots` shows the grant hint.

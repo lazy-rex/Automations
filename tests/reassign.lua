@@ -86,15 +86,30 @@ test('two delivered tasks of a lost worker both move', function()
   expect(#F.worker(ra.agent):call('automations.read', {}).tasks).to_be(2)
 end)
 
--- Restart coverage for the requeue: the hub crashes right after the worker stops. After the
--- restart the run moves exactly once, to exactly one new worker.
+-- Restart coverage for the requeue: the hub crashes after the requeue and the new start admission
+-- committed, and before hub.spawn ran. A gate on that spawn key fixes the crash point: a crash
+-- inside the hub's spawn window leaves the start pending (hub docs, "spawn intent ... stays
+-- unresolved"). lifecycle.lua covers recovery from a pending start (a dropped spawn) through
+-- unknown_start and dismiss; it does not reproduce that crash timing. After the restart
+-- the stored key replays, and the run moves exactly once, to exactly one new worker. The hub
+-- keeps faults in memory, so the gate is gone after the restart.
 test('a hub crash after a worker loss moves the task once', function()
   local id = automation('crash')
   local first = alice:call('automations.run', {id = id, key = 'crash-1'})
   local one = F.wait_status(first.run_key, 'delivered')
   F.worker(one.agent)
   local before = F.running('worker')
+  local key = 'automations/spawn/' .. first.run_key .. '/2'
+  local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = key})
   expect(alice:hub('hub.stop', {spawn_id = one.spawn_id}).status).to_be('closed')
+  wait('the gated second start', function() return fault_fired(gate) end, 20)
+  local held = store(first.run_key).value
+  expect(held.status).to_be('starting')
+  expect(held.starts).to_be(2)
+  expect(held.attempt).to_be(1)
+  expect(store('state/' .. id).value.spawning.request.key).to_be(key)
+  expect(store('box/' .. one.agent .. '/' .. first.run_key).rev).to_be('0')
+  expect(store('dv/' .. id .. '/' .. first.run_key).rev).to_be('0')
   hub:restart({crash = true})
   local two = delivered_again(first.run_key, 2)
   expect(two.agent).not_to_be(one.agent)
