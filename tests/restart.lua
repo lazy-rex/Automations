@@ -101,3 +101,36 @@ test('a crash after a delete and a preset reinstall: the old cleanup ends, the n
   expect(item.detail).to_match('automation ' .. b)
   expect(F.item(tree, 'automations', b)).to_be_truthy()
 end)
+
+-- Run now through the view, cut by a crash (amendment (b)). F1 lets the run batch commit and
+-- loses its reply, so the plugin answers unavailable (an unknown outcome) and the hub keeps the
+-- operation pending. F2 refuses every later replay check of the operation record, so the hub's
+-- retries stay unknown until the crash. After the restart, the hub resumes the operation with the
+-- same key and stored args (hub viewsvc.go at 06b22ca); the plugin replays its op record.
+test('Run now cut by a crash: the hub resumes the same operation, and there is one run', function()
+  local id = daily('view', '09:00')
+  local v = F.open(id)
+  local key = 'crash-run-now'
+  local record = 'run/' .. #'user' .. ':user' .. #('view/' .. key) .. ':view/' .. key
+  local f1 = fault({point = 'action', action = 'hub.store.batch', when = 'after', mode = 'lose-reply'})
+  local f2 = fault({point = 'action', action = 'hub.store.op', when = 'before', mode = 'gate', key = record, nth = 2})
+  v:admit('action', {node_id = 'run', action = 'run', input = {}, revision = v.revision, operation_key = key})
+  wait('the refused replay check', function() return fault_fired(f2) end, 20)
+  -- The boundary before the crash: the batch committed, both faults fired, the operation pending.
+  expect(fault_fired(f1)).to_be(true)
+  expect(store('run/' .. id .. '/m/000001').rev).not_to_be('0')
+  expect(store('state/' .. id).value.next_manual).to_be(1)
+  expect(operation(key).status).to_be('pending')
+  hub:restart({crash = true})
+  local done = wait('the resumed operation', function()
+    local s = operation(key)
+    return s.status ~= 'pending' and s
+  end, 30)
+  expect(done.status).to_be('succeeded')
+  expect(store('state/' .. id).value.next_manual).to_be(1)
+  expect(#F.runs(alice, id, 'm')).to_be(1)
+  expect(store('run/' .. id .. '/m/000002').rev).to_be('0')
+  crash_and_settle()
+  expect(#F.runs(alice, id, 'm')).to_be(1)
+  expect(store('state/' .. id).value.next_manual).to_be(1)
+end)

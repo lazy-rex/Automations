@@ -201,6 +201,9 @@ cd ../../Automations && lazyrex-hub test
   run until a crash): a blocked daily slot runs exactly once after the restart, also after a
   second crash; after a jump over several dates only the newest date is tried and runs once; a
   crash after a delete and a preset reinstall ends the old cleanup and keeps the new reservation.
+  Run now through the view, cut by a crash after its batch committed and before its result
+  (faults: a lost batch reply, then a gate on the replay check): the hub resumes the same
+  operation after the restart, and there is exactly one run.
 - runs.lua: a mixed set over byte-limited pages gives every run once, in phase order; a page of
   only skipped entries is empty and has `next`; the cursor crosses an empty phase; malformed cursors
   are refused.
