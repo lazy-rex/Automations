@@ -14,15 +14,21 @@ local instance_id = assert(rex.args.instance_id, 'instance_id is required')
 local function fail(code, message) error({code = code, message = message}, 0) end
 
 -- A hub error arrives as text that ends with "(status=<n> code=<code>)" (observed on Rex
--- 0.0.1792158932-g88fd41, lab; see Profiles). An error with no code (a lost or timed-out call) is
--- unavailable: its outcome is not known.
+-- 0.0.1792158932-g88fd41, lab; see Profiles). An error whose outcome is not known becomes
+-- unavailable: no code (a lost call), disconnected, timeout, and client_unavailable (Rex fails a
+-- waiting request with it when a connection drops; LazyRex docs/rex-protocol.md, "Client RPC").
+-- The action may have run, so a caller keeps its intent and replays it (review of 997b1eb, R3).
+local unknown_outcome = {unavailable = true, disconnected = true, timeout = true, client_unavailable = true}
 local function hub(action, args)
   local response, call_error = rex.call('client.perform', {client_id = hub_id, action = action, args = args or {}, timeout_ms = 10000})
   if type(response) ~= 'table' then
-    if type(call_error) == 'table' then fail(call_error.code or 'unavailable', call_error.message or 'Hub request failed') end
+    if type(call_error) == 'table' then
+      local table_code = call_error.code or 'unavailable'
+      fail(unknown_outcome[table_code] and 'unavailable' or table_code, call_error.message or 'Hub request failed')
+    end
     local text = tostring(call_error or 'Hub request failed')
     local code = text:match('code=([%w_]+)%)$')
-    if not code or code == 'unavailable' or code == 'disconnected' or code == 'timeout' then fail('unavailable', text) end
+    if not code or unknown_outcome[code] then fail('unavailable', text) end
     fail(code, text:match('failed: (.-) %(status=%d+ code=[%w_]+%)$') or text)
   end
   if type(response.result) ~= 'table' then fail('internal', 'Invalid hub result for ' .. action) end

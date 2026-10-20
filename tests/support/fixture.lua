@@ -32,6 +32,13 @@ return function(H)
     return out
   end
 
+  -- running counts the rows in state running: hub.workers also lists failed spawns.
+  function F.running(profile)
+    local n = 0
+    for _, w in ipairs(F.workers(profile)) do if w.state == 'running' then n = n + 1 end end
+    return n
+  end
+
   -- worker returns a caller for the test agent in a spawned pane: call goes through the agent
   -- face (the MCP path), as an agent's tool call.
   function F.worker(agent_id)

@@ -67,6 +67,8 @@ cd ../../Automations && lazyrex-hub test
   or for another attempt is refused.
 - save.lua: save checks the action against the hub contract (a tab title of at most 60
   characters) and stores nothing when it refuses.
+- start.lua: an unknown start outcome (client_unavailable from `hub.spawn`) keeps the stored
+  request and replays its key, so one worker starts; a definite refusal fails the run.
 - worker.lua: a failed observation (a hub call that fails) keeps the running worker, and the step
   tries again; a stopped worker is replaced.
 
