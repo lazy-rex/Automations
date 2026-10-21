@@ -182,6 +182,12 @@ cd ../../Automations && lazyrex-hub test
   listed and refuses changes; retry after a start failure (new spawn key) and an agent failure
   (attempt 2); disable keeps admitted runs and refuses run and retry; cancel of a queued run does
   not block the next run; `unknown_start` after 10 minutes, and dismiss lets the next run start.
+- not_created.lua: a start that the hub never sent (error `not_created`) fails its run as a
+  definite failure, never `unknown_start`; Retry starts one worker with a new spawn key. It needs
+  the spawn-create fault mode `fail-sending` (hub 89cab8f or later); on an older hub, such as the
+  live hub fc0cd19, this file fails. Not covered: a hub crash between the admission and the
+  sending commits (the hub's own tests cover it), and a `not_created` call error when the hub
+  cannot store the failure.
 - list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
   a page limited by bytes skips no automation.
 - panel.lua: the panel pages 25 automations, and a run of one on page 2 is cancelled from its
