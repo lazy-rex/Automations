@@ -17,7 +17,8 @@ local function tkey(id, n) return string.format('t/%s/%012d', id, MAX_T - n) end
 local function spawn_key(run_key, starts) return 'automations/spawn/' .. run_key .. '/' .. (starts or 1) end
 local function run_now(id, key) return alice:call('automations.run', {id = id, key = key}).run_key end
 local function cancel(run_key, key) return alice:call('automations.cancel_run', {run_key = run_key, key = key}) end
-local function exists(key) return F.store(key).rev ~= '0' end
+local function exists(run_key) return F.run(run_key) ~= nil end
+local function ended(t) return F.ended(t) ~= nil end
 
 -- hold starts run 1 behind a gate, so later runs stay queued: run 1 is starting, and no worker
 -- runs. It returns the gate.
@@ -25,7 +26,7 @@ local function hold(id, key)
   local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(manual(id, 1))})
   expect(run_now(id, key .. '-1')).to_be(manual(id, 1))
   wait('the gated start of ' .. key, function() return fault_fired(gate) end, 10)
-  expect(F.store(manual(id, 1)).value.status).to_be('starting')
+  expect(F.run(manual(id, 1)).status).to_be('starting')
   return gate
 end
 -- cancel_runs makes runs from to upto and cancels each: one terminal sequence each, in order.
@@ -33,7 +34,7 @@ local function cancel_runs(id, key, from, upto)
   for n = from, upto do
     local run_key = run_now(id, key .. '-' .. n)
     expect(run_key).to_be(manual(id, n))
-    expect(F.store(run_key).value.status).to_be('queued')
+    expect(F.run(run_key).status).to_be('queued')
     expect(cancel(run_key, key .. '-c' .. n).status).to_be('cancelled')
   end
 end
@@ -46,22 +47,22 @@ test('the newest 100 terminal runs stay; an older active run stays; a retry take
     for n = 2, 6 do if exists(manual(id, n)) then return false end end
     return true
   end, 20)
-  for n = 2, 6 do expect(exists(tkey(id, n - 1))).to_be(false) end
+  for n = 2, 6 do expect(ended(tkey(id, n - 1))).to_be(false) end
   for n = 7, 106 do
-    local run = F.store(manual(id, n)).value
+    local run = F.run(manual(id, n))
     expect(run.tseq).to_be(n - 1)
     expect(run.t).to_be(tkey(id, n - 1))
-    expect(F.store(run.t).value.run).to_be(manual(id, n))
+    expect(F.ended(run.t)).to_be(manual(id, n))
   end
-  expect(F.store('state/' .. id).value.next_t).to_be(105)
+  expect(F.state(id).next_t).to_be(105)
   -- Run 1 is the oldest run, but it is active.
-  expect(F.store(manual(id, 1)).value.status).to_be('starting')
+  expect(F.run(manual(id, 1)).status).to_be('starting')
   -- A retry of the oldest kept run deletes its entry; its next end takes sequence 106.
   alice:call('automations.retry', {run_key = manual(id, 7), key = 'keep-retry'})
-  expect(exists(tkey(id, 6))).to_be(false)
-  expect(F.store(manual(id, 7)).value.t).to_be(nil)
+  expect(ended(tkey(id, 6))).to_be(false)
+  expect(F.run(manual(id, 7)).t).to_be(nil)
   cancel(manual(id, 7), 'keep-recancel')
-  expect(F.store(manual(id, 7)).value.tseq).to_be(106)
+  expect(F.run(manual(id, 7)).tseq).to_be(106)
   rex.sleep(2)
   expect(exists(manual(id, 8))).to_be(true)
   -- Sequence 107 makes 101 entries: sequence 7 (run 8) goes, and run 7 stays.
@@ -102,7 +103,7 @@ test('with the clock moved back, the latest terminal run stays and the oldest go
   F.set_clock(T0)
   cancel_runs(id, 'clock', 102, 102) -- sequence 101, with an earlier clock
   wait('the oldest terminal run to go', function() return not exists(manual(id, 2)) end, 20)
-  expect(F.store(manual(id, 102)).value.tseq).to_be(101)
+  expect(F.run(manual(id, 102)).tseq).to_be(101)
   expect(exists(manual(id, 102))).to_be(true)
   expect(exists(manual(id, 3))).to_be(true)
   fault_release(gate)
@@ -117,10 +118,10 @@ test('done takes a terminal sequence, and its replay gives the same result', fun
   local r = worker:call('automations.done', {run_key = run_key, attempt = 1, key = 'done-a', summary = 'Done.'})
   expect(r.status).to_be('done')
   expect(worker:call('automations.done', {run_key = run_key, attempt = 1, key = 'done-a', summary = 'Done.'}).status).to_be('done')
-  run = F.store(run_key).value
+  run = F.run(run_key)
   expect(run.tseq).to_be(1)
-  expect(F.store(tkey(id, 1)).value.run).to_be(run_key)
-  expect(F.store('state/' .. id).value.next_t).to_be(1)
+  expect(F.ended(tkey(id, 1))).to_be(run_key)
+  expect(F.state(id).next_t).to_be(1)
 end)
 
 -- The reviewer's case for B2, the prune half: the file changes before the ack, its run is pruned,
@@ -138,20 +139,20 @@ test('a file run pruned before its ack makes no second run: the marker stays', f
   local run = F.wait_status(file_run, 'delivered')
   F.put(dir .. '/z.md', 'two, longer')
   F.worker(run.agent):call('automations.done', {run_key = file_run, attempt = 1, key = 'file-done'})
-  expect(F.store(file_run).value.tseq).to_be(1)
+  expect(F.run(file_run).tseq).to_be(1)
   -- The worker stops, so later runs need a start: the gated start keeps them queued.
   expect(alice:hub('hub.stop', {spawn_id = run.spawn_id}).status).to_be('closed')
   local gate = hold(id, 'file')
   cancel_runs(id, 'file', 2, 101) -- sequences 2 to 101
   wait('the file run to be pruned', function() return not exists(file_run) end, 20)
-  expect(exists(tkey(id, 1))).to_be(false)
-  expect(exists(marker)).to_be(true)
+  expect(ended(tkey(id, 1))).to_be(false)
+  expect(F.seen(marker) ~= nil).to_be(true)
   expect(fault_fired(ack)).to_be(true)
   fault_release(ack)
   rex.sleep(3)
   expect(exists(file_run)).to_be(false)
   expect(#F.runs(alice, id, 'f')).to_be(0)
-  expect(exists(marker)).to_be(true)
+  expect(F.seen(marker) ~= nil).to_be(true)
   fault_release(gate)
 end)
 
@@ -165,18 +166,16 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   local function records(from, upto)
     local ops = {}
     for n = from, upto do
-      ops[#ops + 1] = {key = rk(n), if_rev = '0', value = {v = 1, auto = id, name = 'Keep crash', kind = 'm', by = 'alice', at = T0,
+      ops[#ops + 1] = {tbl = 'runs', key = rk(n), new = true, value = {v = 1, auto = id, name = 'Keep crash', kind = 'm', by = 'alice', at = T0,
         task = {instruction = 'Keep task.', profile = 'worker'}, status = 'cancelled', attempt = 0, starts = 0,
         cancelled = {by = 'alice', at = T0}, t = tkey(id, n), tseq = n}}
-      ops[#ops + 1] = {key = tkey(id, n), if_rev = '0', value = {run = rk(n), seq = n}}
     end
     return ops
   end
   local function with_state(ops, next_t)
-    local rec = F.store('state/' .. id)
-    local st = rec.value
+    local st, rev = F.state(id), F.rev('states', id)
     st.next_t = next_t
-    ops[#ops + 1] = {key = 'state/' .. id, if_rev = rec.rev, value = st}
+    ops[#ops + 1] = {tbl = 'states', key = id, if_rev = rev, value = st}
     return ops
   end
   local function send(ops)
@@ -194,22 +193,22 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   wait('the held second prune batch', function() return injection(held).consumed >= 1 end, 20)
   for n = 11, 60 do
     expect(exists(rk(n))).to_be(false)
-    expect(exists(tkey(id, n))).to_be(false)
+    expect(ended(tkey(id, n))).to_be(false)
   end
   for n = 1, 10 do expect(exists(rk(n))).to_be(true) end
   for n = 61, 160 do expect(exists(rk(n))).to_be(true) end
   hub:restart({crash = true})
   wait('the second prune batch after the restart', function()
-    for n = 1, 10 do if exists(rk(n)) or exists(tkey(id, n)) then return false end end
+    for n = 1, 10 do if exists(rk(n)) or ended(tkey(id, n)) then return false end end
     return true
   end, 30)
   for n = 61, 160 do
-    local run = F.store(rk(n)).value
+    local run = F.run(rk(n))
     expect(run.t).to_be(tkey(id, n))
-    expect(F.store(tkey(id, n)).value.run).to_be(rk(n))
+    expect(F.ended(tkey(id, n))).to_be(rk(n))
   end
   for n = 11, 60 do expect(exists(rk(n))).to_be(false) end
-  expect(F.store('state/' .. id).value.next_t).to_be(160)
+  expect(F.state(id).next_t).to_be(160)
 end)
 
 -- The reviewer's race (review of 451691c, R1): 101 terminal runs, and a retry makes sequence
@@ -227,30 +226,27 @@ test('a retry that commits before the prune transaction keeps the oldest run', f
   for lo = 1, 81, 40 do
     local ops = {}
     for n = lo, math.min(lo + 39, 100) do
-      ops[#ops + 1] = {key = rk(n), if_rev = '0', value = cancelled(n)}
-      ops[#ops + 1] = {key = tkey(id, n), if_rev = '0', value = {run = rk(n), seq = n}}
+      ops[#ops + 1] = {tbl = 'runs', key = rk(n), new = true, value = cancelled(n)}
     end
     F.write(ops)
   end
-  local rec = F.store('state/' .. id)
-  local st = rec.value
+  local st, rev = F.state(id), F.rev('states', id)
   st.next_t = 101
-  F.write({{key = 'state/' .. id, if_rev = rec.rev, value = st}})
+  F.write({{tbl = 'states', key = id, if_rev = rev, value = st}})
   -- The retry of run 101: queued with a queue entry, its entry deleted, and the state written.
   local retried = cancelled(101)
   retried.status, retried.t, retried.tseq, retried.retries = 'queued', nil, nil, 1
   retried.q = string.format('q/%s/%012d', id, 2)
-  local after = F.store('state/' .. id).value
+  local after = F.state(id)
   after.next_q = 2
   local race = F.inject_begin({
-    {key = rk(101), value = retried}, {key = tkey(id, 101), delete = true},
-    {key = retried.q, value = {run = rk(101)}}, {key = 'state/' .. id, value = after}})
-  F.write({{key = rk(101), if_rev = '0', value = cancelled(101)}, {key = tkey(id, 101), if_rev = '0', value = {run = rk(101), seq = 101}}})
+    {tbl = 'runs', key = rk(101), value = retried}, {tbl = 'states', key = id, value = after}})
+  F.write({{tbl = 'runs', key = rk(101), new = true, value = cancelled(101)}})
   wait('the concurrent retry', function() return injection(race).consumed == 1 end, 20)
   rex.sleep(2)
-  expect(F.store(rk(101)).value.status).to_be('queued')
+  expect(F.run(rk(101)).status).to_be('queued')
   expect(exists(rk(1))).to_be(true)
-  expect(exists(tkey(id, 1))).to_be(true)
+  expect(ended(tkey(id, 1))).to_be(true)
   for n = 2, 100 do expect(exists(rk(n))).to_be(true) end
   fault_release(gate)
 end)

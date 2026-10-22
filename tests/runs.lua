@@ -73,7 +73,7 @@ test('a page of only skipped entries is empty and has next; the next page has th
   local ops = {}
   local task = F.run(run_key).task
   for n = 1, 50 do
-    ops[n] = {key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), if_rev = '0', value = {v = 1, auto = id, kind = 'm',
+    ops[n] = {tbl = 'runs', key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), new = true, value = {v = 1, auto = id, kind = 'm',
       k = string.format('%06d', 100 + n), status = 'queued', attempt = 0, starts = 0, task = task, t = string.format('t/%s/%012d', id, n), tseq = 0}}
   end
   F.write(ops)
@@ -85,7 +85,7 @@ test('a page of only skipped entries is empty and has next; the next page has th
   expect(two.runs[1].run_key).to_be(run_key)
   expect(two.next).to_be(nil)
   local clean = {}
-  for n = 1, 50 do clean[n] = {key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), delete = true} end
+  for n = 1, 50 do clean[n] = {tbl = 'runs', key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), delete = true} end
   F.write(clean)
 end)
 

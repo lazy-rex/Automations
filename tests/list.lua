@@ -20,7 +20,7 @@ local function tombstone(key)
   wait('the dropped spawn of ' .. key, function() return fault_fired(drop) end, 10)
   F.wait_status(run_key, 'starting')
   alice:call('automations.delete', {id = id, key = key .. '-delete'})
-  expect(F.store('auto/' .. id).value.deleted).to_be(true)
+  expect(F.auto(id).deleted).to_be(true)
   return id
 end
 -- pages lists every page with the given limit and returns the pages and the visible ids.

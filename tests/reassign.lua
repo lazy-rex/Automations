@@ -13,7 +13,7 @@ end
 
 local function delivered_again(run_key, attempt)
   return wait('run ' .. run_key .. ' attempt ' .. attempt, function()
-    local run = F.store(run_key).value
+    local run = F.run(run_key)
     return run and run.status == 'delivered' and run.attempt == attempt and run
   end, 25)
 end
@@ -31,8 +31,8 @@ test('a stopped worker: the task goes to a new worker as attempt 2', function()
   expect(two.lost.attempt).to_be(1)
   -- The run started once for each worker: the second start has its own key, ending in /2.
   expect(two.starts).to_be(2)
-  expect(F.store('state/' .. id).value.worker.spawn_id).to_be(two.spawn_id)
-  expect(F.store('box/' .. one.agent .. '/' .. first.run_key).rev).to_be('0')
+  expect(F.state(id).worker.spawn_id).to_be(two.spawn_id)
+  expect(F.held(one.agent, first.run_key)).to_be(nil)
   expect(notice(one.agent).pending).to_be(false)
   expect(notice(two.agent).pending).to_be(true)
   local new = F.worker(two.agent)
@@ -55,7 +55,7 @@ test('an alias reads its task; a superseded identity loses it, and its late done
   -- identity reads the task delivered to its legacy ID.
   pane:report('claude', 'automations-reassign-1')
   rex.sleep(2.5)
-  expect(F.store(first.run_key).value.attempt).to_be(1)
+  expect(F.run(first.run_key).attempt).to_be(1)
   local tasks = pane:call('automations.read', {}).tasks
   expect(#tasks).to_be(1)
   expect(tasks[1].run_key).to_be(first.run_key)
@@ -64,11 +64,11 @@ test('an alias reads its task; a superseded identity loses it, and its late done
   pane:report('claude', 'automations-reassign-2')
   local two = delivered_again(first.run_key, 2)
   expect(two.agent).not_to_be(one.agent)
-  expect(F.store('box/' .. one.agent .. '/' .. first.run_key).rev).to_be('0')
+  expect(F.held(one.agent, first.run_key)).to_be(nil)
   -- The old pane, now another conversation, sees nothing and cannot complete the old attempt.
   expect(#pane:call('automations.read', {}).tasks).to_be(0)
   expect_error(function() pane:call('automations.done', {run_key = first.run_key, attempt = 1, key = 'identity-late'}) end, 'stale_delivery')
-  expect(F.store(first.run_key).value.status).to_be('delivered')
+  expect(F.run(first.run_key).status).to_be('delivered')
   F.worker(two.agent):call('automations.done', {run_key = first.run_key, attempt = 2, key = 'identity-done'})
 end)
 
@@ -103,18 +103,18 @@ test('a hub crash after a worker loss moves the task once', function()
   local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = key})
   expect(alice:hub('hub.stop', {spawn_id = one.spawn_id}).status).to_be('closed')
   wait('the gated second start', function() return fault_fired(gate) end, 20)
-  local held = F.store(first.run_key).value
+  local held = F.run(first.run_key)
   expect(held.status).to_be('starting')
   expect(held.starts).to_be(2)
   expect(held.attempt).to_be(1)
-  expect(F.store('state/' .. id).value.spawning.request.key).to_be(key)
-  expect(F.store('box/' .. one.agent .. '/' .. first.run_key).rev).to_be('0')
-  expect(F.store('dv/' .. id .. '/' .. first.run_key).rev).to_be('0')
+  expect(F.state(id).spawning.request.key).to_be(key)
+  expect(F.held(one.agent, first.run_key)).to_be(nil)
+  expect(F.delivered(id, first.run_key)).to_be(nil)
   hub:restart({crash = true})
   local two = delivered_again(first.run_key, 2)
   expect(two.agent).not_to_be(one.agent)
   rex.sleep(3)
-  expect(F.store(first.run_key).value.attempt).to_be(2)
+  expect(F.run(first.run_key).attempt).to_be(2)
   expect(F.running('worker')).to_be(before)
   expect(notice(one.agent).pending).to_be(false)
 end)

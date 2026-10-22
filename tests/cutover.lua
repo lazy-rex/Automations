@@ -59,22 +59,21 @@ local function fixture()
   local c = alice:call('automations.save', {key = 'cut-c', name = 'Cutover c', trigger = {kind = 'daily', at = '09:00'},
     action = {profile = 'worker'}, instruction = 'Cutover task.'}).id
   alice:call('automations.delete', {id = c, key = 'cut-c-delete'})
-  wait('automation ' .. c .. ' to be gone', function() return F.store('auto/' .. c).rev == '0' end, 30)
-  local st_rec = F.store('state/' .. a)
-  local base = st_rec.value.next_t or 0
+  wait('automation ' .. c .. ' to be gone', function() return F.auto(c) == nil end, 30)
+  local base = F.state(a).next_t or 0
   for lo = 1, BACKLOG, 30 do
     local ops = {}
     for n = lo, math.min(lo + 29, BACKLOG) do
       local seq = base + n
-      ops[#ops + 1] = {key = manual(a, 100 + n), if_rev = '0', value = {kind = 'm', k = string.format('%06d', 100 + n), status = 'cancelled',
+      ops[#ops + 1] = {tbl = 'runs', key = manual(a, 100 + n), new = true, value = {kind = 'm', k = string.format('%06d', 100 + n), status = 'cancelled',
         attempt = 0, starts = 0, t = string.format('t/%s/%012d', a, MAX_T - seq), tseq = seq, task = F.run(first.run_key).task,
         cancelled = {by = 'alice', at = 1}}}
     end
     F.write(ops)
   end
-  local st = F.store('state/' .. a)
-  st.value.next_t = base + BACKLOG
-  F.write({{key = 'state/' .. a, if_rev = st.rev, value = st.value}})
+  local st, st_rev = F.state(a), F.rev('states', a)
+  st.next_t = base + BACKLOG
+  F.write({{tbl = 'states', key = a, if_rev = st_rev, value = st}})
   ids.a, ids.b, ids.c, ids.first, ids.second = a, b, c, first.run_key, second.run_key
   worker.agent, worker.pane = one.agent, w
 end
@@ -161,9 +160,8 @@ test('after the copy: old keys replay from ops, also under a legacy ID, and the 
     action = {profile = 'worker'}, instruction = 'Cutover task.'}).id
   expect(tonumber(d) > tonumber(ids.c)).to_be(true)
   -- An old revision is a conflict.
-  local a = F.store('auto/' .. ids.a)
   local stale = store('auto/' .. ids.a).rev
-  expect(stale).to_be(a.rev)
+  expect(stale).to_be(F.rev('automations', ids.a))
   alice:call('automations.set_enabled', {id = ids.a, enabled = false, key = 'cut-a-off'})
   local view = F.view(alice, ids.a)
   expect_error(function() alice:call('automations.save', {id = ids.a, if_rev = stale, key = 'cut-a-stale', name = view.name,
@@ -180,7 +178,7 @@ test('a delivery after the copy: the task and its notice commit together; a lost
   wait('no pending notice', function() return notice(agent).pending == false end, 10)
   -- The delivery commit is held: the commits with this run key as a parameter are the creation
   -- (skip = 1) and then each try of the delivery, which fails until the test cancels it.
-  local rk = manual(ids.a, (F.store('state/' .. ids.a).value.next_manual or 0) + 1)
+  local rk = manual(ids.a, (F.state(ids.a).next_manual or 0) + 1)
   local _, base = calls('none')
   local held = inject({match = {sql_commit_writes = 'runs', sql_param = rk}, skip = 1, fail = 'held delivery', fail_code = 'unavailable',
     times = 'always'})
@@ -188,7 +186,7 @@ test('a delivery after the copy: the task and its notice commit together; a lost
   wait('the held delivery commit', function() return injection(held).consumed >= 2 end, 30)
   -- Before the commit: the run is queued, and the worker has no task and no notice.
   expect(F.run(rk).status).to_be('queued')
-  expect(F.store('box/' .. agent .. '/' .. rk).rev).to_be('0')
+  expect(F.held(agent, rk)).to_be(nil)
   expect(notice(agent).pending).to_be(false)
   for _, t in ipairs(worker.pane:call('automations.read', {}).tasks) do expect(t.run_key).not_to_be(rk) end
   cancel_injection(held)
@@ -212,7 +210,7 @@ test('a delivery after the copy: the task and its notice commit together; a lost
   local run2 = F.wait_status(r2.run_key, 'delivered', 30)
   rex.sleep(3)
   expect(injection(lost).consumed).to_be(1)
-  expect(F.store(r2.run_key).value.attempt).to_be(run2.attempt)
+  expect(F.run(r2.run_key).attempt).to_be(run2.attempt)
   local tasks = F.worker(run2.agent):call('automations.read', {}).tasks
   local n = 0
   for _, t in ipairs(tasks) do if t.run_key == r2.run_key then n = n + 1 end end
@@ -291,7 +289,7 @@ test('a start on rows without a valid marker refuses and writes nothing', functi
     return ok
   end, 30)
   expect(store('meta/cutover').rev).to_be(cutover_rev)
-  expect(F.store('auto/' .. ids.a).rev ~= store('auto/' .. ids.a).rev).to_be(true)
+  expect(F.rev('automations', ids.a) ~= store('auto/' .. ids.a).rev).to_be(true)
 end)
 
 test('a crash during the copy resumes from its committed cursor', function()

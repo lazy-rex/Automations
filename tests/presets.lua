@@ -24,7 +24,7 @@ local function install(name, key)
     action = {profile = 'worker', cwd = p.action.cwd}, instruction = p.instruction}).id
 end
 local function manual(id, n) return 'run/' .. id .. '/m/' .. string.format('%06d', n) end
-local function gone(id) wait('automation ' .. id .. ' to be gone', function() return F.store('auto/' .. id).rev == '0' end, 30) end
+local function gone(id) wait('automation ' .. id .. ' to be gone', function() return F.auto(id) == nil end, 30) end
 local function preset_item(name)
   local _, tree = F.panel()
   return F.item(tree, 'presets', name)
@@ -45,7 +45,7 @@ test('presets list their fields; an install replays, a second install is a confl
   local id = install('vault-health', 'health-1')
   expect(install('vault-health', 'health-1')).to_be(id)
   expect(presets()['vault-health'].installed).to_be(id)
-  expect(F.store('preset/vault-health').value.id).to_be(id)
+  expect(F.preset('vault-health')).to_be(id)
   expect(F.view(alice, id).preset).to_be('vault-health')
   local err = expect_error(function() install('vault-health', 'health-2') end, 'conflict')
   expect(err.message).to_match('installed as automation ' .. id)
@@ -71,15 +71,15 @@ end)
 -- Another install commits just before the save batch (the injection runs when the plugin begins
 -- the batch transaction, after its reads): the save refuses and stores nothing.
 test('a concurrent install makes the save refuse, and it stores nothing', function()
-  local before = F.store('meta/next_id')
+  local _, before = F.next_id()
   local count = #alice:call('automations.list', {}).automations
-  local inj = F.inject_begin({{key = 'preset/vault-inbox', value = {id = '999'}}})
+  local inj = F.inject_begin({{tbl = 'presets', key = 'vault-inbox', value = '999'}})
   local err = expect_error(function() install('vault-inbox', 'inbox-race') end, 'conflict')
   expect(err.message).to_match('installed as automation 999')
   expect(injection(inj).consumed).to_be(1)
-  expect(F.store('meta/next_id').rev).to_be(before.rev)
+  expect(select(2, F.next_id())).to_be(before)
   expect(#alice:call('automations.list', {}).automations).to_be(count)
-  F.write({{key = 'preset/vault-inbox', delete = true}})
+  F.write({{tbl = 'presets', key = 'vault-inbox', delete = true}})
 end)
 
 -- The overlap: a reinstall while the old automation's cleanup waits for its active run. The old
@@ -97,15 +97,15 @@ test('delete, then the preset installs again; an old cleanup keeps the new reser
   wait('the gated start', function() return fault_fired(gate) end, 10)
   alice:call('automations.delete', {id = b, key = 'health-delete-b'})
   local c = install('vault-health', 'health-4')
-  local reserved = F.store('preset/vault-health')
-  expect(reserved.value.id).to_be(c)
+  local reserved, reserved_rev = F.preset('vault-health'), F.rev('presets', 'vault-health')
+  expect(reserved).to_be(c)
   fault_release(gate)
   local run = F.wait_status(manual(b, 1), 'delivered')
   F.worker(run.agent):call('automations.done', {run_key = manual(b, 1), attempt = run.attempt, key = 'health-done-b'})
   gone(b)
-  local after = F.store('preset/vault-health')
-  expect(after.value.id).to_be(c)
-  expect(after.rev).to_be(reserved.rev)
+  local after, after_rev = F.preset('vault-health'), F.rev('presets', 'vault-health')
+  expect(after).to_be(c)
+  expect(after_rev).to_be(reserved_rev)
   expect(preset_item('vault-health').action.enabled).to_be(false)
   alice:call('automations.delete', {id = c, key = 'health-delete-c'})
   gone(c)

@@ -149,59 +149,41 @@ return function(H)
   -- size is the encoded size of a tree.
   function F.size(tree) return #rex.json.encode(tree) end
 
-  -- The plugin's records in the layout of hub.store keys, on its SQL tables (the layout
-  -- of the slice 1 version). F.store(key) reads a record as the harness store(key) did: {rev,
-  -- value}, rev '0' when absent. F.write(ops) writes records as the harness write(ops) did, with
-  -- if_rev and a new revision from meta.rev for each written row. It is for fixtures: each
-  -- statement is its own transaction. An index key (q/, t/, dv/, box/) has no row: F.write checks
-  -- that a run gives it after the other ops, and writes nothing for it.
-  local TABLES = {
-    {prefix = 'auto/', tbl = 'automations', col = 'id', strip = true},
-    {prefix = 'state/', tbl = 'states', col = 'id', strip = true},
-    {prefix = 'run/', tbl = 'runs', col = 'run_key'},
-    {prefix = 'preset/', tbl = 'presets', col = 'name', strip = true},
-    {prefix = 'seen/', tbl = 'seen', col = 'key'},
-    {prefix = 'rt/', tbl = 'retired', col = 'key'},
-  }
-  local function table_of(key)
-    for _, t in ipairs(TABLES) do
-      if key:sub(1, #t.prefix) == t.prefix then return t, t.strip and key:sub(#t.prefix + 1) or key end
-    end
-    error('no table for the key ' .. key, 3)
+  -- The plugin's rows, by table. A reader answers the row's document, or nil when the row is
+  -- absent; F.rev(tbl, key) answers the row's revision. The run readers by column answer the run
+  -- that a queue key (q) or an end key (t) names, and the run while it is delivered.
+  local KEYS = {automations = 'id', states = 'id', runs = 'run_key', presets = 'name', seen = 'key', retired = 'key'}
+  local function row(tbl, cols, key)
+    local col = KEYS[tbl] or error('no table ' .. tostring(tbl), 3)
+    return H.sql('SELECT ' .. cols .. ' FROM ' .. tbl .. ' WHERE ' .. col .. ' = ?', {key})[1]
   end
-  local function index_of(key) local k = key:match('^(%a+)/') if k == 'q' or k == 't' or k == 'dv' or k == 'box' then return k end end
-  local RUN_COLS = 'run_key, automation_id, rev, status, q, t, agent, doc'
-  local function giver(key)
-    local kind = index_of(key)
-    if kind == 'q' or kind == 't' then return H.sql('SELECT ' .. RUN_COLS .. ' FROM runs WHERE ' .. kind .. ' = ?', {key})[1] end
-    if kind == 'dv' then
-      local id, run_key = key:match('^dv/([^/]+)/(run/.+)$')
-      return H.sql('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND automation_id = ? AND status = 'delivered'", {run_key, id})[1]
-    end
-    local agent, run_key = key:match('^box/([^/]+)/(run/.+)$')
-    return H.sql('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND agent = ? AND status = 'delivered'", {run_key, agent})[1]
+  local function doc(tbl, key) local r = row(tbl, 'doc', key) return r and rex.json.decode(r.doc) end
+  function F.auto(id) return doc('automations', id) end
+  function F.state(id) return doc('states', id) end
+  function F.run(run_key) return doc('runs', run_key) end
+  function F.seen(key) return doc('seen', key) end
+  function F.retired(key) return doc('retired', key) end
+  -- F.preset answers the id of the automation that installed the preset.
+  function F.preset(name) local r = row('presets', 'automation_id', name) return r and r.automation_id end
+  function F.rev(tbl, key) local r = row(tbl, 'rev', key) return r and r.rev end
+  -- F.next_id answers meta.next_id (a number) and its revision, or nil before the first create.
+  function F.next_id()
+    local n, r = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1], H.sql("SELECT value FROM meta WHERE name = 'next_id_rev'")[1]
+    if not n then return nil end
+    return tonumber(n.value), r and r.value
   end
-  function F.store(key)
-    if key == 'meta/next_id' then
-      local n, r = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1], H.sql("SELECT value FROM meta WHERE name = 'next_id_rev'")[1]
-      if not n then return {rev = '0'} end
-      return {rev = r and r.value or '0', value = {n = tonumber(n.value)}}
-    end
-    local kind = index_of(key)
-    if kind then
-      local row = giver(key)
-      if not row then return {rev = '0'} end
-      local run = rex.json.decode(row.doc)
-      local value = ({q = {run = row.run_key}, t = {run = row.run_key, seq = run.tseq}, dv = {agent = row.agent},
-        box = {attempt = run.attempt, auto = row.automation_id}})[kind]
-      return {rev = row.rev, value = value}
-    end
-    local t, k = table_of(key)
-    local cols = t.tbl == 'presets' and 'rev, automation_id' or 'rev, doc'
-    local row = H.sql('SELECT ' .. cols .. ' FROM ' .. t.tbl .. ' WHERE ' .. t.col .. ' = ?', {k})[1]
-    if not row then return {rev = '0'} end
-    return {rev = row.rev, value = t.tbl == 'presets' and {id = row.automation_id} or rex.json.decode(row.doc)}
+  function F.queued(q) local r = H.sql('SELECT run_key FROM runs WHERE q = ?', {q})[1] return r and r.run_key end
+  function F.ended(t) local r = H.sql('SELECT run_key FROM runs WHERE t = ?', {t})[1] return r and r.run_key end
+  -- F.delivered answers the run while it is delivered; F.held, while it is delivered to agent.
+  function F.delivered(id, run_key)
+    local r = H.sql("SELECT doc FROM runs WHERE run_key = ? AND automation_id = ? AND status = 'delivered'", {run_key, id})[1]
+    return r and rex.json.decode(r.doc)
   end
+  function F.held(agent, run_key)
+    local r = H.sql("SELECT doc FROM runs WHERE run_key = ? AND agent = ? AND status = 'delivered'", {run_key, agent})[1]
+    return r and rex.json.decode(r.doc)
+  end
+
   -- sql_write tries again while the plugin has an open transaction (busy).
   local function sql_write(sql, params)
     for _ = 1, 100 do
@@ -232,64 +214,57 @@ return function(H)
     error('meta.rev changes too often', 2)
   end
   local function null(v) if v == nil then return {null = true} end return tostring(v) end
-  -- statements turns one record op into SQL statements {sql, params}. rev is the new revision: a
-  -- value, or {expr = <SQL expression>} for statements that take it from meta.rev when they run.
-  local function statements(o, rev)
-    local r, rp = '?', rev
-    if type(rev) == 'table' then r, rp = rev.expr, nil end
-    local function with(list, ...)
+  -- A row op is {tbl, key, value} or {tbl, key, delete = true}. statement turns it into one SQL
+  -- statement {sql, params}. The value of a presets row is the automation id; of another row, its
+  -- document. rev is the new revision: a value, or {expr = <SQL expression>} for a statement that
+  -- takes it from meta.rev when it runs.
+  local function statement(o, rev)
+    local col = KEYS[o.tbl] or error('no table ' .. tostring(o.tbl), 3)
+    if o.delete then return {'DELETE FROM ' .. o.tbl .. ' WHERE ' .. col .. ' = ?', {o.key}} end
+    local r, rp = '?', {rev}
+    if type(rev) == 'table' then r, rp = rev.expr, {} end
+    local function with(head, tail)
       local out = {}
-      for _, v in ipairs(list) do
-        if v == '<rev>' then if rp ~= nil then out[#out + 1] = rp end else out[#out + 1] = v end
-      end
+      for _, v in ipairs(head) do out[#out + 1] = v end
+      for _, v in ipairs(rp) do out[#out + 1] = v end
+      for _, v in ipairs(tail) do out[#out + 1] = v end
       return out
     end
-    if o.key == 'meta/next_id' then
-      return {{"INSERT INTO meta (name, value) VALUES ('next_id', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", {tostring(o.value.n)}},
-        {"INSERT INTO meta (name, value) VALUES ('next_id_rev', " .. r .. ") ON CONFLICT (name) DO UPDATE SET value = excluded.value", with({'<rev>'})}}
-    end
-    local t, k = table_of(o.key)
-    if o.delete then return {{'DELETE FROM ' .. t.tbl .. ' WHERE ' .. t.col .. ' = ?', {k}}} end
-    if t.tbl == 'runs' then
+    if o.tbl == 'runs' then
       local v = o.value
-      return {{'INSERT INTO runs (run_key, automation_id, rev, status, q, t, agent, doc) VALUES (?, ?, ' .. r .. ', ?, ?, ?, ?, ?) '
+      return {'INSERT INTO runs (run_key, automation_id, rev, status, q, t, agent, doc) VALUES (?, ?, ' .. r .. ', ?, ?, ?, ?, ?) '
         .. 'ON CONFLICT (run_key) DO UPDATE SET rev = excluded.rev, status = excluded.status, q = excluded.q, t = excluded.t, '
         .. 'agent = excluded.agent, doc = excluded.doc',
-        with({k, k:match('^run/([^/]+)/'), '<rev>', tostring(v.status), null(v.q), null(v.t), null(v.agent), rex.json.encode(v)})}}
+        with({o.key, o.key:match('^run/([^/]+)/')}, {tostring(v.status), null(v.q), null(v.t), null(v.agent), rex.json.encode(v)})}
     end
-    if t.tbl == 'presets' then
-      return {{'INSERT INTO presets (name, rev, automation_id) VALUES (?, ' .. r .. ', ?) ON CONFLICT (name) DO UPDATE SET rev = excluded.rev, '
-        .. 'automation_id = excluded.automation_id', with({k, '<rev>', tostring(o.value.id)})}}
+    if o.tbl == 'presets' then
+      return {'INSERT INTO presets (name, rev, automation_id) VALUES (?, ' .. r .. ', ?) ON CONFLICT (name) DO UPDATE SET rev = excluded.rev, '
+        .. 'automation_id = excluded.automation_id', with({o.key}, {tostring(o.value)})}
     end
-    return {{'INSERT INTO ' .. t.tbl .. ' (' .. t.col .. ', rev, doc) VALUES (?, ' .. r .. ', ?) ON CONFLICT (' .. t.col .. ') '
-      .. 'DO UPDATE SET rev = excluded.rev, doc = excluded.doc', with({k, '<rev>', rex.json.encode(o.value)})}}
+    return {'INSERT INTO ' .. o.tbl .. ' (' .. col .. ', rev, doc) VALUES (?, ' .. r .. ', ?) ON CONFLICT (' .. col .. ') '
+      .. 'DO UPDATE SET rev = excluded.rev, doc = excluded.doc', with({o.key}, {rex.json.encode(o.value)})}
   end
+  -- F.write(ops) writes row ops, each written row with a new revision from meta.rev. An op with
+  -- new = true needs an absent row; with if_rev, a row at that revision. It is for fixtures. The
+  -- statements of one table merge into one statement (many VALUES rows, or IN for deletes), in
+  -- the order that the ops name the tables, so the plugin never sees a half-written table.
   function F.write(ops)
+    local n = 0
     for _, o in ipairs(ops) do
-      if o.if_rev ~= nil then
-        local cur = F.store(o.key).rev
-        if cur ~= o.if_rev then error({code = 'conflict', message = 'record ' .. o.key .. ' is at rev ' .. cur}, 2) end
-      end
-    end
-    -- The statements of one table merge into one statement (many VALUES rows, or IN for deletes),
-    -- in the order that the ops name the tables. So the plugin never sees a half-written table, as
-    -- the harness store write was one batch.
-    local indexes, n = {}, 0
-    for _, o in ipairs(ops) do
-      if index_of(o.key) then indexes[#indexes + 1] = o elseif not o.delete then n = n + 1 end
+      local cur = F.rev(o.tbl, o.key)
+      if o.new and cur ~= nil then error({code = 'conflict', message = o.tbl .. ' row ' .. o.key .. ' exists at rev ' .. cur}, 2) end
+      if o.if_rev ~= nil and cur ~= o.if_rev then error({code = 'conflict', message = o.tbl .. ' row ' .. o.key .. ' is at rev ' .. tostring(cur)}, 2) end
+      if not o.delete then n = n + 1 end
     end
     local revs, r = reserve(n), 0
     local groups, order = {}, {}
     for _, o in ipairs(ops) do
-      if not index_of(o.key) then
-        local rev
-        if not o.delete then r = r + 1; rev = revs[r] end
-        for _, st in ipairs(statements(o, rev)) do
-          local g = groups[st[1]]
-          if not g then g = {sql = st[1], rows = {}}; groups[st[1]] = g; order[#order + 1] = g end
-          g.rows[#g.rows + 1] = st[2]
-        end
-      end
+      local rev
+      if not o.delete then r = r + 1; rev = revs[r] end
+      local st = statement(o, rev)
+      local g = groups[st[1]]
+      if not g then g = {sql = st[1], rows = {}}; groups[st[1]] = g; order[#order + 1] = g end
+      g.rows[#g.rows + 1] = st[2]
     end
     for _, g in ipairs(order) do
       local head, tuple, tail = g.sql:match('^(.- VALUES )(%b())(.*)$')
@@ -306,44 +281,32 @@ return function(H)
       elseif #g.rows > 1 then
         error('F.write cannot merge ' .. g.sql, 2)
       end
-      for _, row in ipairs(g.rows) do for _, p in ipairs(row) do params[#params + 1] = p end end
+      for _, row_params in ipairs(g.rows) do for _, p in ipairs(row_params) do params[#params + 1] = p end end
       sql_write(sql, params)
     end
-    for _, o in ipairs(indexes) do
-      local given = F.store(o.key)
-      if o.delete and given.rev ~= '0' then error('F.write: a run still gives ' .. o.key, 2) end
-      if not o.delete and given.rev == '0' then error('F.write: no run gives ' .. o.key, 2) end
-    end
   end
-  -- sql_ops gives the statements of record ops (no if_rev; index ops are left out: the runs
-  -- carry them) as {sql, params}. They take their revisions from meta.rev when they run, and
-  -- move it, all in the injection's transaction.
-  local function sql_ops(ops)
-    local out, n = {}, 0
-    for _, o in ipairs(ops) do
-      if not index_of(o.key) then
-        local rev
-        if not o.delete then
-          n = n + 1
-          rev = {expr = "CAST(CAST((SELECT value FROM meta WHERE name = 'rev') AS INTEGER) + " .. n .. " AS TEXT)"}
-        end
-        for _, s in ipairs(statements(o, rev)) do out[#out + 1] = {sql = s[1], params = s[2]} end
-      end
-    end
-    out[#out + 1] = {sql = "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + " .. n .. " AS TEXT) WHERE name = 'rev'"}
-    return out
-  end
-  -- F.inject_begin(ops, spec) commits record ops as another writer when the plugin next begins a
-  -- transaction (inject{match = {sql_begin = true}, sql = ...}; hub/sql-lab 8510d50 or later).
+  -- F.inject_begin(ops, spec) commits row ops as another writer when the plugin next begins a
+  -- transaction (inject{match = {sql_begin = true}, sql = ...}). The statements take their
+  -- revisions from meta.rev when they run, and move it, all in the injection's transaction.
   function F.inject_begin(ops, spec)
     spec = spec or {}
-    return H.inject({match = {sql_begin = true}, sql = sql_ops(ops), skip = spec.skip, times = spec.times})
+    local sql, n = {}, 0
+    for _, o in ipairs(ops) do
+      local rev
+      if not o.delete then
+        n = n + 1
+        rev = {expr = "CAST(CAST((SELECT value FROM meta WHERE name = 'rev') AS INTEGER) + " .. n .. " AS TEXT)"}
+      end
+      local st = statement(o, rev)
+      sql[#sql + 1] = {sql = st[1], params = st[2]}
+    end
+    sql[#sql + 1] = {sql = "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + " .. n .. " AS TEXT) WHERE name = 'rev'"}
+    return H.inject({match = {sql_begin = true}, sql = sql, skip = spec.skip, times = spec.times})
   end
 
-  function F.run(key) return F.store(key).value end
   function F.wait_status(key, status, timeout)
     return H.wait('run ' .. key .. ' to be ' .. status, function()
-      local run = F.store(key).value
+      local run = F.run(key)
       return run and run.status == status and run
     end, timeout or 20)
   end

@@ -21,7 +21,7 @@ test('a file that appears during the copy and a pending start each run once afte
   local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key)})
   alice:call('automations.run', {id = p, key = 'work-start-1'})
   wait('the gated start', function() return fault_fired(gate) end, 10)
-  expect(F.store(run_key).value.status).to_be('starting')
+  expect(F.run(run_key).status).to_be('starting')
   local running = F.running('worker')
   F.to_store()
   -- The new instance copies; its first run page fails 10 times, so the copy waits about 10 s. The

@@ -16,8 +16,8 @@ end
 -- A new automation has gen 1, so its watch key is a-<id>-1 (B1).
 local function wkey(id) return 'a-' .. id .. '-1' end
 local function appearance(run) return run.run_key:match('/f/(.+)$') end
-local function marker(id, run) return F.store('seen/' .. id .. '/' .. appearance(run)) end
-local function retire(id, run) return F.store('rt/' .. id .. '/' .. appearance(run)) end
+local function marker(id, run) return F.seen('seen/' .. id .. '/' .. appearance(run)) end
+local function retire(id, run) return F.retired('rt/' .. id .. '/' .. appearance(run)) end
 
 local function names(runs)
   local out = {}
@@ -35,7 +35,7 @@ test('a new file gives one run; an existing file and another name give none', fu
   expect(runs[1].item.name).to_be('a.md')
   expect(runs[1].item.path).to_be(dir .. '/a.md')
   local run = F.wait_status(runs[1].run_key, 'delivered')
-  expect(marker(id, runs[1]).value.run).to_be(runs[1].run_key)
+  expect(marker(id, runs[1]).run).to_be(runs[1].run_key)
   F.put(dir .. '/b.md')
   F.put(dir .. '/c.txt')
   F.wait_runs(alice, id, 2)
@@ -92,7 +92,7 @@ test('a file that changes before the ack gives no second run', function()
   runs = F.runs(alice, id, 'f')
   expect(#runs).to_be(1)
   -- The file is still there, so its marker stays.
-  expect(marker(id, runs[1]).rev).not_to_be('0')
+  expect(marker(id, runs[1])).not_to_be(nil)
 end)
 
 -- The file comes and goes while the ack is refused: the hub returns created_removed with the same
@@ -105,11 +105,11 @@ test('created_removed after a refused ack: no second run, and the marker retires
   local runs = F.wait_runs(alice, id, 1)
   wait('the gated ack', function() return fault_fired(gate) end, 10)
   F.remove(dir .. '/y.md')
-  wait('the removal row', function() return retire(id, runs[1]).rev ~= '0' end, 10)
-  expect(marker(id, runs[1]).rev).not_to_be('0')
+  wait('the removal row', function() return retire(id, runs[1]) ~= nil end, 10)
+  expect(marker(id, runs[1])).not_to_be(nil)
   fault_release(gate)
-  wait('the marker to retire', function() return marker(id, runs[1]).rev == '0' end, 10)
-  expect(retire(id, runs[1]).rev).to_be('0')
+  wait('the marker to retire', function() return marker(id, runs[1]) == nil end, 10)
+  expect(retire(id, runs[1])).to_be(nil)
   expect(#F.runs(alice, id, 'f')).to_be(1)
 end)
 
@@ -124,10 +124,10 @@ test('a removed file retires its marker after a lost ack reply and a crash', fun
   local lost = fault({point = 'action', action = 'hub.watch.ack', when = 'after', mode = 'lose-reply', key = wkey(id)})
   F.remove(dir .. '/r.md')
   wait('the lost ack reply', function() return fault_fired(lost) end, 10)
-  expect(marker(id, runs[1]).rev).not_to_be('0')
+  expect(marker(id, runs[1])).not_to_be(nil)
   hub:restart({crash = true})
-  wait('the marker to retire', function() return marker(id, runs[1]).rev == '0' end, 20)
-  expect(retire(id, runs[1]).rev).to_be('0')
+  wait('the marker to retire', function() return marker(id, runs[1]) == nil end, 20)
+  expect(retire(id, runs[1])).to_be(nil)
   F.put(dir .. '/r.md')
   local both = F.wait_runs(alice, id, 2)
   expect(names(both)).to_be('r.md r.md')
@@ -148,7 +148,7 @@ test('a file whose run passes the budget gives one failed run without the path',
   expect(runs[1].item.path).to_be(nil)
   expect(runs[1].item.path_bytes).to_be(#dir + 1 + #name)
   expect(#runs[1].item.name <= 256).to_be(true)
-  expect(marker(id, runs[1]).rev).not_to_be('0')
+  expect(marker(id, runs[1])).not_to_be(nil)
   -- The run has no path, so a retry would fail again.
   expect_error(function() alice:call('automations.retry', {run_key = runs[1].run_key, key = 'long-retry'}) end, 'not_retryable')
   F.put(dir .. '/' .. name, 'changed')

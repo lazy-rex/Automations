@@ -68,7 +68,7 @@ test('a changed cwd starts a new worker, and the old worker keeps its task', fun
   expect(in_dir(two.spawn_id, b)).to_be(true)
   expect(in_dir(one.spawn_id, a)).to_be(true)
   rex.sleep(2)
-  local first = F.store(manual(id, 1)).value
+  local first = F.run(manual(id, 1))
   expect(first.status).to_be('delivered')
   expect(first.agent).to_be(one.agent)
   expect(first.attempt).to_be(1)
@@ -84,8 +84,8 @@ test('changed args start a new worker, and the old worker keeps its task', funct
   local two = F.wait_status(run_now(id, 'args-2'), 'delivered')
   expect(two.agent).not_to_be(one.agent)
   rex.sleep(2)
-  expect(F.store(manual(id, 1)).value.agent).to_be(one.agent)
-  expect(F.store(manual(id, 1)).value.attempt).to_be(1)
+  expect(F.run(manual(id, 1)).agent).to_be(one.agent)
+  expect(F.run(manual(id, 1)).attempt).to_be(1)
 end)
 
 -- A pending start keeps its stored request across an edit: it opens in the old directory, and
@@ -98,7 +98,7 @@ test('a pending start across an edit opens with its stored request', function()
   wait('the gated start', function() return fault_fired(gate) end, 10)
   change(id, 'pending-b', {profile = 'worker', cwd = b})
   run_now(id, 'pending-2')
-  expect(F.store('state/' .. id).value.spawning.request.cwd).to_be(a)
+  expect(F.state(id).spawning.request.cwd).to_be(a)
   fault_release(gate)
   local one = F.wait_status(manual(id, 1), 'delivered')
   expect(in_dir(one.spawn_id, a)).to_be(true)
@@ -117,13 +117,13 @@ test('an old worker lost after an action change: its task starts a worker with i
   local two = F.wait_status(run_now(id, 'lost-2'), 'delivered')
   expect(alice:hub('hub.stop', {spawn_id = one.spawn_id}).status).to_be('closed')
   local again = wait('run 1 attempt 2', function()
-    local r = F.store(manual(id, 1)).value
+    local r = F.run(manual(id, 1))
     return r.status == 'delivered' and r.attempt == 2 and r
   end, 25)
   expect(again.agent).not_to_be(one.agent)
   expect(again.agent).not_to_be(two.agent)
   expect(in_dir(again.spawn_id, a)).to_be(true)
-  expect(F.store(manual(id, 2)).value.agent).to_be(two.agent)
+  expect(F.run(manual(id, 2)).agent).to_be(two.agent)
 end)
 
 -- A -> B -> A: one current worker only, so the second A starts a third worker; the first A
@@ -139,8 +139,8 @@ test('A, then B, then A again starts a third worker', function()
   expect(three.agent).not_to_be(one.agent)
   expect(three.agent).not_to_be(two.agent)
   expect(in_dir(three.spawn_id, a)).to_be(true)
-  expect(F.store(manual(id, 1)).value.agent).to_be(one.agent)
-  expect(F.store(manual(id, 2)).value.agent).to_be(two.agent)
+  expect(F.run(manual(id, 1)).agent).to_be(one.agent)
+  expect(F.run(manual(id, 2)).agent).to_be(two.agent)
 end)
 
 -- The reviewer's case for the paged scan: 20 tasks of a live W1 fill the first dv page, and the
@@ -156,24 +156,24 @@ test('a lost task after 20 live tasks moves, and a crash keeps every holder', fu
   expect(two.agent).not_to_be(one.agent)
   expect(alice:hub('hub.stop', {spawn_id = two.spawn_id}).status).to_be('closed')
   local moved = wait('run 21 attempt 2', function()
-    local r = F.store(manual(id, 21)).value
+    local r = F.run(manual(id, 21))
     return r.status == 'delivered' and r.attempt == 2 and r
   end, 25)
   expect(in_dir(moved.spawn_id, b)).to_be(true)
   for n = 1, 20 do
-    local r = F.store(manual(id, n)).value
+    local r = F.run(manual(id, n))
     expect(r.agent).to_be(one.agent)
     expect(r.attempt).to_be(1)
   end
   hub:restart({crash = true})
   rex.sleep(5)
   for n = 1, 20 do
-    local r = F.store(manual(id, n)).value
+    local r = F.run(manual(id, n))
     expect(r.status).to_be('delivered')
     expect(r.agent).to_be(one.agent)
     expect(r.attempt).to_be(1)
   end
-  local r21 = F.store(manual(id, 21)).value
+  local r21 = F.run(manual(id, 21))
   expect(r21.agent).to_be(moved.agent)
   expect(r21.attempt).to_be(2)
 end)
