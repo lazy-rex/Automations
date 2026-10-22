@@ -71,6 +71,26 @@ test('the newest 100 terminal runs stay; an older active run stays; a retry take
   fault_release(gate)
 end)
 
+-- Run documents near the run budget (review of f71fc6e). An instruction of 4000 backslashes is
+-- 8000 bytes encoded, and twice that inside a hub.sql reply, which holds about 1 MB: the full
+-- documents of 101 runs need two replies. The prune's t/ scan must still see 100 entries, so the
+-- oldest go and exactly the newest 100 stay.
+test('with run documents near the budget, exactly the newest 100 terminal runs stay', function()
+  local id = alice:call('automations.save', {key = 'big', name = 'Keep big', trigger = {kind = 'daily', at = '09:00'},
+    action = {profile = 'worker'}, instruction = string.rep('\\', 4000)}).id
+  local gate = hold(id, 'big')
+  cancel_runs(id, 'big', 2, 106) -- terminal sequences 1 to 105
+  local stored = sql('SELECT sum(length(doc)) AS n FROM runs WHERE automation_id = ?', {id})[1].n
+  expect(tonumber(stored) > 101 * 8000).to_be(true) -- more than one reply of full documents
+  wait('the 5 oldest terminal runs to go', function()
+    for n = 2, 6 do if exists(manual(id, n)) then return false end end
+    return true
+  end, 30)
+  for n = 7, 106 do expect(exists(manual(id, n))).to_be(true) end
+  expect(#sql("SELECT run_key FROM runs WHERE automation_id = ? AND t IS NOT NULL", {id})).to_be(100)
+  fault_release(gate)
+end)
+
 -- A clock moved back changes no order: the run that ended last stays.
 test('with the clock moved back, the latest terminal run stays and the oldest goes', function()
   F.set_clock(T0 + 86400)

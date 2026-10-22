@@ -70,7 +70,13 @@ return function(A)
   local function columns(t) return t.tbl == 'presets' and 'name, rev, automation_id' or (t.col .. ', rev, doc') end
 
   -- The run that gives an index key, as the tables are now (inside the batch: after its writes).
-  local RUN_COLS = 'run_key, automation_id, rev, status, q, t, agent, doc'
+  -- INDEX_COLS are the columns of an index record: never the document, so a page of index
+  -- records stays small, as the store's index records were (a run document is up to 12 KiB, and
+  -- one hub.sql reply holds about 1 MB: 100 runs with full documents can need two replies, and a
+  -- short page then stops the prune). RUN_COLS add the document, for the run that gives one key.
+  local INDEX_COLS = "run_key, automation_id, rev, status, q, t, agent, json_extract(doc, '$.tseq') AS tseq, "
+    .. "json_extract(doc, '$.attempt') AS attempt"
+  local RUN_COLS = INDEX_COLS .. ', doc'
   local function giver(key)
     local kind = index_of(key)
     if kind == 'q' then return db.first('SELECT ' .. RUN_COLS .. ' FROM runs WHERE q = ?', key) end
@@ -86,11 +92,10 @@ return function(A)
   end
   -- The value of an index record, from the run that gives it (the values of today's records).
   local function index_value(kind, row)
-    local run = decode(row.doc)
     if kind == 'q' then return {run = row.run_key} end
-    if kind == 't' then return {run = row.run_key, seq = run.tseq} end
+    if kind == 't' then return {run = row.run_key, seq = tonumber(row.tseq)} end
     if kind == 'dv' then return {agent = row.agent} end
-    return {attempt = run.attempt, auto = row.automation_id}
+    return {attempt = tonumber(row.attempt), auto = row.automation_id}
   end
 
   local function same(a, b)
@@ -181,7 +186,7 @@ return function(A)
     local kind = index_of(prefix)
     if kind == 'q' or kind == 't' then
       local col = kind
-      local rows, more = db.query('SELECT ' .. RUN_COLS .. ' FROM runs WHERE ' .. col .. ' > ? AND substr(' .. col .. ', 1, ?) = ? ORDER BY '
+      local rows, more = db.query('SELECT ' .. INDEX_COLS .. ' FROM runs WHERE ' .. col .. ' > ? AND substr(' .. col .. ', 1, ?) = ? ORDER BY '
         .. col .. ' LIMIT ?', after, #prefix, prefix, n)
       return page(rows, limit, more, function(row) return row[col] end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
     end
@@ -189,7 +194,7 @@ return function(A)
       local id = prefix:match('^dv/([^/]+)/$')
       if not id then fail('internal', 'The bridge scans dv/<id>/ only, not ' .. prefix) end
       local from = after:sub(1, #prefix) == prefix and after:sub(#prefix + 1) or ''
-      local rows, more = db.query('SELECT ' .. RUN_COLS .. " FROM runs WHERE automation_id = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
+      local rows, more = db.query('SELECT ' .. INDEX_COLS .. " FROM runs WHERE automation_id = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
         id, from, n)
       return page(rows, limit, more, function(row) return prefix .. row.run_key end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
     end
@@ -197,7 +202,7 @@ return function(A)
       local agent = prefix:match('^box/([^/]+)/$')
       if not agent then fail('internal', 'The bridge scans box/<agent>/ only, not ' .. prefix) end
       local from = after:sub(1, #prefix) == prefix and after:sub(#prefix + 1) or ''
-      local rows, more = db.query('SELECT ' .. RUN_COLS .. " FROM runs WHERE agent = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
+      local rows, more = db.query('SELECT ' .. INDEX_COLS .. " FROM runs WHERE agent = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
         agent, from, n)
       return page(rows, limit, more, function(row) return prefix .. row.run_key end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
     end
