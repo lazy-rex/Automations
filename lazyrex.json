@@ -12,6 +12,7 @@
   },
   "watch_roots": {"automations": ["${LAB}/inbox"]},
   "env": {"TZ": "PST8PDT"},
+  "files": {"sql_import.lua": {"args": {"automations": {"sql_import_file": "${LAB}/import-now"}}}},
   "parity_fixture": "tests/parity_fixture.lua",
   "parity_routes": [
    "/forms/automation/1",

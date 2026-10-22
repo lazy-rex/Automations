@@ -27,29 +27,47 @@ return function(A)
   local encode = rex.json.encode
   local function text(v) if v == nil then return nil end return tostring(v) end
 
-  -- The write functions. mode 'import' inserts only a missing row (an import step that runs again
-  -- after a crash repeats nothing).
-  local function verb(mode) return mode == 'import' and 'INSERT OR IGNORE' or 'INSERT OR REPLACE' end
-  local W = {}
-  function W.automation(mode, id, rev, value)
-    db.exec(verb(mode) .. ' INTO automations (id, rev, doc) VALUES (?, ?, ?)', id, rev, encode(value))
+  local function same(a, b)
+    if type(a) ~= type(b) then return false end
+    if type(a) ~= 'table' then return a == b end
+    for k, v in pairs(a) do if not same(v, b[k]) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
   end
-  function W.state(mode, id, rev, value)
-    db.exec(verb(mode) .. ' INTO states (id, rev, doc) VALUES (?, ?, ?)', id, rev, encode(value))
+  -- copy inserts one imported row. Only a conflict on the row's own key does nothing (an import
+  -- step that runs again after a crash), and then the stored row must be the same; any other
+  -- conflict, for example a second run with the same queue entry, fails the step. This module has
+  -- import writes only: the runtime writes come with the cutover, with their revision checks.
+  -- A JSON column is compared as its value: the key order of an encoding is not fixed.
+  local JSON = {doc = true, reply = true}
+  local function copy(tbl, cols, values)
+    local marks = {}
+    for i = 1, #cols do marks[i] = '?' end
+    local r = db.exec('INSERT INTO ' .. tbl .. ' (' .. table.concat(cols, ', ') .. ') VALUES (' .. table.concat(marks, ', ')
+      .. ') ON CONFLICT (' .. cols[1] .. ') DO NOTHING', unpack(values, 1, #cols))
+    if r.changes == 1 then return end
+    local row = db.first('SELECT ' .. table.concat(cols, ', ') .. ' FROM ' .. tbl .. ' WHERE ' .. cols[1] .. ' = ?', values[1])
+    for i, c in ipairs(cols) do
+      local equal = row[c] == values[i]
+      if not equal and JSON[c] and row[c] and values[i] then equal = same(rex.json.decode(row[c]), rex.json.decode(values[i])) end
+      if not equal then
+        error({code = 'conflict', message = 'The import of ' .. tostring(values[1]) .. ' meets another ' .. tbl .. ' row (' .. c .. ')'}, 0)
+      end
+    end
   end
+  local put = {}
+  function put.automation(id, rev, value) copy('automations', {'id', 'rev', 'doc'}, {id, rev, encode(value)}) end
+  function put.state(id, rev, value) copy('states', {'id', 'rev', 'doc'}, {id, rev, encode(value)}) end
   -- A run key is run/<id>/<kind>/<k>; its automation is the second part.
-  function W.run(mode, run_key, rev, value)
+  function put.run(run_key, rev, value)
     local id = run_key:match('^run/([^/]+)/')
     if not id then error({code = 'internal', message = 'A run key without an automation: ' .. run_key}, 0) end
-    db.exec(verb(mode) .. ' INTO runs (run_key, automation_id, rev, status, q, t, agent, doc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      run_key, id, rev, tostring(value.status), text(value.q), text(value.t), text(value.agent), encode(value))
+    copy('runs', {'run_key', 'automation_id', 'rev', 'status', 'q', 't', 'agent', 'doc'},
+      {run_key, id, rev, tostring(value.status), text(value.q), text(value.t), text(value.agent), encode(value)})
   end
-  function W.preset(mode, name, rev, value)
-    db.exec(verb(mode) .. ' INTO presets (name, rev, automation_id) VALUES (?, ?, ?)', name, rev, tostring(value.id))
-  end
-  function W.seen(mode, key, rev, value) db.exec(verb(mode) .. ' INTO seen (key, rev, doc) VALUES (?, ?, ?)', key, rev, encode(value)) end
-  function W.retired(mode, key, rev, value) db.exec(verb(mode) .. ' INTO retired (key, rev, doc) VALUES (?, ?, ?)', key, rev, encode(value)) end
-  M.write = W
+  function put.preset(name, rev, value) copy('presets', {'name', 'rev', 'automation_id'}, {name, rev, tostring(value.id)}) end
+  function put.seen(key, rev, value) copy('seen', {'key', 'rev', 'doc'}, {key, rev, encode(value)}) end
+  function put.retired(key, rev, value) copy('retired', {'key', 'rev', 'doc'}, {key, rev, encode(value)}) end
 
   -- The import (plan, "The one-time import"). Each step copies one page of one store prefix in one
   -- transaction and moves meta.import_cursor in it. The index records (q/, t/, dv/, box/) are not
@@ -58,18 +76,18 @@ return function(A)
   local PREFIXES = {
     {prefix = 'meta/', put = function(key, rec)
       if key == 'meta/next_id' then
-        db.exec('INSERT OR IGNORE INTO meta (name, value) VALUES (?, ?)', 'next_id', tostring(rec.value.n))
+        copy('meta', {'name', 'value'}, {'next_id', tostring(rec.value.n)})
       end
     end},
-    {prefix = 'auto/', put = function(key, rec) W.automation('import', key:sub(6), rec.rev, rec.value) end},
-    {prefix = 'state/', put = function(key, rec) W.state('import', key:sub(7), rec.rev, rec.value) end},
-    {prefix = 'run/', put = function(key, rec) W.run('import', key, rec.rev, rec.value) end},
-    {prefix = 'preset/', put = function(key, rec) W.preset('import', key:sub(8), rec.rev, rec.value) end},
-    {prefix = 'seen/', put = function(key, rec) W.seen('import', key, rec.rev, rec.value) end},
-    {prefix = 'rt/', put = function(key, rec) W.retired('import', key, rec.rev, rec.value) end},
+    {prefix = 'auto/', put = function(key, rec) put.automation(key:sub(6), rec.rev, rec.value) end},
+    {prefix = 'state/', put = function(key, rec) put.state(key:sub(7), rec.rev, rec.value) end},
+    {prefix = 'run/', put = function(key, rec) put.run(key, rec.rev, rec.value) end},
+    {prefix = 'preset/', put = function(key, rec) put.preset(key:sub(8), rec.rev, rec.value) end},
+    {prefix = 'seen/', put = function(key, rec) put.seen(key, rec.rev, rec.value) end},
+    {prefix = 'rt/', put = function(key, rec) put.retired(key, rec.rev, rec.value) end},
     -- The saved replies of hub.store operations, exactly: key, fingerprint and result.
     {ops = true, put = function(key, op)
-      db.exec('INSERT OR IGNORE INTO ops (key, fingerprint, reply) VALUES (?, ?, ?)', key, op.fingerprint, encode(op.result == nil and {} or op.result))
+      copy('ops', {'key', 'fingerprint', 'reply'}, {key, op.fingerprint, encode(op.result == nil and {} or op.result)})
     end},
   }
   -- fetch reads one page of a step: a store prefix (hub.store.scan) or the saved operations

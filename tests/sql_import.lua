@@ -105,31 +105,71 @@ local function check()
   return count
 end
 
+-- The import starts at the first tick after the trigger file exists (manifest test.files arg
+-- sql_import_file). The fixture is done and the engine is idle before the file is made, so the
+-- store does not change during the import.
+local TRIGGER = H.args.lab .. '/import-now'
+local function start_import() F.put(TRIGGER, 'now') end
+-- again empties the tables and restarts the hub without the trigger file, so the next import
+-- starts only when the test makes the file again, after it has armed its faults.
+local function again()
+  empty_tables()
+  F.remove(TRIGGER)
+  hub:restart()
+end
+
 test('the import copies each record exactly, with its rev, and the columns equal the document', function()
   fixture()
   rex.sleep(3)
-  empty_tables()
-  hub:restart()
+  expect(#sql('SELECT name FROM meta')).to_be(0)
+  start_import()
   wait('the import', imported, 60)
   expect(imported()).to_be('store')
   expect(check()).to_be(2 + 2 + 2 + BACKLOG)
 end)
 
--- A crash between import pages. Faults and injections live in the hub process, and the import runs
--- at the plugin start, so the test cannot stop it between two pages from outside. It writes the
--- state that such a crash leaves instead (a fixture): the rows of the first page of runs, the
--- cursor after that page, and no imported mark. Then it crashes the hub: the import resumes from
--- the cursor, and each record is copied once.
-test('a crash between import pages: the import resumes from its cursor and copies each record once', function()
+-- A failed page commit: the second page of runs fails until a crash. The rows of that page and
+-- its cursor are not committed; the first page and its cursor are. After the crash the import
+-- resumes from the cursor and copies each record once.
+test('a failed page commit keeps the rows and the cursor of the page before it; the import resumes after a crash', function()
+  again()
+  local inj = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'blocked for the import test', fail_code = 'unavailable', times = 'always'})
+  start_import()
+  wait('the failed second page', function() return injection(inj).consumed >= 1 end, 60)
+  expect(imported()).to_be(nil)
   local keys = sql('SELECT run_key FROM runs ORDER BY run_key')
-  expect(#keys).to_be(2 + BACKLOG)
-  sql_write('DELETE FROM runs WHERE run_key > ?', {keys[50].run_key})
-  sql_write('DELETE FROM presets')
-  sql_write('DELETE FROM meta WHERE name = ?', {'imported'})
-  sql_write('UPDATE meta SET value = ? WHERE name = ?', {'4:' .. keys[50].run_key, 'import_cursor'})
-  expect(#sql('SELECT run_key FROM runs')).to_be(50)
+  expect(#keys).to_be(50)
+  expect(sql('SELECT value FROM meta WHERE name = ?', {'import_cursor'})[1].value).to_be('4:' .. keys[50].run_key)
   hub:restart({crash = true})
   wait('the import', imported, 60)
-  expect(sql('SELECT value FROM meta WHERE name = ?', {'import_cursor'})[1].value:match('^8:')).to_be_truthy()
   expect(check()).to_be(2 + 2 + 2 + BACKLOG)
+end)
+
+-- A lost commit reply: the second page of runs commits, and the plugin gets an error. The step
+-- runs again from the committed cursor, so no page is copied twice and none is skipped.
+test('a lost page commit reply: the import goes on from the committed cursor', function()
+  again()
+  local inj = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'lost reply for the import test', after = true})
+  start_import()
+  wait('the import', imported, 60)
+  expect(injection(inj).consumed).to_be(1)
+  expect(check()).to_be(2 + 2 + 2 + BACKLOG)
+end)
+
+-- Two store runs with the same terminal entry: the second meets the UNIQUE index on runs.t. The
+-- import must fail that step, not drop the run and go on.
+test('a run that meets another run on its terminal entry stops the import', function()
+  again()
+  local a = ids.a
+  local dup = string.format('t/%s/%012d', a, 1)
+  local task = F.run(manual(a, 1)).task
+  write({{key = manual(a, 900), if_rev = '0', value = {kind = 'm', k = '000900', status = 'cancelled', attempt = 0, starts = 0, t = dup, tseq = 1, task = task}},
+    {key = manual(a, 901), if_rev = '0', value = {kind = 'm', k = '000901', status = 'cancelled', attempt = 0, starts = 0, t = dup, tseq = 1, task = task}}})
+  start_import()
+  wait('the first rows of the import', function() return #sql('SELECT run_key FROM runs') > 0 end, 60)
+  rex.sleep(5)
+  expect(imported()).to_be(nil)
+  expect(#sql('SELECT run_key FROM runs WHERE run_key = ?', {manual(a, 901)})).to_be(0)
+  -- The fixture goes again, so the file ends with a consistent store.
+  write({{key = manual(a, 900), delete = true}, {key = manual(a, 901), delete = true}})
 end)

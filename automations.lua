@@ -1824,8 +1824,11 @@ app.on('hub.changed', function(args)
   end
 end, {tx = false})
 
--- The import copies hub.store into the SQL tables one page at a time, at start. A failed step
--- tries again after RECHECK; a done import does nothing.
+-- The import copies hub.store into the SQL tables one page at a time. Until the cutover it runs
+-- only in a lab: the arg sql_import_file names a file, and the import starts at the first tick
+-- after that file exists. Without the arg it never runs, and no path reads the tables. A failed
+-- step tries again after RECHECK; a done import does nothing.
+local IMPORT_FILE = rex.args.sql_import_file
 local function import_step()
   local ok, done = pcall(sql.import_step)
   if not ok then
@@ -1834,6 +1837,14 @@ local function import_step()
   elseif not done then
     rex.after(0, import_step)
   end
+end
+local function import_due()
+  if S.importing or not IMPORT_FILE then return end
+  local f = io.open(IMPORT_FILE, 'r')
+  if not f then return end
+  f:close()
+  S.importing = true
+  import_step()
 end
 
 -- Startup work is not in the main chunk: a catch there can split module-level locals.
@@ -1848,9 +1859,9 @@ rex.after(0, function()
     S.last_sweep = wall()
     tick()
   end)
-  import_step()
   if not ok then print('automations: startup: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end
   rex.every(TICK, function()
+    import_due()
     local tick_ok, tick_err = pcall(tick)
     if not tick_ok then print('automations: tick: ' .. (type(tick_err) == 'table' and tostring(tick_err.message) or tostring(tick_err))) end
   end)
