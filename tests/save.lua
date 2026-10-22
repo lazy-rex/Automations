@@ -87,3 +87,15 @@ test('a trigger with a list of 3000 items is refused as invalid input', function
   expect(err.message:find('registry', 1, true)).to_be(nil)
   expect(count()).to_be(before)
 end)
+
+-- The object path of the same join: action.args with 3000 keys. The check of action.args (at most
+-- 512 bytes encoded) refuses it after the fingerprint.
+test('action args with 3000 keys are refused as invalid input', function()
+  local before = count()
+  local args = {}
+  for n = 1, 3000 do args['k' .. n] = 'v' end
+  local err = expect_error(function() alice:call('automations.save', {key = 'many-args', name = 'Many args',
+    trigger = {kind = 'daily', at = '09:00'}, action = {profile = 'worker', args = args}, instruction = 'Many args task.'}) end, 'invalid_input')
+  expect(err.message:find('registry', 1, true)).to_be(nil)
+  expect(count()).to_be(before)
+end)
