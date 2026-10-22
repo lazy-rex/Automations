@@ -195,7 +195,7 @@ that slice starts right after the cutover is approved on the branch.
    The old instance: the hub retires it before the new one starts. A store batch of the old
    instance that passed the caller check before the retirement must not commit after it. That is
    the store write fence of hub/store-fence (f0c580c), which is not in f6f1a03. The cutover needs
-   it in the hub release that has hub.sql (asked of the hub lead). Test in a lab: an old-instance
+   it in the hub release that has hub.sql: the hub lead puts it on main before hub.sql. Test in a lab: an old-instance
    batch held at the fence during a plugin reload; it gets `stale_instance`, and the copy does not
    see its record.
 
@@ -289,15 +289,17 @@ plugin. The hub lead's procedure (proposed, not built; it goes to hub/sql-r2 bef
 release):
 
 1. Before the cutover: back up `<state>/sql/automations.db` with its `-wal` and `-shm` files.
-2. Rollback: stop the plugin; call `hub.admin.sql_notices_return {plugin}` (it refuses while the
-   plugin runs, drains the plugin's outbox, refuses if a row stays, and deletes the plugin's
-   `sql_notice_plugins` and `notice_receipts` rows in one transaction); move the release clone
-   back; start the plugin.
-3. A later forward copies the store again. The SQL file of the earlier cutover must not be open
-   as live: it has `cutover-1:done` and does not have the store changes made after the rollback,
-   and the plugin cannot see those changes. So the rollback moves the SQL file aside (asked of the
-   hub lead: in the same admin call; else a step of the procedure). The moved file stays as
-   evidence.
+2. Rollback: stop the plugin; call `hub.admin.sql_return {plugin}`; move the release clone back;
+   start the plugin. The admin call refuses while the plugin is registered or desired running. It
+   drains the plugin's outbox and refuses if a row stays. It closes the hub's connections to the
+   plugin's SQL file and renames the file (with `-wal` and `-shm`) to
+   `<plugin>.db.returned-<UTC time>`; it never deletes it. Then, in one hub.db transaction, it
+   deletes the plugin's `sql_notice_plugins` and `notice_receipts` rows. It answers
+   `{returned = <backup name>}`. A retry after a stop between the rename and the transaction finds
+   no file and does only the transaction.
+3. A later forward starts with no SQL file and copies the store again. The renamed file is never
+   live: it has `cutover-1:done` and does not have the store changes made after the rollback, and
+   the plugin cannot see those changes. The file stays as evidence.
 
 The changes made after the cutover are lost (accepted by the coordinator); the release note must
 say so and name the procedure.
