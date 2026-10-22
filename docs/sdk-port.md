@@ -74,9 +74,9 @@ later cutover (slice 2): no release has SQL reads beside store writes.
 - `app.view('/panels/automations*', ...)` and `app.view('/forms/automation/*', ...)` with
   `{store = false}`; the view module stays. `app.command` for the two palette commands.
 - `app.on('hub.changed', fn)` marks the automations and schedules the steps, as today.
-- The hub calls stay on a local wrapper over `app.hub` that keeps today's codes: no code,
-  `disconnected`, `timeout`, `client_unavailable` and `unavailable` are `unavailable` (an unknown
-  outcome). The SDK maps only `disconnected`.
+- The hub calls stay on the plugin's own `hub()` function, which calls `rex.call` directly (not
+  `app.hub`) and keeps today's codes: no code, `disconnected`, `timeout`, `client_unavailable` and
+  `unavailable` are `unavailable` (an unknown outcome). The SDK maps only `disconnected`.
 - The launcher: the manifest has `"sdk": "0"`, and the hub starts the plugin through the SDK
   launcher (`boot.lua`, hub 0ae7451 on the lab branch `hub/sql-r2`), which puts the SDK in
   `package.path`. The plugin has no path setup of its own. Until the launcher is live, slice 1 runs
@@ -145,29 +145,73 @@ Every old index record and its replacement:
   guarantee needs a product decision.
 - The op key and the fingerprint stay as today: `<kind>/<caller id><key>`, looked up under every
   ID of the caller (identity and legacy IDs).
-- Old replies are not imported: `hub.store.scan` reads records, not the ops table. Before a
-  mutation, the plugin looks up the key in `ops`; if it is absent, it looks up the old key with
-  `hub.store.op` under every ID of the caller, and compares the old fingerprint. A found reply is
-  the answer (and copies to `ops`). This lookup stays until a product decision removes it.
+- Old replies are imported: the hub gives `hub.store.ops_scan` (f6f1a03), and the import copies
+  each saved operation (key, fingerprint, result) into `ops` (f962e2b). The lazy `hub.store.op`
+  lookup is not needed when the cutover test shows that an old key replays from `ops` under the
+  identity and under a legacy ID; until that test passes, the lookup stays in the plan.
 
 ## The one-time import (slice 2)
 
-- The import runs at start, before any action, view, timer or watch step. Until it is done, each
-  action and view answers `unavailable` ("importing"), and no engine step runs. Read paths show
-  nothing partial.
-- Steps, each one transaction: the automation records, then for each automation its runs and its
-  markers, in key order. Each step writes `meta.import_cursor` with its rows; each insert is
-  `INSERT OR IGNORE` on the store key, so a step after a crash repeats nothing. The last step
-  writes `meta.imported` with the store high-water marks.
-- Exact copies: IDs, revs, `next_id`, gen, spawn keys and requests, `daily_high`, attempts, starts,
-  watch keys, appearance keys and sequences. A pending start replays its stored key; a watch keeps
-  its appearance IDs.
-- Notices: the slice 1 code writes notices with `hub.store.batch`. The ported plugin writes no
-  store notice: the first SQL notice comes after `meta.imported`, and from then on the hub refuses
-  store notices of the plugin (`notices_moved`). Store notices that committed before the import
-  are already applied by the hub.
-- Automations runs live since 2026-10-20. I do not know whether the user added automations, so the
-  import is required. The old records stay in hub.store until a later cleanup commit.
+Built and approved for its branch (f962e2b): the import module copies each store record and
+saved reply exactly, one page per transaction with its cursor; a row repeats only when it is
+equal; any other conflict stops the import. Until the cutover it runs only on a lab trigger.
+
+## The cutover (slice 2, proposed)
+
+The cutover is one plugin version. From its first start, SQL is the only store: no path reads or
+writes hub.store records after the import, and no path writes hub.store notices.
+
+1. **Versioned import state.** `meta.import` holds `{version, state}`, version `cutover-1`, state
+   `copying` or `done`. At start, before anything else (in one transaction): when `meta.import`
+   is absent or has another version (for example the lab experiment's `imported = store`), the
+   plugin deletes every row of every table and writes `{cutover-1, copying}`. So stale
+   experimental rows are never taken as an import.
+2. **No other writer during the copy.** The hub runs one instance of a plugin, and its
+   retirement fence ends the old instance's calls before the new one starts (to verify in a lab:
+   a store batch of a retired instance gets `stale_instance`). The new instance is the only
+   writer of the plugin's store, and while the state is `copying` it starts no engine step, no
+   tick, no watch work and no reconcile; each export answers `unavailable` ("starting: importing
+   the automations"); each view shows that text and no action. `hub.changed` only marks. So the
+   store does not change during the copy, and the copy is one moment of it.
+3. **The copy.** The approved import steps. The last step sets `{cutover-1, done}` and
+   `meta.next_id`. Then the engine starts, as at a start today (every automation marked, the
+   sweep, the tick).
+4. **One store after the copy.** A storage layer with the store interface that the engine uses
+   today (`get`, `get1`, `scan`, `batch` with `if_rev`, the op records) runs on the SQL tables:
+   - a record key names its table and row (`auto/`, `state/`, `run/`, `preset/`, `seen/`, `rt/`,
+     `meta/next_id`);
+   - `if_rev` is checked in the transaction (`rev` equal, or the row absent for `'0'`), and a
+     write stores the next decimal rev;
+   - the index keys (`q/`, `t/`, `dv/`, `box/`) are read from the run columns: a scan of `q/<id>/`
+     is the runs with that `q` in order, and so on. A batch write of an index key is checked
+     against the run that the same batch writes (the same `q`, `t`, status and agent), so the
+     batch keeps its meaning; it writes no row of its own;
+   - `{notify = {agent, pending}}` becomes `app.notice(agent, pending)` in the same transaction;
+   - an op record (`{op = {key, fingerprint, result}}` of a batch) is an `ops` row in the same
+     transaction, and the replay reads `ops` under every caller ID.
+   This layer is a bridge, not the end state: the engine keeps its record logic, and slice 3
+   deletes the layer table by table.
+5. **External calls stay outside a transaction.** Each batch is one transaction. A step that
+   calls `hub.spawn`, `hub.watch.*` or `hub.workers` does it between its batches, as today, so no
+   transaction spans a slow call; the start stores its request first and its result in a later
+   fenced batch.
+6. **Bounded work.** The delete cleanup keeps its pages (at most 50 rows in one batch) and its
+   resume after an error. The 48 KiB request measure of today stays as a bound on one batch.
+7. **Tests.** All 20 files run on the cutover version. The harness store calls of the tests
+   (`store()`, `write()`, `inject` on store batches) change to SQL (`sql()`, `sql_write()`, the
+   commit faults); the assertions stay. New:
+   - a start on a store with automations, runs, a watch, a pending start and saved replies: during
+     the copy, exports and views answer "importing" and nothing else changes; after it, the
+     pending start replays its key, the old Run now key (also under a legacy ID) replays, and the
+     next ID is new;
+   - a crash during the copy, and a start on stale experimental tables: the copy starts again
+     from empty tables;
+   - a delivery: the task and its notice commit together; a failed commit has neither; a lost
+     commit reply delivers once; a store notice after the cutover is `notices_moved`.
+
+The old records stay in hub.store until a later cleanup commit. Rollback after the cutover goes
+to the slice 1 version and its store, which does not have the changes made after the cutover:
+the release note must say so.
 
 ## Gaps sent to the SDK owners
 
