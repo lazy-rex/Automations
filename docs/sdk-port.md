@@ -276,7 +276,7 @@ bridge; slice 3 follows as a plugin release.
 |---|---|---|
 | `scan` of `q/`, `t/`, `dv/`, `box/` (queue, prune, lost worker, read) | derived index records | 3a: runs queries on the columns (`ORDER BY q`, `ORDER BY t`, `status = 'delivered'`) |
 | `batch` ops on `q/`, `t/`, `dv/`, `box/`; `terminal_op`; the stale-entry prune | derived index checks | 3a: the run write sets the columns; the index ops go |
-| `get1`/`get`/`batch` on `run/` | the runs table, `if_rev` | 3a: run writes with `WHERE rev = ?` |
+| `get1`/`get`/`batch` on `run/` | the runs table, `if_rev` | 3b (moved from 3a): run writes with `WHERE rev = ?`, with the state writes |
 | `get1`/`batch` on `auto/`, `state/`, `preset/`, `meta/next_id` | key mapping, `if_rev` | 3b: direct SQL for automations, states, presets, next ID |
 | `scan`/`batch` on `seen/`, `rt/` | key mapping | 3c: direct SQL for the markers |
 | the op records of `batch`, `result_revs`, the `hub.store.op` lookup (line 313) | ops mapping | 3d: the replay reads and writes `ops` directly |
