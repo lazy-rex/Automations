@@ -212,6 +212,7 @@ return function(H)
     end
     error('the SQL database stays busy', 2)
   end
+  F.sql_write = sql_write
   local function increment(r)
     local i = #r
     while i > 0 and r:sub(i, i) == '9' do i = i - 1 end
