@@ -212,12 +212,11 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   expect(F.store('state/' .. id).value.next_t).to_be(160)
 end)
 
--- The reviewer's race (review of 451691c, R1): the prune chose sequence 1 from 101 entries, and a
--- retry makes sequence 101 active before the prune batch commits. Then 100 terminal runs are
--- left, so sequence 1 must stay. The injection commits the retry's records when the plugin
--- begins its next transaction, the prune batch that deletes entry 1; the retry writes
--- state/<id>, so the prune's state fence fails.
-test('a retry between the prune read and its batch keeps the oldest run', function()
+-- The reviewer's race (review of 451691c, R1): 101 terminal runs, and a retry makes sequence
+-- 101 active. Then 100 terminal runs are left, so sequence 1 must stay. The injection commits the
+-- retry's records when the plugin begins its next transaction: the prune reads its cutoff in
+-- that transaction, after the retry. (It does not show a writer inside the transaction.)
+test('a retry that commits before the prune transaction keeps the oldest run', function()
   local id = automation('race')
   local gate = hold(id, 'race')
   local function rk(n) return 'run/' .. id .. '/m/' .. string.format('%06d', 500 + n) end

@@ -714,7 +714,8 @@ end
 -- fence. It answers the new state revision, or nil when the state changed (a save or another
 -- step). A page is bounded by rows, not bytes: each write is its own hub.sql call (at most 64 KiB;
 -- a run is at most RUN_BUDGET), and the transaction must end within the hub's 10 s (hub
--- docs/sql.md, section 4). The backlog and large-record tests prove the bounds.
+-- docs/sql.md, section 4). The backlog and large-record tests prove the bounds. The cleanup
+-- steps below have the same row bounds.
 local function commit_page(id, st, st_rev, writes)
   local done = commit(function()
     for _, write in ipairs(writes) do write() end
@@ -843,68 +844,75 @@ end
 
 local CLEANUP_RUNS, CLEANUP_KEYS = 20, 50
 
+-- The cleanup and prune steps read and write in one transaction (D.atomic): no other commit
+-- comes between the read and the write.
+
 -- cancel_step cancels at most CLEANUP_RUNS queued runs of a deleted automation, one commit for
 -- each step. A starting or unknown_start run keeps its place in the queue: that run continues
 -- (design v2, 5f). It returns nil when no queued run is left.
-local function cancel_step(id, st, st_rev)
-  local writes = {}
-  for _, r in ipairs((queued_runs(id, nil, CLEANUP_RUNS + 1))) do
-    if r.value.status == 'queued' and #writes < CLEANUP_RUNS then
-      local run = r.value
-      run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
-      terminal(st, id, run)
-      writes[#writes + 1] = function() D.put_run(r.key, r.rev, run) end
+local function cancel_step(id)
+  local done = atomic(function()
+    local st, st_rev = D.state(id)
+    if not st or not st.deleted then D.abort('none') end
+    local n = 0
+    for _, r in ipairs((queued_runs(id, nil, CLEANUP_RUNS + 1))) do
+      if r.value.status == 'queued' and n < CLEANUP_RUNS then
+        local run = r.value
+        run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
+        terminal(st, id, run)
+        D.put_run(r.key, r.rev, run)
+        n = n + 1
+      end
     end
-  end
-  if #writes == 0 then return nil end
-  commit_page(id, st, st_rev, writes)
-  return true
+    if n == 0 then D.abort('none') end
+    D.put_state(id, st_rev, st)
+  end)
+  return done and true or nil
 end
 
--- purge_step deletes the rows of a deleted automation when no run is active, at most
--- CLEANUP_KEYS in each step: markers, retired rows, and the terminal runs. The last commit
--- deletes the state and the automation tombstone.
+-- purge_step deletes the rows of a deleted automation when no start is pending and no run is
+-- delivered, at most CLEANUP_KEYS in each step: markers, retired rows, and the terminal runs. The
+-- last commit deletes the state and the automation tombstone. It never deletes a preset row.
 local ACTIVE = {queued = true, starting = true, unknown_start = true, delivered = true}
-local function purge_step(id, st, st_rev)
-  local writes = {}
-  for _, r in ipairs((D.markers('seen/' .. id .. '/', nil, CLEANUP_KEYS))) do writes[#writes + 1] = function() D.delete_marker(r.key) end end
-  if #writes == 0 then
-    for _, r in ipairs((D.retired('rt/' .. id .. '/', nil, CLEANUP_KEYS))) do writes[#writes + 1] = function() D.delete_retired(r.key) end end
-  end
-  if #writes == 0 then
-    for _, r in ipairs((D.run_page('automation_id = ? ORDER BY run_key', {id}, CLEANUP_KEYS))) do
+local function purge_step(id)
+  local out = {}
+  atomic(function()
+    local st, st_rev = D.state(id)
+    if not st or not st.deleted or st.spawning or #delivered_runs(id, nil, 1) > 0 then D.abort('wait') end
+    local markers = D.markers('seen/' .. id .. '/', nil, CLEANUP_KEYS)
+    for _, r in ipairs(markers) do D.delete_marker(r.key) end
+    if #markers > 0 then out.more = true return end
+    local retired = D.retired('rt/' .. id .. '/', nil, CLEANUP_KEYS)
+    for _, r in ipairs(retired) do D.delete_retired(r.key) end
+    if #retired > 0 then out.more = true return end
+    local runs = D.run_page('automation_id = ? ORDER BY run_key', {id}, CLEANUP_KEYS)
+    for _, r in ipairs(runs) do
       if ACTIVE[r.value.status] then fail('internal', 'Run ' .. r.key .. ' is ' .. r.value.status .. ' after the cleanup') end
-      writes[#writes + 1] = function() D.delete_run(r.key) end
+      D.delete_run(r.key)
     end
-  end
-  if #writes > 0 then
-    commit_page(id, st, st_rev, writes)
-    return true
-  end
-  commit(function() D.delete_state(id, st_rev); D.delete_auto(id) end)
-  return false
+    if #runs > 0 then out.more = true return end
+    D.delete_state(id, st_rev)
+    D.delete_auto(id)
+  end)
+  return out.more == true
 end
 
--- prune_step keeps the newest KEEP_RUNS terminal runs. It reads the state first: every change of
--- the terminal set (a terminal change, a retry) writes it, and the prune commit writes it back
--- unchanged with the observed rev. So a change after the read makes the commit fail, and the
--- next step computes the cutoff again (review of 451691c, R1). Then it deletes at most PRUNE_PAGE
--- terminal runs after the newest KEEP_RUNS, in t order, each with its observed rev, so a run that
--- a retry made active stays: the commit writes nothing, and a later step reads again. The query
--- reads no document (a page of 100 documents can need more than one reply). Markers are never
--- touched (B2).
+-- prune_step keeps the newest KEEP_RUNS terminal runs: it deletes at most PRUNE_PAGE terminal
+-- runs after the newest KEEP_RUNS, in t order. The query reads no document (a page of 100
+-- documents can need more than one reply). Markers are never touched (B2).
 local KEEP_RUNS, PRUNE_PAGE = 100, 50
 local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
 local function prune_step(id)
-  local st, st_rev = D.state(id)
-  if not st then S.prune[id] = nil; return false end
-  local old = db.query("SELECT run_key, rev FROM runs WHERE automation_id = ? AND t IS NOT NULL "
-    .. "AND status IN ('done', 'failed', 'cancelled', 'dismissed') ORDER BY t LIMIT ? OFFSET ?", id, PRUNE_PAGE, KEEP_RUNS)
-  if #old == 0 then S.prune[id] = nil; return false end
-  local writes = {}
-  for _, row in ipairs(old) do writes[#writes + 1] = function() D.delete_run(row.run_key, row.rev) end end
-  commit_page(id, st, st_rev, writes)
-  return true
+  local out = {}
+  atomic(function()
+    local old = db.query("SELECT run_key, rev FROM runs WHERE automation_id = ? AND t IS NOT NULL "
+      .. "AND status IN ('done', 'failed', 'cancelled', 'dismissed') ORDER BY t LIMIT ? OFFSET ?", id, PRUNE_PAGE, KEEP_RUNS)
+    if #old == 0 then D.abort('none') end
+    for _, row in ipairs(old) do D.delete_run(row.run_key, row.rev) end
+    out.more = true
+  end)
+  if not out.more then S.prune[id] = nil end
+  return out.more == true
 end
 
 -- step does one unit of work for one automation and says whether more work may follow now.
@@ -920,7 +928,7 @@ local function step(id)
   -- After a delete: queued runs are cancelled first. A pending start still replays and delivers
   -- its run, and a delivered run stays until done or a worker loss. Then the rows go.
   if st.deleted then
-    local cancelled = cancel_step(id, st, st_rev)
+    local cancelled = cancel_step(id)
     if cancelled ~= nil then return cancelled end
   end
   if st.spawning then return spawn_step(id, st, st_rev) end
@@ -928,7 +936,7 @@ local function step(id)
   if lost ~= nil then return lost end
   if st.deleted then
     if #delivered_runs(id, nil, 1) > 0 then return S.dv_after[id] ~= nil end
-    return purge_step(id, st, st_rev)
+    return purge_step(id)
   end
   local first = queued_runs(id, nil, 1)[1]
   -- A delivered-run pass that is not at its end continues in the next step.

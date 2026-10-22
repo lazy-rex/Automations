@@ -414,3 +414,7 @@ New in slice 2:
    go. `run_now` takes its manual number in the same transaction. The engine steps keep their
    re-read on a conflict: they make other hub calls (spawn, watch read) between the read and the
    write.
+   Area 2: `cancel_step`, `purge_step` and `prune_step` read the state and their page in their
+   commit transaction, and check their conditions there (a deleted state; for the purge also no
+   pending start and no delivered run). The prune and purge pages no longer write the unchanged
+   state as a fence, so `meta.rev` advances less; revisions stay exact and monotonic.
