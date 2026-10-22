@@ -227,17 +227,18 @@ cd ../../Automations && lazyrex-hub test
 - pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
   turns: no automation delivers its whole backlog before another delivers its first run.
 - cutover_work.lua: a file that appears during the copy gives one run after it, and a pending
-  start replays its key once; the purge clears a run's terminal entry with a new revision in the
-  batch of the state fence, then deletes the run.
+  start replays its key once.
+- large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits whole, in
+  one transaction.
 - cutover.lua: the first start on an old store copies each record and saved reply exactly, with
   its rev, below the new revision counter, and the run columns equal the document; while the copy
   waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
   replays under the identity and under a legacy ID, and the next ID is new; while a delivery commit
   is held, the worker has no task and no notice, and after it one of each; a lost reply delivers
-  once; the revision counter
-  refuses at the int64 maximum and on a malformed value with no change; each unknown start state
-  refuses with no write, and a start on a done copy keeps the SQL changes; a crash during the copy
-  resumes from its cursor.
+  once; the revision counter refuses at the int64 maximum, above it and on a malformed value with
+  no change, and a commit whose later write finds the maximum rolls back its earlier writes; each
+  unknown start state refuses with no write, and a start on a done copy keeps the SQL changes; a
+  crash during the copy resumes from its cursor.
 - presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in

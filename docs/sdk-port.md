@@ -318,6 +318,12 @@ Progress:
   5. 3e (a separate commit) changes the byte bounds of a page of writes to row counts. The row
      counts must fit the hub transaction limits for valid maximum-size records: the large-record
      and backlog tests prove them, not the row count alone.
+- 3e: a commit is bounded by rows: a watch page (50 rows, at most 100 writes), 20 cancelled runs,
+  50 purged rows, 50 pruned runs. The hub limits are per statement (64 KiB for one request; a run
+  is at most 12 KiB) and per transaction (5 s idle, 10 s in total; hub docs/sql.md, section 4), so
+  the bound is the number of statements. Proof: tests/large_page.lua (one page of 50 runs of more
+  than 8000 bytes each, about 100 statements), the 120-file backlog (file.lua) and the large
+  documents of retention.lua. The 48 KiB request measure, `fits` and the byte accounting go.
 
 ### Rollback
 

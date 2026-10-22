@@ -41,9 +41,9 @@ end
 
 -- --- Sizes (design v2 section 3; amendment 1, detail 1) ---
 
--- A rex do script sends at most 64 KiB in one control message (rex-protocol.md). Every request
--- is measured complete, as JSON, before it leaves.
-local REQUEST_BUDGET = 48 * 1024
+-- A rex do script sends at most 64 KiB in one control message (rex-protocol.md). A run document
+-- (one SQL statement), a reply page and a view are measured complete, as JSON, against these
+-- budgets.
 local RUN_BUDGET = 12 * 1024
 local PAGE_BUDGET = 40 * 1024
 local MAX_NAME, MAX_TEXT, MAX_ERROR, MAX_SUMMARY = 60, 256, 512, 2000
@@ -703,33 +703,23 @@ local function file_run(id, auto, row, n)
   return run
 end
 
--- A page of writes that commits with the state fence: B.writes are functions that write in the
--- commit, and B.used is the encoded size of their values. The byte bound stays until 3e (SDK port
--- plan, "The bridge inventory", Progress).
-local PAGE_WRITES = REQUEST_BUDGET - 2048
-local function page_of_writes(st, st_rev) return {writes = {}, used = 1024 + size(st), st = st, rev = st_rev, n = 0} end
-local function fits(B, n, write)
-  if B.used + n > PAGE_WRITES then return false end
-  B.writes[#B.writes + 1] = write
-  B.used = B.used + n
-  B.n = B.n + 1
-  return true
-end
--- commit_page commits the writes and the state; it answers the new state revision, or nil when
--- the state changed (a save or another step).
-local function commit_page(id, B)
+-- commit_page commits a page of writes (functions that write in the commit) with the state
+-- fence. It answers the new state revision, or nil when the state changed (a save or another
+-- step). A page is bounded by rows, not bytes: each write is its own hub.sql call (at most 64 KiB;
+-- a run is at most RUN_BUDGET), and the transaction must end within the hub's 10 s (hub
+-- docs/sql.md, section 4). The backlog and large-record tests prove the bounds.
+local function commit_page(id, st, st_rev, writes)
   local done = commit(function()
-    for _, write in ipairs(B.writes) do write() end
-    return D.put_state(id, B.rev, B.st)
+    for _, write in ipairs(writes) do write() end
+    return D.put_state(id, st_rev, st)
   end)
-  B.writes, B.used, B.n = {}, 1024 + size(B.st), 0
   return done and done.reply
 end
 
--- drain_step reads one page of the automation's desired watch. A created row without a marker
--- gets its run and marker (both new rows). A removed or created_removed row of a marked
--- appearance gets its retired row. The ack (through = next) follows only when every write
--- committed.
+-- drain_step reads one page of the automation's desired watch (at most WATCH_PAGE rows) and
+-- commits it in one transaction. A created row without a marker gets its run and marker (both new
+-- rows). A removed or created_removed row of a marked appearance gets its retired row. The ack
+-- (through = next) follows only when the page committed.
 local function drain_step(id)
   local asked = S.drain[id]
   local auto = D.auto(id)
@@ -751,47 +741,26 @@ local function drain_step(id)
   end
   if w.state ~= page.state then ui_changed() end
   w.state = page.state
-  local rows = page.rows or {}
-  local marked = {}
-  for _, row in ipairs(rows) do
+  local writes, marked = {}, {}
+  for _, row in ipairs(page.rows or {}) do
     if type(row.appearance_key) ~= 'string' or appearance_watch(row.appearance_key) ~= w.watch_id then
       fail('internal', 'A watch row has no valid appearance_key')
     end
     local mk = marker_key(id, row.appearance_key)
-    marked[mk] = D.marker(mk) ~= nil
-  end
-  local B = page_of_writes(st, st_rev)
-  local next_q = st.next_q or 0
-  for _, row in ipairs(rows) do
-    local mk = marker_key(id, row.appearance_key)
+    if marked[mk] == nil then marked[mk] = D.marker(mk) ~= nil end
     if row.kind == 'created' and not marked[mk] then
       local run_key = run_prefix(id) .. 'f/' .. row.appearance_key
-      local run = file_run(id, auto, row, next_q + 1)
+      local run = file_run(id, auto, row, (st.next_q or 0) + 1)
+      if run.q then st.next_q = (st.next_q or 0) + 1 end
       if run.status == 'failed' then terminal(st, id, run) end
-      local n = size(run) + #mk + 64
-      -- A full page commits first, with the earlier next_q.
-      if B.used + n > PAGE_WRITES then
-        st.next_q = next_q
-        B.rev = commit_page(id, B)
-        if not B.rev then return true end
-      end
-      fits(B, n, function() D.put_run(run_key, '0', run); D.put_marker(mk, '0', {run = run_key}) end)
-      if run.q then next_q = next_q + 1 end
+      writes[#writes + 1] = function() D.put_run(run_key, '0', run); D.put_marker(mk, '0', {run = run_key}) end
       marked[mk] = true
     elseif (row.kind == 'removed' or row.kind == 'created_removed') and marked[mk] then
       local rk, seq = retire_key(id, row.appearance_key), row.seq
-      if B.used + #rk + 64 > PAGE_WRITES then
-        st.next_q = next_q
-        B.rev = commit_page(id, B)
-        if not B.rev then return true end
-      end
-      fits(B, #rk + 64, function() D.put_retired(rk, {seq = seq}) end)
+      writes[#writes + 1] = function() D.put_retired(rk, {seq = seq}) end
     end
   end
-  if B.n > 0 then
-    st.next_q = next_q
-    if not commit_page(id, B) then return true end
-  end
+  if #writes > 0 and not commit_page(id, st, st_rev, writes) then return true end
   if type(page.next) == 'string' and page.next ~= '' then
     -- The page's runs and markers committed, so a failed ack loses nothing: the rows come again,
     -- and the markers stop a second run. The drain stops here, so the engine can deliver; the
@@ -867,48 +836,42 @@ end
 
 local CLEANUP_RUNS, CLEANUP_KEYS = 20, 50
 
--- cancel_step cancels the queued runs of a deleted automation, one commit for each step. A
--- starting or unknown_start run keeps its place in the queue: that run continues (design v2,
--- 5f). It returns nil when no queued run is left.
+-- cancel_step cancels at most CLEANUP_RUNS queued runs of a deleted automation, one commit for
+-- each step. A starting or unknown_start run keeps its place in the queue: that run continues
+-- (design v2, 5f). It returns nil when no queued run is left.
 local function cancel_step(id, st, st_rev)
-  local page = queued_runs(id, nil, CLEANUP_RUNS + 1)
-  local B = page_of_writes(st, st_rev)
-  for _, r in ipairs(page) do
-    if r.value.status == 'queued' then
+  local writes = {}
+  for _, r in ipairs((queued_runs(id, nil, CLEANUP_RUNS + 1))) do
+    if r.value.status == 'queued' and #writes < CLEANUP_RUNS then
       local run = r.value
       run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
-      if B.n >= CLEANUP_RUNS then break end
-      -- A run that does not fit keeps its sequence unused: a gap, never a reuse.
       terminal(st, id, run)
-      if not fits(B, size(run) + 64, function() D.put_run(r.key, r.rev, run) end) then break end
+      writes[#writes + 1] = function() D.put_run(r.key, r.rev, run) end
     end
   end
-  if B.n == 0 then return nil end
-  commit_page(id, B)
+  if #writes == 0 then return nil end
+  commit_page(id, st, st_rev, writes)
   return true
 end
 
--- purge_step deletes the rows of a deleted automation when no run is active: markers, retired
--- rows, and the terminal runs. The last commit deletes the state and the automation tombstone.
+-- purge_step deletes the rows of a deleted automation when no run is active, at most
+-- CLEANUP_KEYS in each step: markers, retired rows, and the terminal runs. The last commit
+-- deletes the state and the automation tombstone.
 local ACTIVE = {queued = true, starting = true, unknown_start = true, delivered = true}
 local function purge_step(id, st, st_rev)
-  local keys = {}
-  for _, r in ipairs((D.markers('seen/' .. id .. '/', nil, CLEANUP_KEYS))) do keys[#keys + 1] = {D.delete_marker, r.key} end
-  if #keys == 0 then
-    for _, r in ipairs((D.retired('rt/' .. id .. '/', nil, CLEANUP_KEYS))) do keys[#keys + 1] = {D.delete_retired, r.key} end
+  local writes = {}
+  for _, r in ipairs((D.markers('seen/' .. id .. '/', nil, CLEANUP_KEYS))) do writes[#writes + 1] = function() D.delete_marker(r.key) end end
+  if #writes == 0 then
+    for _, r in ipairs((D.retired('rt/' .. id .. '/', nil, CLEANUP_KEYS))) do writes[#writes + 1] = function() D.delete_retired(r.key) end end
   end
-  if #keys == 0 then
+  if #writes == 0 then
     for _, r in ipairs((D.run_page('automation_id = ? ORDER BY run_key', {id}, CLEANUP_KEYS))) do
       if ACTIVE[r.value.status] then fail('internal', 'Run ' .. r.key .. ' is ' .. r.value.status .. ' after the cleanup') end
-      keys[#keys + 1] = {D.delete_run, r.key}
+      writes[#writes + 1] = function() D.delete_run(r.key) end
     end
   end
-  if #keys > 0 then
-    local B = page_of_writes(st, st_rev)
-    for _, k in ipairs(keys) do
-      if not fits(B, #k[2] + 64, function() k[1](k[2]) end) then break end
-    end
-    commit_page(id, B)
+  if #writes > 0 then
+    commit_page(id, st, st_rev, writes)
     return true
   end
   commit(function() D.delete_state(id, st_rev); D.delete_auto(id) end)
@@ -918,10 +881,11 @@ end
 -- prune_step keeps the newest KEEP_RUNS terminal runs. It reads the state first: every change of
 -- the terminal set (a terminal change, a retry) writes it, and the prune commit writes it back
 -- unchanged with the observed rev. So a change after the read makes the commit fail, and the
--- next step computes the cutoff again (review of 451691c, R1). Then it deletes the terminal runs
--- after the newest KEEP_RUNS, in t order, each with its observed rev, so a run that a retry made
--- active stays: the commit writes nothing, and a later step reads again. The query reads no
--- document (a page of 100 documents can need more than one reply). Markers are never touched (B2).
+-- next step computes the cutoff again (review of 451691c, R1). Then it deletes at most PRUNE_PAGE
+-- terminal runs after the newest KEEP_RUNS, in t order, each with its observed rev, so a run that
+-- a retry made active stays: the commit writes nothing, and a later step reads again. The query
+-- reads no document (a page of 100 documents can need more than one reply). Markers are never
+-- touched (B2).
 local KEEP_RUNS, PRUNE_PAGE = 100, 50
 local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
 local function prune_step(id)
@@ -930,11 +894,9 @@ local function prune_step(id)
   local old = db.query("SELECT run_key, rev FROM runs WHERE automation_id = ? AND t IS NOT NULL "
     .. "AND status IN ('done', 'failed', 'cancelled', 'dismissed') ORDER BY t LIMIT ? OFFSET ?", id, PRUNE_PAGE, KEEP_RUNS)
   if #old == 0 then S.prune[id] = nil; return false end
-  local B = page_of_writes(st, st_rev)
-  for _, row in ipairs(old) do
-    if not fits(B, #row.run_key + 64, function() D.delete_run(row.run_key, row.rev) end) then break end
-  end
-  commit_page(id, B)
+  local writes = {}
+  for _, row in ipairs(old) do writes[#writes + 1] = function() D.delete_run(row.run_key, row.rev) end end
+  commit_page(id, st, st_rev, writes)
   return true
 end
 
