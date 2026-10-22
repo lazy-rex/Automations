@@ -228,8 +228,8 @@ cd ../../Automations && lazyrex-hub test
   turns: no automation delivers its whole backlog before another delivers its first run.
 - cutover_work.lua: a file that appears during the copy gives one run after it, and a pending
   start replays its key once.
-- large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits whole, in
-  one transaction.
+- large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits in one
+  transaction, within the hub's transaction time; a failed page commit leaves no run and no marker.
 - cutover.lua: the first start on an old store copies each record and saved reply exactly, with
   its rev, below the new revision counter, and the run columns equal the document; while the copy
   waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
