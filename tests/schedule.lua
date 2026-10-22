@@ -1,4 +1,4 @@
--- The daily schedule (design v2 section 7; amendment 1, B4). daily_high is the newest date that
+-- The daily schedule. daily_high is the newest date that
 -- got a daily run; daily_base moves only on create, enable, a change to daily and a time change.
 -- A date runs only when it is newer than both. The lab time zone is PST8PDT (manifest test.env).
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)

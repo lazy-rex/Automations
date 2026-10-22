@@ -1,4 +1,4 @@
--- The action cwd and the worker spec (commit 6a plan, amendment 1). A run snapshots its action;
+-- The action cwd and the worker spec. A run snapshots its action;
 -- its start passes cwd to hub.spawn. One current worker for each automation (the coordinator's
 -- rule, 2026-10-20): a new run goes to it only when its spec (profile, args, cwd) is the same.
 -- An older worker finishes the tasks that it has and gets no new ones.
@@ -143,7 +143,7 @@ test('A, then B, then A again starts a third worker', function()
   expect(F.run(manual(id, 2)).agent).to_be(two.agent)
 end)
 
--- The reviewer's case for the paged scan: 20 tasks of a live W1 fill the first dv page, and the
+-- The lost-worker scan reads pages: 20 tasks of a live W1 fill the first dv page, and the
 -- task of a stopped W2 is on the second page. It must move. Then a hub crash while both workers
 -- hold tasks changes nothing.
 test('a lost task after 20 live tasks moves, and a crash keeps every holder', function()

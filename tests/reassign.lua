@@ -1,4 +1,4 @@
--- A lost worker (design v2, 5e): its delivered runs go back to the queue and to the next worker
+-- A lost worker: its delivered runs go back to the queue and to the next worker
 -- with attempt + 1. The old box entry goes, the old notice row follows its box, and a done of the
 -- old attempt is refused.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -60,7 +60,7 @@ test('an alias reads its task; a superseded identity loses it, and its late done
   expect(#tasks).to_be(1)
   expect(tasks[1].run_key).to_be(first.run_key)
   -- A second conversation in the same pane: the spawn ID's alias stays with the first one, which
-  -- is no longer current. The worker does not run by rule 5c, so the task moves.
+  -- is no longer current. The worker does not count as running, so the task moves.
   pane:report('claude', 'automations-reassign-2')
   local two = delivered_again(first.run_key, 2)
   expect(two.agent).not_to_be(one.agent)

@@ -1,4 +1,4 @@
--- The autonomous delivery path (design v2, section 5): a daily tick in the plugin, with no agent
+-- The autonomous delivery path: a daily tick in the plugin, with no agent
 -- call in flight, starts one worker from the automation's profile (hub.spawn for the user),
 -- stores one task in the worker's box, and sets the notice intent. The worker reads and completes
 -- the task through the agent face.

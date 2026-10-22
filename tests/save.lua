@@ -27,7 +27,7 @@ test('a title of 60 characters is accepted and its worker starts', function()
   end
 end)
 
--- The reviewer's case for 3b2cba7 (R2): save refuses it and stores nothing.
+-- A title over the limit: save refuses it and stores nothing.
 test('a title of 61 characters is refused before anything is stored', function()
   local before, next_id = count(), select(2, F.next_id())
   expect_error(function() save('title-61', string.rep('t', 61)) end, 'invalid_input')

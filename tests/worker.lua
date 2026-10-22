@@ -1,4 +1,4 @@
--- Whether the worker runs (design v2, 5c). Only a definite observation counts: a lookup that
+-- Whether the worker runs. Only a definite observation counts: a lookup that
 -- fails for another reason keeps the worker, and the step tries again later. A wrong "absent"
 -- would start a second worker.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -6,7 +6,6 @@ F.profiles()
 F.set_clock(F.at(2026, 11, 3, 10, 0))
 local alice = agent('alice')
 
--- The reviewer's case for 3b2cba7 (R1).
 test('an unavailable identity lookup does not replace a running worker', function()
   local saved = alice:call('automations.save', {key = 'lookup-save', name = 'Lookup',
     trigger = {kind = 'daily', at = '09:00'}, action = {profile = 'worker'}, instruction = 'Lookup task.'})

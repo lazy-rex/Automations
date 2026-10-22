@@ -1,4 +1,4 @@
--- The panel and the automation view (commit 6b plan, amendments 1 and 2), through the hub's real
+-- The panel and the automation view, through the hub's real
 -- view path: admission, durable operations and effects. Each view action calls the same handler
 -- as its agent tool; the agent path of each tool has its own tests (lifecycle.lua, action.lua).
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)

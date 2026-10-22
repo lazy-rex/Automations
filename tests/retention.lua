@@ -1,4 +1,4 @@
--- Run retention (design v2 section 10; retention amendment 1): the newest 100 terminal runs of an
+-- Run retention: the newest 100 terminal runs of an
 -- automation stay. The order is the terminal sequence in state/<id> (next_t), never the clock.
 -- Active runs and markers are never pruned.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -72,7 +72,7 @@ test('the newest 100 terminal runs stay; an older active run stays; a retry take
   fault_release(gate)
 end)
 
--- Run documents near the run budget (review of f71fc6e). An instruction of 4000 backslashes is
+-- Run documents near the run budget. An instruction of 4000 backslashes is
 -- 8000 bytes encoded, and twice that inside a hub.sql reply, which holds about 1 MB: the full
 -- documents of 101 runs need two replies. The prune's t/ scan must still see 100 entries, so the
 -- oldest go and exactly the newest 100 stay.
@@ -124,7 +124,7 @@ test('done takes a terminal sequence, and its replay gives the same result', fun
   expect(F.state(id).next_t).to_be(1)
 end)
 
--- The reviewer's case for B2, the prune half: the file changes before the ack, its run is pruned,
+-- The prune case of a file change before the ack: the file changes before the ack, its run is pruned,
 -- and the created row comes again. The marker stays, so no second run comes.
 test('a file run pruned before its ack makes no second run: the marker stays', function()
   local dir = F.dir('pruned')
@@ -156,10 +156,10 @@ test('a file run pruned before its ack makes no second run: the marker stays', f
   fault_release(gate)
 end)
 
--- The reviewer's crash point: the backlog comes from the harness write (complete run records with
--- their entries), so 60 excess entries exist before the prune starts. Newest first, the excess
--- pages are 60 down to 11 (batch 1), then 10 down to 1 (batch 2). The injection fails exactly the
--- batch that deletes entry 10. The hub keeps injections in memory, so the restart ends it.
+-- A crash point of the prune: the test writes the backlog as complete run rows (F.write), so
+-- 60 excess entries exist before the prune starts. Newest first, the excess pages are 60 down
+-- to 11 (batch 1), then 10 down to 1 (batch 2). The injection fails exactly the batch that
+-- deletes entry 10. The hub keeps injections in memory, so the restart ends it.
 test('a crash between prune batches leaves exactly the newest 100', function()
   local id = automation('crash')
   local function rk(n) return 'run/' .. id .. '/m/' .. string.format('%06d', 500 + n) end
@@ -211,7 +211,7 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   expect(F.state(id).next_t).to_be(160)
 end)
 
--- The reviewer's race (review of 451691c, R1): 101 terminal runs, and a retry makes sequence
+-- A retry races the prune: 101 terminal runs, and a retry makes sequence
 -- 101 active. Then 100 terminal runs are left, so sequence 1 must stay. The injection commits the
 -- retry's records when the plugin begins its next transaction: the prune reads its cutoff in
 -- that transaction, after the retry. (It does not show a writer inside the transaction.)

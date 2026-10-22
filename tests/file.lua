@@ -1,4 +1,4 @@
--- File triggers (design v2 sections 4 and 6; amendment 1, B2). One run for each appearance of a
+-- File triggers. One run for each appearance of a
 -- matching file. The marker seen/<id>/<appearance_key> is the dedup proof. It retires only after
 -- an acknowledged removed or created_removed row.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -13,7 +13,7 @@ local function automation(key, dir, action, instruction)
   return id
 end
 
--- A new automation has gen 1, so its watch key is a-<id>-1 (B1).
+-- A new automation has gen 1, so its watch key is a-<id>-1.
 local function wkey(id) return 'a-' .. id .. '-1' end
 local function appearance(run) return run.run_key:match('/f/(.+)$') end
 local function marker(id, run) return F.seen('seen/' .. id .. '/' .. appearance(run)) end
@@ -76,7 +76,7 @@ test('a refused ack does not hold the delivery of the run', function()
   expect(#F.runs(alice, id, 'f')).to_be(1)
 end)
 
--- The reviewer's case for B2: the file changes after its run and before the ack. The next read
+-- The file changes after its run and before the ack. The next read
 -- returns created again, with the same appearance_key. The marker stops a second run.
 test('a file that changes before the ack gives no second run', function()
   local dir = F.dir('changed')
@@ -134,7 +134,7 @@ test('a removed file retires its marker after a lost ack reply and a crash', fun
   expect(both[1].run_key).not_to_be(both[2].run_key)
 end)
 
--- A run over the 12 KiB budget (amendment 1, detail 1): an 8 KiB encoded instruction, a long
+-- A run over the 12 KiB budget: an 8 KiB encoded instruction, a long
 -- directory and a file name of control characters (6 bytes encoded each). The run fails with
 -- "path too long" and keeps no path. Its marker still stops a second run.
 test('a file whose run passes the budget gives one failed run without the path', function()

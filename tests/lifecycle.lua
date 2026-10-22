@@ -1,4 +1,4 @@
--- Lifecycle (design v2, 5f, 5g and section 9; amendment 1, B3): delete, set_enabled, retry,
+-- Lifecycle: delete, set_enabled, retry,
 -- cancel_run and dismiss_start. Delete is a fence, then a cleanup in bounded commits. The
 -- decision "Automation delete also deletes its run history" (2026-10-20): the runs go after the
 -- active work ends.
@@ -23,7 +23,7 @@ local function gone(id)
   end, 30)
 end
 
--- The reviewer's crash boundary for B3. A cleanup commit cancels at most 20 queued runs
+-- A crash between delete cleanup commits. A cleanup commit cancels at most 20 queued runs
 -- (CLEANUP_RUNS), so 41 queued runs need three commits. A dropped spawn holds the first run in
 -- starting, so the others stay queued. A gate on the third SQL commit (1: the fence, 2: the first
 -- cleanup commit) stops the cleanup between commits; the hub crashes there. The hub keeps faults
@@ -91,7 +91,7 @@ test('a crash between delete cleanup batches cancels every queued run once and d
 end)
 
 -- Delete while a start waits: the stored request still replays after the delete, and its open
--- delivers exactly that run (design v2, 5f). A gate on hub.spawn holds the request.
+-- delivers exactly that run. A gate on hub.spawn holds the request.
 test('a delete during a pending start: the start delivers its run, and queued runs are cancelled', function()
   local id = automation('pending')
   local first = manual(id, 1)
@@ -117,7 +117,7 @@ test('a delete during a pending start: the start delivers its run, and queued ru
   expect(#F.workers('worker')).to_be(before + 1)
 end)
 
--- Worker loss after delete (B3): the delivered runs are cancelled, not requeued, and no worker
+-- Worker loss after delete: the delivered runs are cancelled, not requeued, and no worker
 -- starts.
 test('a worker loss after delete cancels the delivered runs and starts no worker', function()
   local id = automation('loss')
@@ -184,7 +184,7 @@ test('a deleted automation is not listed, and every change to it is refused', fu
   gone(id)
 end)
 
--- retry (B7): a start failure retries with a new spawn key; an agent failure retries with
+-- retry: a start failure retries with a new spawn key; an agent failure retries with
 -- attempt + 1.
 test('retry queues a failed run again: a new spawn key after a start failure, attempt 2 after an agent failure', function()
   local id = automation('retry')
@@ -215,7 +215,7 @@ test('retry queues a failed run again: a new spawn key after a start failure, at
   expect_error(function() alice:call('automations.retry', {run_key = manual(id, 9), key = 'retry-a'}) end, 'conflict')
 end)
 
--- Disable stops new admission only (design v2, 5f): a run already queued continues. A disabled
+-- Disable stops new admission only: a run already queued continues. A disabled
 -- automation refuses run and retry.
 test('disable keeps admitted runs going and refuses new runs and retries', function()
   local id = automation('off')
@@ -260,7 +260,7 @@ test('cancel of a queued run behind a start; the next run still goes; a delivere
   expect_error(function() alice:call('automations.cancel_run', {run_key = third, key = 'cancel-delivered'}) end, 'not_cancellable')
 end)
 
--- unknown_start (design v2, 5d.6) and dismiss_start (5g). The dismissed run keeps its spawn key
+-- unknown_start and dismiss_start. The dismissed run keeps its spawn key
 -- and loses its queue entry, and the next queued run starts a new worker with its own key.
 test('a start without an outcome for 10 minutes is unknown_start; dismiss lets the next run start', function()
   local id = automation('dismiss')

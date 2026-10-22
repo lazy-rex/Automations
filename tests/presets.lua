@@ -1,4 +1,4 @@
--- Presets (commit 6b plan, amendments 1 and 2; the coordinator's accepted texts). A preset installs
+-- Presets. A preset installs
 -- once: preset/<name> = {id} commits with if_rev '0' in the save batch. The delete fence deletes
 -- it only when it names that automation, so a reinstall during an old cleanup stays.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)

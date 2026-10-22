@@ -1,4 +1,4 @@
--- automations.runs pages (commit 6b plan, amendment 2). The phases come in this order: S (the
+-- automations.runs pages. The phases come in this order: S (the
 -- starting run), D (delivered), Q (queued) and T (ended, the newest end first). The cursor is the
 -- last consumed index entry, and a page reads at most 50 entries, so a page can be empty and still
 -- have next.

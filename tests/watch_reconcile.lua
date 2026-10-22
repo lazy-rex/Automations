@@ -1,4 +1,4 @@
--- Watch reconcile (design v2 section 6; amendment 1, B1). Each trigger generation has its own
+-- Watch reconcile. Each trigger generation has its own
 -- watch key a-<id>-<gen>. The reconcile removes every watch that is not desired, by its exact
 -- watch_id, then ensures the desired ones. It keeps no watch_id across runs, so a crash or a lost
 -- reply at any point repeats it from hub.watch.list.

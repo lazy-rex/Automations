@@ -1,4 +1,4 @@
--- automations.list pages (review of 59bf455, R1). The cursor moves over every record that a page
+-- automations.list pages. The cursor moves over every record that a page
 -- reads, also a deleted one (a tombstone stays while a run is active). A page can be empty and
 -- still have next. The byte limit never skips a visible record.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)

@@ -1,4 +1,4 @@
--- The Automations panel and forms (commit 6b plan, amendments 1 and 2). The main file loads this
+-- The Automations panel and forms. The main file loads this
 -- file with dofile and an absolute path, and passes the functions that the views use. No RPC runs
 -- at load time. A user action calls the same export handler as the agent tool, with the user as
 -- the caller and the view operation key as the key.

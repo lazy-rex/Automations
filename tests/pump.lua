@@ -1,4 +1,4 @@
--- Pump fairness (review of d66cdc5, panel.lua timeouts). The engine takes one step at a time, and
+-- Pump fairness. The engine takes one step at a time, and
 -- each delivery is one step. Automations with work wait in a FIFO order, so one backlog cannot
 -- hold back another automation until it is empty.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)

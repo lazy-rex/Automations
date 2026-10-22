@@ -1,4 +1,4 @@
--- The row bound of one watch page (SDK port plan, slice 3e): one page commits in one transaction.
+-- The row bound of one watch page: one page commits in one transaction.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
 F.profiles()
 F.set_clock(F.at(2026, 11, 3, 10, 0))
@@ -8,8 +8,8 @@ local alice = agent('alice')
 -- is near the largest size (an instruction of 8 KiB encoded): the page is 100 writes and about
 -- 450 KB. Page commits fail until the test cancels the failure: no run and no marker stay. The
 -- next commit must hold the whole page: the record of hub calls after the failure shows one
--- transaction with all 50 run inserts, committed once (the byte bound of d0bb6a1 split this page
--- into 10). The spawn gate holds the start, so no worker starts.
+-- transaction with all 50 run inserts, committed once.
+-- The spawn gate holds the start, so no worker starts.
 test('one watch page of 50 large file runs commits in one transaction; a failed commit leaves none', function()
   local dir = F.dir('large-page')
   local id = alice:call('automations.save', {key = 'large-page', name = 'Large page', trigger = {kind = 'file', path = dir, glob = '*.md'},

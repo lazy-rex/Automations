@@ -1,4 +1,4 @@
--- The automation forms (commit 6b plan, amendments 1 and 2): step 1 chooses the agent profile,
+-- The automation forms: step 1 chooses the agent profile,
 -- step 2 has the fields and that profile's args. Every form is measured complete against the
 -- 40 KB page budget: a picker page ends early, and a form that cannot fit is a refusal.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -92,7 +92,7 @@ test('120 agent profiles: the picker has pages of at most 50 and reaches the las
   F.profiles()
 end)
 
--- The reviewer's case: a profile whose args alone pass the budget gets a refusal, not a cut form.
+-- A profile whose args alone pass the budget gets a refusal, not a cut form.
 test('a profile with 400 args gets a refusal widget in step 2, under the budget', function()
   local profiles = F.profile_list()
   -- The hub requires each arg in the command.

@@ -1,4 +1,4 @@
--- A start that the hub never sent (hub Fix A, hub main 8aa9426): hub.spawn answers status failed
+-- A start that the hub never sent (hub 8aa9426 or later): hub.spawn answers status failed
 -- with an error that starts with not_created. Nothing was created, so the plugin starts it again
 -- once with a new key (the coordinator's decision: one automatic retry per start admission). A
 -- second failure fails the run. Needs the spawn-create fault mode fail-sending (hub 89cab8f or
@@ -27,7 +27,7 @@ local function run_now(id, key)
   return run_key
 end
 -- wait_for waits for a run status. Each poll sees a status other than unknown_start. A poll does
--- not see every state, so the source review covers the rest: a failed result never takes the
+-- not see every state, so the plugin source covers the rest: a failed result never takes the
 -- pending branch.
 local function wait_for(run_key, status)
   return wait('run ' .. run_key .. ' to be ' .. status, function()
@@ -203,7 +203,7 @@ test('a delete while start 1 waits: not_created gives no second start, and the c
   expect(#F.workers('worker')).to_be(before + 1)
 end)
 
--- The reviewer's case for a79e7f2: a start whose hub row is still prepared reads pending, so it can
+-- A start whose hub row is still prepared reads pending, so it can
 -- become unknown_start, and a durable not_created failure can end it later. The lab cannot hold a
 -- prepared row (that needs a hub store failure), so this test writes the old state as a fixture:
 -- while a gate refuses /1, the run record gets status unknown_start. Then /1 fails as not_created.

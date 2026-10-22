@@ -1,4 +1,4 @@
--- The storage of Automations (SDK port plan, slice 3): typed reads and writes of the domain
+-- The storage of Automations: typed reads and writes of the domain
 -- tables, the revision counter, and commit(fn, op), the transaction of one engine step or one
 -- operation. Load it with dofile(...)(A): A.app (the SDK app), A.fail.
 --

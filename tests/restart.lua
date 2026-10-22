@@ -1,4 +1,4 @@
--- Restart coverage (restart plan, review of adf74bf). These are blocked-commit recovery tests,
+-- Restart coverage. These are blocked-commit recovery tests,
 -- not outage tests: the old hub runs, but an injection fails every SQL commit that writes the
 -- due run (a commit that writes the runs table with that run key as a parameter), so the slot
 -- stays pending. Then the hub crashes; the injections live in hub memory,
@@ -104,7 +104,7 @@ test('a crash after a delete and a preset reinstall: the old cleanup ends, the n
   expect(F.item(tree, 'automations', b)).to_be_truthy()
 end)
 
--- Run now through the view, cut by a crash (amendment (b)). F1 lets the run batch commit and
+-- Run now through the view, cut by a crash. F1 lets the run batch commit and
 -- loses its reply, so the plugin answers unavailable (an unknown outcome) and the hub keeps the
 -- operation pending. F2 refuses every later replay check of the operation record, so the hub's
 -- retries stay unknown until the crash. On SQL each check is a query with the op key as a

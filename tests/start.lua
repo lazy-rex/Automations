@@ -1,4 +1,4 @@
--- Start outcomes (design v2, 5d). Only a definite failure ends a start: then the run fails and
+-- Start outcomes. Only a definite failure ends a start: then the run fails and
 -- the pending request is forgotten. Every unknown outcome keeps the stored request, and the
 -- plugin replays it with the same key, so it never starts a second worker.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -11,7 +11,7 @@ local function automation(key)
     action = {profile = 'worker'}, instruction = 'Start task.'}).id
 end
 
--- The reviewer's case for 997b1eb (R3). Rex reports client_unavailable when a connection drops
+-- Rex reports client_unavailable when a connection drops
 -- while a request waits (LazyRex docs/rex-protocol.md, "Client RPC"): the spawn may have run.
 -- The fault injects that error reply after the handler ran; it does not drop a connection.
 test('client_unavailable from hub.spawn is an unknown outcome: the same key is replayed', function()
@@ -49,7 +49,7 @@ test('a refused start fails its run, and the next run starts with a new key', fu
   expect(F.running('worker')).to_be(before + 1)
 end)
 
--- New start admission checks the profile again (design v2, 5d): a saved profile can change or
+-- New start admission checks the profile again: a saved profile can change or
 -- disappear. Here it becomes an accessory profile between save and the first run. The run fails
 -- without a hub.spawn call, and its queue entry goes, so the next run is not blocked.
 test('a profile that is no longer an agent profile fails the run before a start', function()

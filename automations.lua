@@ -2,7 +2,6 @@
 -- to the automation's worker if it runs; else the plugin starts a worker from the automation's
 -- profile (hub.spawn for the user), then delivers. Delivery is a task box entry plus a hub notice;
 -- the worker reads its tasks (automations.read) and completes them (automations.done).
--- The design is "Automations design v2" with amendment 1 (team thread, 2026-10-20).
 --
 -- Lua rules (LazyRex docs/rex-protocol.md, "Rex Lua runtime"): callback state lives in table
 -- fields (a closure write to a captured local can be lost after a caught error); the main chunk
@@ -11,7 +10,7 @@
 --
 -- The LazyRex Plugin SDK (hub sdk/lua) does the registration and the dispatch. The hub starts the
 -- plugin through the SDK launcher (manifest "sdk": "0"), which puts the SDK in package.path. The
--- store engine, its replay and the hub calls below stay the plugin's own (SDK port plan, slice 1).
+-- engine, its replay by key and the hub calls below are the plugin's own.
 local app = require('lazyrex').plugin('automations')
 local hub_id = app.hub_id
 
@@ -21,7 +20,7 @@ local function fail(code, message) error({code = code, message = message}, 0) en
 -- 0.0.1792158932-g88fd41, lab; see Profiles). An error whose outcome is not known becomes
 -- unavailable: no code (a lost call), disconnected, timeout, and client_unavailable (Rex fails a
 -- waiting request with it when a connection drops; LazyRex docs/rex-protocol.md, "Client RPC").
--- The action may have run, so a caller keeps its intent and replays it (review of 997b1eb, R3).
+-- The action may have run, so a caller keeps its intent and replays it.
 local unknown_outcome = {unavailable = true, disconnected = true, timeout = true, client_unavailable = true}
 local function hub(action, args)
   local response, call_error = rex.call('client.perform', {client_id = hub_id, action = action, args = args or {}, timeout_ms = 10000})
@@ -39,7 +38,7 @@ local function hub(action, args)
   return response.result
 end
 
--- --- Sizes (design v2 section 3; amendment 1, detail 1) ---
+-- --- Sizes ---
 
 -- A rex do script sends at most 64 KiB in one control message (rex-protocol.md). A run document
 -- (one SQL statement), a reply page and a view are measured complete, as JSON, against these
@@ -105,7 +104,7 @@ end
 
 local function part(value) return tostring(#value) .. ':' .. value end
 
--- --- Clock and daily slots (design v2 section 7; amendment 1, B4) ---
+-- --- Clock and daily slots ---
 
 -- The test manifest can set clock_file (epoch seconds) and tick. Without them: the real clock
 -- and a 60 s tick.
@@ -264,7 +263,7 @@ local function check_action(a)
   if a.title ~= nil and a.title ~= '' then
     out.title = text_arg(a.title, 'action.title', MAX_TEXT)
     -- hub.spawn allows at most 60 characters (Unicode characters; hub workers.go at 06b22ca).
-    -- Save checks it, so the first start cannot fail on it (review of 3b2cba7, R2).
+    -- Save checks it, so the first start cannot fail on it.
     local _, chars = out.title:gsub('[^\128-\191]', '')
     if chars > MAX_TITLE_CHARS then fail('invalid_input', 'action.title is at most ' .. MAX_TITLE_CHARS .. ' characters') end
   end
@@ -318,12 +317,12 @@ local function replay(kind, caller, key, fingerprint)
   return nil
 end
 
--- --- Records (design v2 section 2; amendment 1) ---
+-- --- Records ---
 
 local function run_prefix(id) return 'run/' .. id .. '/' end
 local function queue_key(id, n) return string.format('q/%s/%012d', id, n) end
 
--- The runs table answers what the index records q/, t/, dv/ and box/ answered (slice 3a): a run
+-- The runs table keeps the queue, the end order and the deliveries in columns: a run
 -- in the queue has q, a terminal run has t, and a delivered run has status delivered and its
 -- agent. A run write sets these columns from the document. A page is at most limit runs
 -- {key, rev, value}, and whether more follow.
@@ -355,7 +354,7 @@ local S = {dirty = {}, queue = {}, pumping = false, retry_at = {}, ready = false
   watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}, dv_after = {}}
 
 -- S.queue holds the automations with work in FIFO order; S.dirty is the set of ids in it. A step
--- with more work goes to the end, so one backlog cannot hold back the others (review of d66cdc5).
+-- with more work goes to the end, so one backlog cannot hold back the others.
 local function mark(id)
   if S.dirty[id] then return end
   S.dirty[id] = true
@@ -385,7 +384,7 @@ local function each_auto(fn)
   until not after
 end
 
--- --- Run creation (design v2 section 4) ---
+-- --- Run creation ---
 
 -- create_run commits one run (in the queue) and the state change, in one transaction with its
 -- reads. extra(state) changes the state (for example daily_high). It refuses when the state has
@@ -443,7 +442,7 @@ local function worker_runs(worker)
   if not row or row.state ~= 'running' then return false end
   -- Only a definite answer says that the agent is gone: the hub knows no such agent, or the
   -- identity is not current. Any other failure raises, so the step keeps the worker and tries
-  -- again later (review of 3b2cba7, R1). hub.workers and hub.agents raise the same way.
+  -- again later. hub.workers and hub.agents raise the same way.
   local ok, resolved = pcall(hub, 'hub.agents.resolve', {to = worker.agent_id})
   if not ok then
     local message = type(resolved) == 'table' and tostring(resolved.message) or tostring(resolved)
@@ -500,7 +499,7 @@ local function profile_problem(task)
   error(err, 0)
 end
 
--- --- Run retention (design v2 section 10; retention amendment 1) ---
+-- --- Run retention ---
 
 -- Every batch that makes a run terminal takes the next terminal sequence from state.next_t (the
 -- batch has the state fence) and sets run.t = t/<id>/<inv>. inv counts down from MAX_T, so the
@@ -514,7 +513,7 @@ local function terminal(st, id, run)
   S.prune[id] = true
 end
 
--- --- Engine steps (design v2 section 5; amendment 1, B1) ---
+-- --- Engine steps ---
 
 -- spawn_step replays the stored spawn request (never a new key) and applies its result.
 local function spawn_step(id, st, st_rev)
@@ -544,7 +543,7 @@ local function spawn_step(id, st, st_rev)
     S.retry_at[id] = wall() + RECHECK
     return false
   end
-  -- A start that the hub never sent (hub Fix A) created nothing, so the plugin starts it again
+  -- A start that the hub never sent (not_created) created nothing, so the plugin starts it again
   -- once with a new key: one retry per start admission, never after a delete. Only a stored
   -- failed result counts, never a call error. The run and the new request commit together
   -- before the new key is sent.
@@ -571,8 +570,8 @@ local function spawn_step(id, st, st_rev)
   return true
 end
 
--- lose (in a commit): a delivered run whose worker no longer runs goes back to the queue (design
--- v2, 5e); after a delete it is cancelled, not requeued (B3): no new worker starts for a deleted
+-- lose (in a commit): a delivered run whose worker no longer runs goes back to the queue;
+-- after a delete it is cancelled, not requeued: no new worker starts for a deleted
 -- automation. The old agent's notice row follows its remaining tasks. The run keeps its attempt,
 -- so the next delivery has attempt + 1 and a done of the old attempt is refused. It also keeps
 -- starts: a later start uses a new key.
@@ -598,7 +597,7 @@ end
 -- not run, it is forgotten. An uncertain observation raises (worker_runs), so nothing is
 -- requeued on a guess.
 -- The scan goes one page at a time from S.dv_after[id] and wraps at the end, so a page of live
--- tasks never hides a later lost one (review of the 6a plan, point 2). A page with a requeue is
+-- tasks never hides a later lost one. A page with a requeue is
 -- read again by the next step. It returns nil when the page has no lost run.
 local DV_PAGE = 20
 local function lost_step(id, st, st_rev)
@@ -623,7 +622,7 @@ local function lost_step(id, st, st_rev)
   return nil
 end
 
--- --- File watches (design v2 section 6; amendment 1, B1 and B2) ---
+-- --- File watches ---
 
 -- Each trigger generation has its own watch key, so a changed trigger never meets the old spec
 -- (watch_conflict). settle_ms is fixed per plugin run: a test sets it short (manifest).
@@ -666,7 +665,7 @@ local function reconcile()
       watches[w.key] = w
     else
       hub('hub.watch.remove', {key = w.key, watch_id = w.watch_id})
-      -- The rows of the removed watch cannot come again, so its markers retire (B2, rule 2).
+      -- The rows of the removed watch cannot come again, so its markers retire.
       local owner = watch_owner(w.key)
       if owner then S.sweep[owner] = true; mark(owner) end
     end
@@ -698,7 +697,7 @@ local function reconcile()
 end
 
 -- file_run builds the run of a created row. A row whose run would pass the run budget gives a
--- failed run without the path (amendment 1, detail 1); it still has its marker.
+-- failed run without the path; it still has its marker.
 local function file_run(id, auto, row, n)
   local run = {v = 1, auto = id, name = auto.name, kind = 'f', by = 'watch', at = now(),
     item = {name = row.name, path = row.path, seq = row.seq, watch_id = appearance_watch(row.appearance_key)},
@@ -815,8 +814,8 @@ local function retire_step(id)
   return #gone > 0
 end
 
--- sweep_step deletes the markers (and retired rows) of watches that the hub no longer lists
--- (B2, rule 2). Steps run one at a time, so no drain makes a marker between the list and the
+-- sweep_step deletes the markers (and retired rows) of watches that the hub no longer lists.
+-- Steps run one at a time, so no drain makes a marker between the list and the
 -- delete.
 local function sweep_step(id)
   local live = {}
@@ -839,8 +838,7 @@ local function sweep_step(id)
   return #gone > 0
 end
 
--- --- Delete cleanup (amendment 1, B3; the coordinator's decision, 2026-10-20: a delete also
--- deletes the run history) ---
+-- --- Delete cleanup: a delete also deletes the run history ---
 
 local CLEANUP_RUNS, CLEANUP_KEYS = 20, 50
 
@@ -848,8 +846,8 @@ local CLEANUP_RUNS, CLEANUP_KEYS = 20, 50
 -- comes between the read and the write.
 
 -- cancel_step cancels at most CLEANUP_RUNS queued runs of a deleted automation, one commit for
--- each step. A starting or unknown_start run keeps its place in the queue: that run continues
--- (design v2, 5f). It returns nil when no queued run is left.
+-- each step. A starting or unknown_start run keeps its place in the queue: that run continues.
+-- It returns nil when no queued run is left.
 local function cancel_step(id)
   local done = atomic(function()
     local st, st_rev = D.state(id)
@@ -899,7 +897,7 @@ end
 
 -- prune_step keeps the newest KEEP_RUNS terminal runs: it deletes at most PRUNE_PAGE terminal
 -- runs after the newest KEEP_RUNS, in t order. The query reads no document (a page of 100
--- documents can need more than one reply). Markers are never touched (B2).
+-- documents can need more than one reply). Markers are never touched.
 local KEEP_RUNS, PRUNE_PAGE = 100, 50
 local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
 local function prune_step(id)
@@ -952,7 +950,7 @@ local function step(id)
     return true
   end
   -- Start admission: a new start counter gives a new key; the request is stored before the call.
-  -- The profile can change after save, so a new start checks it again (design v2, 5d). A replay
+  -- The profile can change after save, so a new start checks it again. A replay
   -- in spawn_step does not: its earlier effect may already exist.
   local problem = profile_problem(run.task)
   if problem then
@@ -1039,7 +1037,7 @@ local function tick()
   pump()
 end
 
--- --- Exports (design v2 section 9) ---
+-- --- Exports ---
 
 local function next_id()
   local n, rev = D.next_id()
@@ -1110,7 +1108,7 @@ local function save(caller, args)
     local enabling = enabled and (not old or not old.enabled)
     if trigger_changed or (old and old.enabled ~= enabled) then st.gen = (st.gen or 0) + 1 end
     st.enabled = enabled
-    -- The baseline moves only on create, enable, a change to daily and a time change (B4). An
+    -- The baseline moves only on create, enable, a change to daily and a time change. An
     -- unrelated save keeps a due catch-up. daily_high is never cleared.
     if trigger.kind == 'daily' and enabled and (trigger_changed or enabling) then st.daily_base = slot(trigger.at, t) or '' end
     local auto = {v = 1, id = id, name = name, enabled = enabled, gen = st.gen, trigger = trigger, action = action,
@@ -1197,7 +1195,7 @@ local function presets(_, args)
   return {presets = out}
 end
 
--- runs lists the runs of one automation by phase (6b plan, amendments 1 and 2). Each run is in
+-- runs lists the runs of one automation by phase. Each run is in
 -- one phase by its status: S, the run of state.spawning (starting or unknown_start); D, the
 -- delivered runs; Q, the runs in queue order (queued, without the S run); T, the runs in t order
 -- (terminal, the newest end first). The cursor is the last consumed position: '<P>' (phase P, nothing consumed
@@ -1324,7 +1322,7 @@ local function change_managed(id, op, change)
 end
 
 -- set_enabled changes only the flag. A change makes a new gen: disable stops new run admission,
--- and the runs already admitted continue (a queued run can still start a worker). Enable moves the daily baseline (B4)
+-- and the runs already admitted continue (a queued run can still start a worker). Enable moves the daily baseline
 -- and makes a new watch, so files from the disabled time make no run.
 local function set_enabled(caller, args)
   only(args, {id = true, enabled = true, key = true})
@@ -1345,7 +1343,7 @@ local function set_enabled(caller, args)
   end)
 end
 
--- delete is the fence of B3: one commit marks the automation (the tombstone) and its state
+-- delete is the fence: one commit marks the automation (the tombstone) and its state
 -- deleted, with a new gen. Every admission commit has if_rev on the state, so no new run, start or
 -- delivery of a queued run commits after it. The cleanup runs in later steps (cancel_step,
 -- purge_step). The fence also deletes the preset row when it names this automation, so the
@@ -1394,7 +1392,7 @@ local function run_change(kind, caller, args, change)
   return done.replayed or done.reply
 end
 
--- retry is a new admission (design v2, B7): a failed, dismissed or cancelled run goes back to the
+-- retry is a new admission: a failed, dismissed or cancelled run goes back to the
 -- queue with a new queue entry. It keeps attempt and starts, so its next delivery has attempt + 1
 -- and its next start has a new spawn key. A disabled or deleted automation refuses it.
 local function retry(caller, args)
@@ -1418,7 +1416,7 @@ local function retry(caller, args)
   end)
 end
 
--- cancel_run takes only a queued run: no side effect has started (design v2, section 9).
+-- cancel_run takes only a queued run: no side effect has started.
 local function cancel_run(caller, args)
   return run_change('cancel', caller, args, function(run, st, _, run_key, id)
     if run.status ~= 'queued' then fail('not_cancellable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only a queued run can be cancelled') end
@@ -1428,7 +1426,7 @@ local function cancel_run(caller, args)
   end)
 end
 
--- dismiss_start ends an unknown_start run (design v2, 5g). The plugin never replays that spawn
+-- dismiss_start ends an unknown_start run. The plugin never replays that spawn
 -- key again, so it never adopts that pane; the next queued run starts a new worker. The run
 -- keeps every dismissed key (the recovery reference), and the state keeps the newest.
 local function dismiss_start(caller, args)

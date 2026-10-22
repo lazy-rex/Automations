@@ -151,17 +151,44 @@ pruned, and pruning never deletes a file marker, so a pruned file run cannot com
 
 ## Storage
 
-The plugin keeps its data in its own SQL database (hub.sql), in one table for each entity
-(automations, states, runs, presets, file markers, operation replies). Each row has its record as
-a JSON document, and the fields that queries need as columns. The first start of this version
-copies the hub.store records of the earlier version into the tables, one page at a time; until
-the copy is done, each tool answers `unavailable` ("importing") and the panel says so. A start on
-a database that the plugin does not recognize changes nothing and says why. The engine reads and
-writes the tables with SQL (`automations_db.lua`): one transaction for each engine step or
-operation, with its notices and its saved reply. An operation reads its rows in its own
-transaction. The plan (`docs/sdk-port.md`) has the start states, the
-revision rules and the rollback procedure.
+The plugin keeps its data in its own SQL database (hub.sql), in one table for each entity:
 
+| Table | Key | Holds |
+|---|---|---|
+| `meta` | `name` | `rev` (the revision counter), `next_id` and `next_id_rev` |
+| `automations` | `id` | the automation document |
+| `states` | `id` | the engine state of an automation (gen, schedule, queue and end counters, deleted) |
+| `runs` | `run_key` | the run document, and its `automation_id`, `status`, `q`, `t` and `agent` as columns |
+| `presets` | `name` | the automation that installed the preset |
+| `seen` | `seen/<id>/<appearance>` | a file marker: the appearance has its run |
+| `retired` | `rt/<id>/<appearance>` | a marker whose removal came, until the marker is deleted |
+| `ops` | operation key | the saved reply and fingerprint of a keyed operation |
+
+- The document is the one authoritative value. The run columns are copies of document fields, and
+  the one write function of a run sets them from the document in the same statement.
+- Revisions are decimal strings. Each written row takes the next value of `meta.rev`; a write
+  compares the old revision in its transaction. The counter refuses a value at or above the
+  int64 maximum, and a malformed value, with no change.
+- Queue keys (`q/<id>/<seq>`) and end keys (`t/<id>/<inverted seq>`) are zero padded, so the text
+  order is the queue order and the end order (the newest end first). `runs.q` and `runs.t` are
+  unique. A delivered run has `status = 'delivered'` and its `agent`.
+- `presets.name` is the primary key, so a second install is a conflict that names the owner. The
+  delete fence deletes the row only when it names that automation.
+- A marker stays after its run is pruned, until the hub acknowledges the removal of its file.
+- A deleted highest ID is never used again (`meta.next_id`).
+- Saved replies have no expiry (the exports use `store = false` and the `ops` table). An operation
+  key holds the operation kind, the caller ID and the key; a replay looks under every ID of the
+  caller.
+- The engine reads and writes the tables with SQL (`automations_db.lua`): one transaction for each
+  engine step or operation, with its notices and its saved reply. An operation reads its rows in
+  its own transaction. A cleanup or prune step reads and writes in one transaction: at most
+  20 queued runs, or 50 markers or terminal runs. No transaction spans `hub.spawn` or another
+  slow hub call: a start stores its request, calls the hub, then stores the result in a second,
+  fenced transaction.
+- The first start of this version copies the hub.store records of the earlier version into the
+  tables, one page at a time; until the copy is done, each tool answers `unavailable`
+  ("importing") and the panel says so. A start on a database that the plugin does not recognize
+  changes nothing and says why.
 ## Agents
 
 The exports are agent tools: `automations.save`, `automations.list`, `automations.run`,
@@ -180,10 +207,9 @@ The tests are Lua files in `tests/`. `lazyrex-hub test` runs them against the re
 isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No test touches your
 own Rex server.
 
-Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql. It needs a hub
-with the SDK launcher, hub.sql, the store fence and the SQL test hooks (lab branch `hub/sql-lab`
-8510d50 or later; not on hub main yet), and an `sdk/lua` with the block join (ffa583f or later;
-with an older SDK, the two long-list tests of save.lua fail in the SDK).
+Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on hub v0.4.1
+(release 4.1) or later. The suite passes on hub main d912148 (observed 2026-10-22): it uses the
+SQL test hooks, the test renderer and the render counts of `renders()`.
 
 ```sh
 cd ../LazyRex/hub && go build -o ~/bin/lazyrex-hub ./cmd/hub
@@ -209,11 +235,10 @@ cd ../../Automations && lazyrex-hub test
   new key and delivers; a second `not_created` or another failure fails the run, never
   `unknown_start`, and Retry starts one worker with a new key; a lost reply of the restart batch
   and a hub crash after it start key /2 once; after a delete there is no restart; an
-  `unknown_start` run (a written fixture) whose start fails as `not_created` is starting again. It needs
-  the spawn-create fault mode `fail-sending` (hub 89cab8f or later); on an older hub, such as the
-  live hub fc0cd19, this file fails. Not covered: a hub crash between the admission and the
-  sending commits (the hub's own tests cover it), and a `not_created` call error when the hub
-  cannot store the failure.
+  `unknown_start` run (a written fixture) whose start fails as `not_created` is starting again. It
+  needs the spawn-create fault mode `fail-sending` (hub 89cab8f or later). Not covered: a hub
+  crash between the admission and the sending commits (the hub's own tests cover it), and a
+  `not_created` call error when the hub cannot store the failure.
 - list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
   a page limited by bytes skips no automation.
 - panel.lua: the panel pages 25 automations, and a run of one on page 2 is cancelled from its
@@ -231,6 +256,8 @@ cd ../../Automations && lazyrex-hub test
   start replays its key once.
 - large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits in one
   transaction, within the hub's transaction time; a failed page commit leaves no run and no marker.
+- refresh.lua: an open profile picker shows a new agent profile with no plugin handler; a start
+  refusal asks for an invalidate render of an open panel.
 - transaction.lua: a failed commit of a create or of a manual run leaves no row, no revision
   change and no saved reply, and the same key then makes the change once; manual runs take the
   numbers 1 and 2 from the state, and a replay makes no run.
