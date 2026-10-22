@@ -210,6 +210,8 @@ cd ../../Automations && lazyrex-hub test
   submit, and Change profile; a profile that is not an agent profile shows a warning; 120 agent
   profiles in pages of at most 50; a profile with 400 args gets a refusal; an edit form with a
   4000-byte instruction and full args fits the budget.
+- pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
+  turns: no automation delivers its whole backlog before another delivers its first run.
 - presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in

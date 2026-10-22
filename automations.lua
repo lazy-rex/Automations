@@ -338,10 +338,16 @@ local function state_of(record) return type(record.value) == 'table' and record.
 -- S.watches: the plugin's watches by key, from the last reconcile (hub.watch.list, then ensure).
 -- S.watch_errors: the refused ensure of an automation. S.drain, S.retire and S.sweep: file work
 -- that waits for an automation (section 6 below).
-local S = {dirty = {}, pumping = false, retry_at = {}, ready = false, reconcile_due = true,
+local S = {dirty = {}, queue = {}, pumping = false, retry_at = {}, ready = false, reconcile_due = true,
   watches = {}, watch_errors = {}, drain = {}, retire = {}, sweep = {}, prune = {}, dv_after = {}}
 
-local function mark(id) S.dirty[id] = true end
+-- S.queue holds the automations with work in FIFO order; S.dirty is the set of ids in it. A step
+-- with more work goes to the end, so one backlog cannot hold back the others (review of d66cdc5).
+local function mark(id)
+  if S.dirty[id] then return end
+  S.dirty[id] = true
+  S.queue[#S.queue + 1] = id
+end
 
 -- ui_changed asks the hub to render the plugin's views again, for a change that is not in the
 -- store (a watch state, a worker). The hub renders them after each store commit by itself. One
@@ -1071,9 +1077,13 @@ pump = function()
     end)
     return
   end
+  -- One pass over the queue: an id that waits for its retry time goes to the end, and the first
+  -- ready id is taken.
   local id
-  for candidate in pairs(S.dirty) do
+  for _ = 1, #S.queue do
+    local candidate = table.remove(S.queue, 1)
     if not S.retry_at[candidate] or S.retry_at[candidate] <= t then id = candidate break end
+    S.queue[#S.queue + 1] = candidate
   end
   if not id then return end
   S.pumping = true
@@ -1084,9 +1094,9 @@ pump = function()
     if not ok then
       print('automations: step ' .. id .. ': ' .. (type(more) == 'table' and tostring(more.message) or tostring(more)))
       S.retry_at[id] = wall() + RECHECK
-      S.dirty[id] = true
+      mark(id)
     elseif more or S.retry_at[id] then
-      S.dirty[id] = true
+      mark(id)
     end
     S.pumping = false
     pump()
