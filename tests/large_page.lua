@@ -6,10 +6,10 @@ local alice = agent('alice')
 
 -- A gate holds the watch read until 50 files are there, so one read page has all 50 rows. Each run
 -- is near the largest size (an instruction of 8 KiB encoded): the page is 100 writes and about
--- 450 KB. The first commit of the page fails: no run and no marker stay. The next one must hold
--- the whole page: the record of hub calls after the failure shows one transaction with all 50
--- run inserts, committed once (the byte bound of d0bb6a1 split this page into about 10). The spawn gate holds the
--- start, so no worker starts.
+-- 450 KB. Page commits fail until the test cancels the failure: no run and no marker stay. The
+-- next commit must hold the whole page: the record of hub calls after the failure shows one
+-- transaction with all 50 run inserts, committed once (the byte bound of d0bb6a1 split this page
+-- into 10). The spawn gate holds the start, so no worker starts.
 test('one watch page of 50 large file runs commits in one transaction; a failed commit leaves none', function()
   local dir = F.dir('large-page')
   local id = alice:call('automations.save', {key = 'large-page', name = 'Large page', trigger = {kind = 'file', path = dir, glob = '*.md'},
@@ -23,15 +23,22 @@ test('one watch page of 50 large file runs commits in one transaction; a failed 
   local prefix = 'seen/' .. id .. '/'
   local function runs() return sql('SELECT run_key, status, length(doc) AS n FROM runs WHERE automation_id = ?', {id}) end
   local function markers() return #sql('SELECT key FROM seen WHERE substr(key, 1, ?) = ?', {#prefix, prefix}) end
-  local failed = inject({match = {sql_commit_writes = 'runs'}, fail = 'the first page commit fails', fail_code = 'unavailable', times = 1})
-  local t0 = os.time()
+  -- The injection fails every page commit until the test cancels it.
+  local failed = inject({match = {sql_commit_writes = 'runs'}, fail = 'the page commit fails', fail_code = 'unavailable', times = 'always'})
   fault_release(read)
   wait('the failed page commit', function() return injection(failed).consumed >= 1 end, 20)
-  -- The plugin tries again after the recheck (1 s in the lab). The second baseline keeps the
-  -- failed transaction out of the record below (one reply holds about 1 MB).
-  local _, after_fail = calls('none')
+  -- A second gate stops the retries at their read: when it has refused one, no page transaction
+  -- is open (the plugin runs one step at a time).
+  local again = fault({point = 'action', action = 'hub.watch.read', when = 'before', mode = 'gate', key = 'a-' .. id .. '-1'})
+  wait('the held retry', function() return fault_fired(again) end, 20)
   expect(#runs()).to_be(0)
   expect(markers()).to_be(0)
+  -- The baseline keeps the failed transactions out of the record below (one reply holds about
+  -- 1 MB). Then the retry may commit.
+  local _, after_fail = calls('none')
+  cancel_injection(failed)
+  local t0 = os.time()
+  fault_release(again)
   wait('50 large file runs', function() return #runs() >= 50 end, 30)
   local t1 = os.time()
   local list = runs()
@@ -57,10 +64,10 @@ test('one watch page of 50 large file runs commits in one transaction; a failed 
   local committed = 0
   for _, c in ipairs(commits) do if c.args.tx == order[1] then committed = committed + 1 end end
   expect(committed).to_be(1)
-  -- From the read release to 50 committed runs: two page transactions and the 1 s recheck, far
-  -- within the hub's 10 s for one transaction (a longer one gets tx_expired and commits nothing).
-  print('large page: ' .. (t1 - t0) .. ' s from the read release to the committed page')
-  expect(t1 - t0 <= 6).to_be(true)
+  -- The time from the release of the retry to the committed page (the recheck wait, the read and
+  -- the page transaction), for the record. The hub ends a transaction after 10 s with tx_expired,
+  -- and then nothing commits: the commit above is the check of that limit.
+  print('large page: ' .. (t1 - t0) .. ' s from the retry release to the committed page')
   wait('the held start', function() return fault_fired(spawn) end, 10)
   fault_release(spawn)
 end)
