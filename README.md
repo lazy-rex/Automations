@@ -181,7 +181,7 @@ own Rex server.
 
 Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql. It needs a hub
 with the SDK launcher, hub.sql, the store fence and the SQL test hooks (lab branch `hub/sql-lab`
-26c751d or later; not on hub main yet), and an `sdk/lua` with the block join (ffa583f or later;
+8510d50 or later; not on hub main yet), and an `sdk/lua` with the block join (ffa583f or later;
 with an older SDK, the two long-list tests of save.lua fail in the SDK).
 
 ```sh
@@ -226,11 +226,15 @@ cd ../../Automations && lazyrex-hub test
   4000-byte instruction and full args fits the budget.
 - pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
   turns: no automation delivers its whole backlog before another delivers its first run.
+- cutover_work.lua: a file that appears during the copy gives one run after it, and a pending
+  start replays its key once; the purge clears a run's terminal entry with a new revision in the
+  batch of the state fence, then deletes the run.
 - cutover.lua: the first start on an old store copies each record and saved reply exactly, with
   its rev, below the new revision counter, and the run columns equal the document; while the copy
   waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
-  replays under the identity and under a legacy ID, and the next ID is new; a delivery commits its
-  task and notice together, also after a failed commit and a lost reply; the revision counter
+  replays under the identity and under a legacy ID, and the next ID is new; while a delivery commit
+  is held, the worker has no task and no notice, and after it one of each; a lost reply delivers
+  once; the revision counter
   refuses at the int64 maximum and on a malformed value with no change; each unknown start state
   refuses with no write, and a start on a done copy keeps the SQL changes; a crash during the copy
   resumes from its cursor.
@@ -249,9 +253,10 @@ cd ../../Automations && lazyrex-hub test
   only skipped entries is empty and has `next`; the cursor crosses an empty phase; malformed cursors
   are refused.
 - retention.lua: the newest 100 terminal runs stay and an older active run stays; a retry takes
-  a new sequence; a clock moved back keeps the latest run; done takes a sequence, and its replay
+  a new sequence; with run documents near the budget (more than one SQL reply for 101 of them),
+  exactly the newest 100 stay; a clock moved back keeps the latest run; done takes a sequence, and its replay
   gives the same result; a file run pruned before its ack makes no second run; a crash between
-  prune batches (a backlog from the harness `write`, an injection that fails the second batch)
+  prune batches (a backlog written to the tables, an injection that fails the second batch)
   leaves exactly the newest 100; a retry between the prune read and its batch keeps the oldest run.
 - reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
   worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias

@@ -13,7 +13,7 @@ local alice = agent('alice')
 local MAX_T = 999999999999
 local BACKLOG = 60
 local MAX_REV = '9223372036854775807'
-local TABLES = {'meta', 'automations', 'states', 'runs', 'presets', 'seen', 'retired', 'ops'}
+local TABLES = F.TABLES
 
 local function manual(id, n) return 'run/' .. id .. '/m/' .. string.format('%06d', n) end
 local function same(a, b)
@@ -77,36 +77,6 @@ local function fixture()
   worker = {agent = one.agent, pane = w}
 end
 
--- to_store writes every row to hub.store in the slice 1 layout, and each saved reply as an
--- operation record. The store gives new revisions; check() compares the copy with them.
-local function to_store()
-  local ops = {}
-  local function flush() if #ops > 0 then write(ops) end ops = {} end
-  local function put(key, value) ops[#ops + 1] = {key = key, value = value} if #ops >= 30 then flush() end end
-  put('meta/next_id', {n = tonumber(meta('next_id'))})
-  for _, r in ipairs(sql('SELECT id, doc FROM automations')) do put('auto/' .. r.id, rex.json.decode(r.doc)) end
-  for _, r in ipairs(sql('SELECT id, doc FROM states')) do put('state/' .. r.id, rex.json.decode(r.doc)) end
-  for _, r in ipairs(sql('SELECT name, automation_id FROM presets')) do put('preset/' .. r.name, {id = r.automation_id}) end
-  for _, r in ipairs(sql('SELECT key, doc FROM seen')) do put(r.key, rex.json.decode(r.doc)) end
-  for _, r in ipairs(sql('SELECT key, doc FROM retired')) do put(r.key, rex.json.decode(r.doc)) end
-  for _, r in ipairs(sql('SELECT run_key, automation_id, status, q, t, agent, doc FROM runs')) do
-    local run = rex.json.decode(r.doc)
-    put(r.run_key, run)
-    if r.q then put(r.q, {run = r.run_key}) end
-    if r.t then put(r.t, {run = r.run_key, seq = run.tseq}) end
-    if r.status == 'delivered' then
-      put('dv/' .. r.automation_id .. '/' .. r.run_key, {agent = r.agent})
-      put('box/' .. r.agent .. '/' .. r.run_key, {attempt = run.attempt, auto = r.automation_id})
-    end
-  end
-  flush()
-  for _, r in ipairs(sql('SELECT key, fingerprint, reply FROM ops')) do
-    put_operation({key = r.key, fingerprint = r.fingerprint, result = rex.json.decode(r.reply)})
-  end
-end
-local function empty_tables()
-  for _, t in ipairs(TABLES) do sql_write('DELETE FROM ' .. t) end
-end
 -- check compares every SQL row with its store record, and every store record with its row.
 local function check()
   local n = 0
@@ -146,13 +116,6 @@ local function check()
   return n
 end
 local function marker() return meta('import') end
--- reload stops the plugin, runs setup (fixtures, injections), and starts a new instance.
-local function reload(setup)
-  H.hub('hub.admin.stop', {plugin = 'automations'})
-  if setup then setup() end
-  H.hub('hub.admin.start', {plugin = 'automations'})
-  wait('the plugin', function() return H.hub('hub.test.status', {}).plugins.automations.registered end, 30)
-end
 
 -- The gate check while the copy is held: every export and view answers the import text, and
 -- nothing changes.
@@ -171,11 +134,11 @@ test('the first start copies the store exactly; the gate holds until done', func
   wait('the first copy', function() return marker() == 'cutover-1:done' end, 30)
   fixture()
   rex.sleep(2)
-  to_store()
+  F.to_store()
   -- The copy fails at its first run page 10 times (a retry each second), then goes on.
   local inj
-  reload(function()
-    empty_tables()
+  F.reload(function()
+    F.empty_tables()
     inj = inject({match = {sql_commit_writes = 'runs'}, fail = 'held for the gate test', fail_code = 'unavailable', times = 10})
   end)
   wait('the held run page', function() return injection(inj).consumed >= 1 end, 30)
@@ -207,13 +170,32 @@ end)
 
 test('a delivery after the copy: the task and its notice commit together; a lost reply delivers once', function()
   alice:call('automations.set_enabled', {id = ids.a, enabled = true, key = 'cut-a-on'})
-  -- A failed commit of the delivery has neither the task nor the notice.
-  -- skip = 1: the run's creation commits; its delivery commit fails once.
-  local held = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'held delivery', fail_code = 'unavailable', times = 1})
-  local r = alice:call('automations.run', {id = ids.a, key = 'cut-a-2'})
-  local run = F.wait_status(r.run_key, 'delivered', 30)
-  expect(injection(held).consumed).to_be(1)
-  expect(notice(run.agent).pending).to_be(true)
+  -- The fixture's two tasks end first, so the worker has no pending notice.
+  local agent = F.run(ids.first).agent
+  for _, rk in ipairs({ids.first, ids.second}) do
+    worker.pane:call('automations.done', {run_key = rk, attempt = F.run(rk).attempt, key = 'cut-done-' .. rk})
+  end
+  wait('no pending notice', function() return notice(agent).pending == false end, 10)
+  -- The delivery commit is held: the commits with this run key as a parameter are the creation
+  -- (skip = 1) and then each try of the delivery, which fails until the test cancels it.
+  local rk = manual(ids.a, (F.store('state/' .. ids.a).value.next_manual or 0) + 1)
+  local held = inject({match = {sql_commit_writes = 'runs', sql_param = rk}, skip = 1, fail = 'held delivery', fail_code = 'unavailable',
+    times = 'always'})
+  expect(alice:call('automations.run', {id = ids.a, key = 'cut-a-2'}).run_key).to_be(rk)
+  wait('the held delivery commit', function() return injection(held).consumed >= 2 end, 30)
+  -- Before the commit: the run is queued, and the worker has no task and no notice.
+  expect(F.run(rk).status).to_be('queued')
+  expect(F.store('box/' .. agent .. '/' .. rk).rev).to_be('0')
+  expect(notice(agent).pending).to_be(false)
+  for _, t in ipairs(worker.pane:call('automations.read', {}).tasks) do expect(t.run_key).not_to_be(rk) end
+  cancel_injection(held)
+  local run = F.wait_status(rk, 'delivered', 30)
+  expect(run.agent).to_be(agent)
+  expect(run.attempt).to_be(1)
+  expect(notice(agent).pending).to_be(true)
+  local seen = 0
+  for _, t in ipairs(worker.pane:call('automations.read', {}).tasks) do if t.run_key == rk then seen = seen + 1 end end
+  expect(seen).to_be(1)
   -- A lost reply: the commit happens, and the plugin gets an error. The run is delivered once.
   local lost = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'lost delivery reply', after = true, times = 1})
   local r2 = alice:call('automations.run', {id = ids.a, key = 'cut-a-3'})
@@ -252,7 +234,7 @@ end)
 
 -- Each refused start state: no write, and the exports and views give the reason.
 local function refused(setup, text)
-  reload(setup)
+  F.reload(setup)
   rex.sleep(3)
   local before = counts()
   expect_closed(text)
@@ -276,7 +258,7 @@ test('a start on rows without a valid marker refuses and writes nothing', functi
   sql_write("INSERT INTO meta (name, value) VALUES ('rev', ?)", {saved.rev})
   -- A restart on done keeps the SQL-only changes and does not copy again.
   local cutover_rev = store('meta/cutover').rev
-  reload()
+  F.reload()
   wait('the start on done', function()
     local ok = pcall(alice.call, alice, 'automations.list', {})
     return ok
@@ -288,8 +270,8 @@ end)
 test('a crash during the copy resumes from its committed cursor', function()
   -- The hub crash ends the injection with the hub process.
   local inj
-  reload(function()
-    empty_tables()
+  F.reload(function()
+    F.empty_tables()
     inj = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'held for the crash test', fail_code = 'unavailable', times = 'always'})
   end)
   wait('the held second run page', function() return injection(inj).consumed >= 1 end, 60)

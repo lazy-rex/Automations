@@ -333,12 +333,10 @@ return function(H)
     return out
   end
   -- F.inject_begin(ops, spec) commits record ops as another writer when the plugin next begins a
-  -- transaction (inject{match = {sql_begin = true}, sql = ...}). It calls hub.test.inject itself:
-  -- the harness inject() of hub 26c751d does not pass sql on.
+  -- transaction (inject{match = {sql_begin = true}, sql = ...}; hub/sql-lab 8510d50 or later).
   function F.inject_begin(ops, spec)
     spec = spec or {}
-    return H.hub('hub.test.inject', {plugin = 'automations', match = {sql_begin = true}, sql = sql_ops(ops), skip = spec.skip,
-      times = spec.times}).id
+    return H.inject({match = {sql_begin = true}, sql = sql_ops(ops), skip = spec.skip, times = spec.times})
   end
 
   function F.run(key) return F.store(key).value end
@@ -349,12 +347,55 @@ return function(H)
     end, timeout or 20)
   end
 
-  -- The plugin's first start copies hub.store (empty in a new lab) into the SQL tables; until the
-  -- copy is done, every export answers unavailable. Each file starts after it.
-  H.wait('the first copy', function()
+  -- The cutover fixtures (cutover.lua, cutover_work.lua). F.to_store writes every row to hub.store
+  -- in the layout of the slice 1 version (with the index records q/, t/, dv/ and box/) and each
+  -- saved reply as an operation record; the store gives new revisions. F.empty_tables deletes
+  -- every row. F.reload stops the plugin, runs setup (fixtures, injections), and starts a new
+  -- instance: the hub process stays, so the injections and faults of setup stay armed.
+  F.TABLES = {'meta', 'automations', 'states', 'runs', 'presets', 'seen', 'retired', 'ops'}
+  function F.to_store()
+    local ops = {}
+    local function flush() if #ops > 0 then H.write(ops) end ops = {} end
+    local function put(key, value) ops[#ops + 1] = {key = key, value = value} if #ops >= 30 then flush() end end
+    local next_id = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1]
+    if next_id then put('meta/next_id', {n = tonumber(next_id.value)}) end
+    for _, r in ipairs(H.sql('SELECT id, doc FROM automations')) do put('auto/' .. r.id, rex.json.decode(r.doc)) end
+    for _, r in ipairs(H.sql('SELECT id, doc FROM states')) do put('state/' .. r.id, rex.json.decode(r.doc)) end
+    for _, r in ipairs(H.sql('SELECT name, automation_id FROM presets')) do put('preset/' .. r.name, {id = r.automation_id}) end
+    for _, r in ipairs(H.sql('SELECT key, doc FROM seen')) do put(r.key, rex.json.decode(r.doc)) end
+    for _, r in ipairs(H.sql('SELECT key, doc FROM retired')) do put(r.key, rex.json.decode(r.doc)) end
+    for _, r in ipairs(H.sql('SELECT run_key, automation_id, status, q, t, agent, doc FROM runs')) do
+      local run = rex.json.decode(r.doc)
+      put(r.run_key, run)
+      if r.q then put(r.q, {run = r.run_key}) end
+      if r.t then put(r.t, {run = r.run_key, seq = run.tseq}) end
+      if r.status == 'delivered' then
+        put('dv/' .. r.automation_id .. '/' .. r.run_key, {agent = r.agent})
+        put('box/' .. r.agent .. '/' .. r.run_key, {attempt = run.attempt, auto = r.automation_id})
+      end
+    end
+    flush()
+    for _, r in ipairs(H.sql('SELECT key, fingerprint, reply FROM ops')) do
+      H.put_operation({key = r.key, fingerprint = r.fingerprint, result = rex.json.decode(r.reply)})
+    end
+  end
+  function F.empty_tables()
+    for _, t in ipairs(F.TABLES) do sql_write('DELETE FROM ' .. t) end
+  end
+  function F.reload(setup)
+    H.hub('hub.admin.stop', {plugin = 'automations'})
+    if setup then setup() end
+    H.hub('hub.admin.start', {plugin = 'automations'})
+    H.wait('the plugin', function() return H.hub('hub.test.status', {}).plugins.automations.registered end, 30)
+  end
+  function F.copied()
     local r = H.sql("SELECT value FROM meta WHERE name = 'import'")[1]
     return r and r.value == 'cutover-1:done'
-  end, 30)
+  end
+
+  -- The plugin's first start copies hub.store (empty in a new lab) into the SQL tables; until the
+  -- copy is done, every export answers unavailable. Each file starts after it.
+  H.wait('the first copy', F.copied, 30)
 
   return F
 end
