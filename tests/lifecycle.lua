@@ -1,5 +1,5 @@
 -- Lifecycle (design v2, 5f, 5g and section 9; amendment 1, B3): delete, set_enabled, retry,
--- cancel_run and dismiss_start. Delete is a fence, then a cleanup in measured batches. The
+-- cancel_run and dismiss_start. Delete is a fence, then a cleanup in bounded commits. The
 -- decision "Automation delete also deletes its run history" (2026-10-20): the runs go after the
 -- active work ends.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
@@ -23,58 +23,60 @@ local function gone(id)
   end, 30)
 end
 
--- The reviewer's crash boundary for B3. Runs near the 12 KiB run budget (an 8 KiB encoded
--- instruction and a 480-byte arg) fit about 4 to a cleanup batch, so 12 queued runs need several
--- batches. A dropped spawn holds the first run in starting, so the others stay queued. A gate on
--- the third SQL commit (one for each batch; 1: the fence, 2: the first cleanup batch) stops the
--- cleanup between batches; the hub crashes there. The hub keeps faults in memory, so the gate is gone after the
--- restart. This test is first in the file: no other automation makes batches during it.
+-- The reviewer's crash boundary for B3. A cleanup commit cancels at most 20 queued runs
+-- (CLEANUP_RUNS), so 41 queued runs need three commits. A dropped spawn holds the first run in
+-- starting, so the others stay queued. A gate on the third SQL commit (1: the fence, 2: the first
+-- cleanup commit) stops the cleanup between commits; the hub crashes there. The hub keeps faults
+-- in memory, so the gate is gone after the restart. This test is first in the file: no other
+-- automation commits during it.
+local QUEUED = 41
 test('a crash between delete cleanup batches cancels every queued run once and delivers none', function()
-  local id = automation('crash', {profile = 'tasked', args = {task = string.rep('t', 480)}}, string.rep('\1', 1365))
+  local id = automation('crash')
   local first = manual(id, 1)
   local drop = fault({point = 'spawn-create', mode = 'drop', op = spawn_key(first)})
   expect(run_now(id, 'crash-1')).to_be(first)
   wait('the dropped spawn', function() return fault_fired(drop) end, 10)
   expect(F.wait_status(first, 'starting').starts).to_be(1)
-  for n = 2, 13 do run_now(id, 'crash-' .. n) end
-  for n = 2, 13 do
+  for n = 2, QUEUED + 1 do run_now(id, 'crash-' .. n) end
+  for n = 2, QUEUED + 1 do
     expect(F.store(manual(id, n)).value.status).to_be('queued')
     expect(F.store(qkey(id, n)).value.run).to_be(manual(id, n))
   end
   local gate = fault({point = 'action', action = 'hub.sql.commit', when = 'before', mode = 'gate', nth = 3})
   expect(alice:call('automations.delete', {id = id, key = 'crash-delete'}).status).to_be('deleting')
-  wait('the gated third batch', function() return fault_fired(gate) end, 10)
+  wait('the gated third commit', function() return fault_fired(gate) end, 10)
   expect(F.store('auto/' .. id).value.deleted).to_be(true)
   expect(F.store('state/' .. id).value.deleted).to_be(true)
-  local cancelled, queued = 0, 0
-  for n = 2, 13 do
+  -- The first cleanup commit cancelled the first 20 in queue order; the others are queued.
+  for n = 2, QUEUED + 1 do
     local run = F.store(manual(id, n)).value
-    if run.status == 'cancelled' then
-      cancelled = cancelled + 1
+    if n <= 21 then
+      expect(run.status).to_be('cancelled')
       expect(F.store(qkey(id, n)).rev).to_be('0')
     else
       expect(run.status).to_be('queued')
       expect(F.store(qkey(id, n)).rev).not_to_be('0')
-      queued = queued + 1
     end
   end
-  expect(cancelled >= 1).to_be(true)
-  expect(queued >= 1).to_be(true)
   hub:restart({crash = true})
   wait('every queued run to be cancelled', function()
-    for n = 2, 13 do
+    for n = 2, QUEUED + 1 do
       if F.store(manual(id, n)).value.status ~= 'cancelled' then return false end
     end
     return true
   end, 30)
-  for n = 2, 13 do
+  -- Each run is cancelled once: one terminal sequence each, all different.
+  local seqs = {}
+  for n = 2, QUEUED + 1 do
     local run = F.store(manual(id, n)).value
     expect(run.error).to_be('automation deleted')
     expect(run.agent).to_be(nil)
     expect(run.attempt).to_be(0)
     expect(F.store(qkey(id, n)).rev).to_be('0')
+    expect(seqs[run.tseq]).to_be(nil)
+    seqs[run.tseq] = true
   end
-  expect(F.running('tasked')).to_be(0)
+  expect(F.running('worker')).to_be(0)
   -- The started run continues after the delete. Its start has no outcome; dismiss it, and the
   -- cleanup ends.
   if F.store(first).value.status == 'starting' then
@@ -83,7 +85,8 @@ test('a crash between delete cleanup batches cancels every queued run once and d
     alice:call('automations.dismiss_start', {run_key = first, key = 'crash-dismiss'})
   end
   gone(id)
-  for n = 1, 13 do expect(F.store(manual(id, n)).rev).to_be('0') end
+  for n = 1, QUEUED + 1 do expect(F.store(manual(id, n)).rev).to_be('0') end
+  expect(#sql('SELECT run_key FROM runs WHERE automation_id = ?', {id})).to_be(0)
   F.set_clock(T0)
 end)
 

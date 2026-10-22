@@ -197,8 +197,8 @@ cd ../../Automations && lazyrex-hub test
   does not hold the delivery; a marker retires
   after its removal is acknowledged, also after a lost ack reply and a crash; a run over the budget
   fails without the path; a backlog of 120 files gives 120 runs.
-- lifecycle.lua: a hub crash between delete cleanup batches (near-limit runs, a gate on the third
-  SQL commit) cancels every queued run once and delivers none; a delete during a pending start
+- lifecycle.lua: a hub crash between delete cleanup commits (41 queued runs, 20 for each commit, a
+  gate on the third SQL commit) cancels every queued run once and delivers none; a delete during a pending start
   delivers that run and cancels the queued ones; a worker loss after delete cancels and starts no
   worker; a deleted file automation loses its watch, markers and runs; a deleted automation is not
   listed and refuses changes; retry after a start failure (new spawn key) and an agent failure
