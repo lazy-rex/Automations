@@ -405,3 +405,12 @@ New in slice 2:
    inventory" (runs first), with direct SQL on the same domain tables, and delete the record
    logic that each step makes redundant.
 5. Remove the bridges that the SDK covers; report the line counts after each slice.
+6. The cleanup pass (coordinator, 2026-10-22), on the branch sdk-cleanup: delete the code that the
+   SQL tables and the transactions made redundant, with no behavior change, one reviewed commit for
+   each area. Area 1: the operation handlers (`save`, `set_enabled`, `delete`, `run_change`, `done`,
+   and `run_now` through `create_run`) read their rows inside the commit (`D.atomic`). The plugin
+   has one open transaction at a time (hub docs/sql.md, section 4), so no other commit changes the
+   rows between the read and the write: the 5-attempt `if_rev` loops and their "try again" failure
+   go. `run_now` takes its manual number in the same transaction. The engine steps keep their
+   re-read on a conflict: they make other hub calls (spawn, watch read) between the read and the
+   write.

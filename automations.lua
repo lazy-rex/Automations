@@ -66,7 +66,7 @@ local plugin_dir = assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be 
 -- The engine's storage is SQL (automations_db.lua). hub.store is read only by the copy
 -- (store_scan below).
 local D = dofile(plugin_dir .. '/automations_db.lua')({app = app, fail = fail})
-local commit = D.commit
+local commit, atomic = D.commit, D.atomic
 
 -- store_scan reads hub.store, for the copy only.
 local function store_scan(prefix, after, limit)
@@ -387,19 +387,27 @@ end
 
 -- --- Run creation (design v2 section 4) ---
 
--- create_run commits one run (in the queue) and the state change. extra(state) changes the state
--- (for example daily_high). It refuses when the state has another gen or is disabled or deleted,
--- so a stale callback makes no run. op: {by, record = the saved operation, reply = its reply}.
--- It answers the run key, how, and the commit (with replayed: the saved reply of op).
+-- create_run commits one run (in the queue) and the state change, in one transaction with its
+-- reads. extra(state) changes the state (for example daily_high). It refuses when the state has
+-- another gen or is disabled or deleted, so a stale callback makes no run. A manual run (kind m,
+-- k nil) takes the next manual number of the state. op: {by, record = the saved operation}; its
+-- reply is {run_key}. It answers the run key (nil after a replay), how, and the commit (with
+-- replayed: the saved reply of op).
 local function create_run(id, gen, kind, k, extra, op)
-  for _ = 1, 5 do
+  local out = {k = k}
+  local done, stop = atomic(function()
     local auto = D.auto(id)
     local st, st_rev = D.state(id)
-    if not auto or not st or st.deleted then return nil, 'not_found' end
-    if not st.enabled then return nil, 'disabled' end
-    if gen and st.gen ~= gen then return nil, 'stale' end
-    local run_key = run_prefix(id) .. kind .. '/' .. k
-    if D.run(run_key) then return run_key, 'exists' end
+    if not auto or not st or st.deleted then D.abort('not_found') end
+    if not st.enabled then D.abort('disabled') end
+    if gen and st.gen ~= gen then D.abort('stale') end
+    if kind == 'm' then
+      st.next_manual = (st.next_manual or 0) + 1
+      out.k = string.format('%06d', st.next_manual)
+    end
+    out.run_key = run_prefix(id) .. kind .. '/' .. out.k
+    local run_key = out.run_key
+    if D.run(run_key) then D.abort('exists') end
     local n = (st.next_q or 0) + 1
     local run = {v = 1, auto = id, name = auto.name, kind = kind, by = op and op.by or 'schedule', at = now(),
       task = {instruction = auto.instruction, profile = auto.action.profile, args = auto.action.args, title = auto.action.title, cwd = auto.action.cwd},
@@ -408,14 +416,13 @@ local function create_run(id, gen, kind, k, extra, op)
     if size(run) > RUN_BUDGET then fail('internal', 'The run record is over ' .. RUN_BUDGET .. ' bytes encoded') end
     st.next_q = n
     if extra then extra(st) end
-    local done = commit(function()
-      D.put_run(run_key, '0', run)
-      D.put_state(id, st_rev, st)
-      return op and op.reply
-    end, op and op.record)
-    if done then mark(id); return run_key, 'created', done end
-  end
-  fail('unavailable', 'The automation changed during the run; try again')
+    D.put_run(run_key, '0', run)
+    D.put_state(id, st_rev, st)
+    return op and {run_key = run_key}
+  end, op and op.record)
+  if not done then return stop == 'exists' and out.run_key or nil, stop end
+  mark(id)
+  return out.run_key, 'created', done
 end
 
 -- --- Workers ---
@@ -1070,7 +1077,7 @@ local function save(caller, args)
   local enabled = args.enabled ~= false
   if enabled and trigger.kind == 'file' then check_file_limit(args.id) end
   local t = now()
-  for _ = 1, 5 do
+  local done = atomic(function()
     local id, n, n_rev, old, st, st_rev = args.id, nil, nil, nil, nil, '0'
     if id == nil then
       id, n, n_rev = next_id()
@@ -1085,6 +1092,10 @@ local function save(caller, args)
       if args.preset ~= nil and args.preset ~= old.preset then fail('invalid_input', 'Automation ' .. id .. ' is not from preset ' .. args.preset) end
     end
     local preset = old and old.preset or args.preset
+    if preset and not old then
+      local owner = D.preset(preset)
+      if owner then fail('conflict', 'Preset ' .. preset .. ' is installed as automation ' .. owner) end
+    end
     st = st or {v = 1, gen = 0, next_q = 0, next_manual = 0}
     local trigger_changed = not old or canon(old.trigger) ~= canon(trigger)
     local enabling = enabled and (not old or not old.enabled)
@@ -1095,26 +1106,18 @@ local function save(caller, args)
     if trigger.kind == 'daily' and enabled and (trigger_changed or enabling) then st.daily_base = slot(trigger.at, t) or '' end
     local auto = {v = 1, id = id, name = name, enabled = enabled, gen = st.gen, trigger = trigger, action = action,
       instruction = instruction, preset = preset, by = old and old.by or caller.id, created_at = old and old.created_at or t, updated_at = t}
-    local done, conflict = commit(function()
-      local rev = D.put_auto(id, old and args.if_rev or '0', auto)
-      D.put_state(id, st_rev, st)
-      if n then D.put_next_id(n, n_rev) end
-      if preset and not old then D.put_preset(preset, '0', id) end
-      return {id = id, rev = rev}
-    end, {key = op_key('save', caller.id, args.key), fingerprint = fingerprint})
-    if done then
-      mark(id)
-      S.reconcile_due = true
-      S.reconcile_at = nil
-      pump()
-      return done.replayed or done.reply
-    end
-    if conflict.what == 'automation ' .. id and args.id then fail('conflict', 'Automation ' .. id .. ' is at rev ' .. select(2, D.auto(id))) end
-    if preset and conflict.what == 'preset ' .. preset then
-      fail('conflict', 'Preset ' .. preset .. ' is installed as automation ' .. tostring(D.preset(preset) or '(unknown)'))
-    end
-  end
-  fail('unavailable', 'The automations changed during the save; try again')
+    local rev = D.put_auto(id, old and args.if_rev or '0', auto)
+    D.put_state(id, st_rev, st)
+    if n then D.put_next_id(n, n_rev) end
+    if preset and not old then D.put_preset(preset, '0', id) end
+    return {id = id, rev = rev}
+  end, {key = op_key('save', caller.id, args.key), fingerprint = fingerprint})
+  local reply = done.replayed or done.reply
+  mark(reply.id)
+  S.reconcile_due = true
+  S.reconcile_at = nil
+  pump()
+  return reply
 end
 
 -- watch_view is the watch state of an enabled file automation: the hub's state of its watch, or
@@ -1282,36 +1285,28 @@ local function run_now(caller, args)
   local prior = replay('run', caller, args.key, fingerprint)
   if prior then return prior end
   local id = text_arg(args.id, 'id', 32)
-  local st = D.state(id)
-  if not st or st.deleted then fail('not_found', 'No automation ' .. id) end
-  local n = (st.next_manual or 0) + 1
-  local run_key, how, done = create_run(id, nil, 'm', string.format('%06d', n), function(state) state.next_manual = n end,
-    {by = caller.id, record = {key = op_key('run', caller.id, args.key), fingerprint = fingerprint},
-      reply = {run_key = run_prefix(id) .. 'm/' .. string.format('%06d', n)}})
+  local run_key, how, done = create_run(id, nil, 'm', nil, nil,
+    {by = caller.id, record = {key = op_key('run', caller.id, args.key), fingerprint = fingerprint}})
   if how == 'disabled' then fail('disabled', 'Automation ' .. id .. ' is disabled') end
   if how == 'not_found' then fail('not_found', 'No automation ' .. id) end
   if done and done.replayed then return done.replayed end
   pump()
   return {run_key = run_key}
 end
-
--- managed reads the automation and its state for a management change, and refuses a deleted
--- automation. commit_managed commits the change with if_rev on both rows, extra() (more writes)
--- and the saved reply: op.reply, or {id, rev} with the new automation revision.
-local function managed(id)
-  local auto, auto_rev = D.auto(id)
-  local st, st_rev = D.state(id)
-  if not auto or not st or auto.deleted or st.deleted then fail('not_found', 'No automation ' .. id) end
-  return auto, st, auto_rev, st_rev
-end
-local function commit_managed(id, auto, auto_rev, st, st_rev, op, extra)
-  local done = commit(function()
+-- change_managed commits a management change of one automation in one transaction: it reads the
+-- automation and its state (a deleted automation is refused), change(auto, st) changes them, and
+-- the commit writes both with the saved reply: op.reply, or {id, rev} with the new automation
+-- revision.
+local function change_managed(id, op, change)
+  local done = atomic(function()
+    local auto, auto_rev = D.auto(id)
+    local st, st_rev = D.state(id)
+    if not auto or not st or auto.deleted or st.deleted then fail('not_found', 'No automation ' .. id) end
+    change(auto, st)
     local rev = D.put_auto(id, auto_rev, auto)
     D.put_state(id, st_rev, st)
-    if extra then extra() end
     return op.reply or {id = id, rev = rev}
   end, {key = op.key, fingerprint = op.fingerprint})
-  if not done then return nil end
   mark(id)
   S.reconcile_due = true
   S.reconcile_at = nil
@@ -1329,8 +1324,7 @@ local function set_enabled(caller, args)
   local prior = replay('enable', caller, args.key, fingerprint)
   if prior then return prior end
   local id = text_arg(args.id, 'id', 32)
-  for _ = 1, 5 do
-    local auto, st, auto_rev, st_rev = managed(id)
+  return change_managed(id, {key = op_key('enable', caller.id, args.key), fingerprint = fingerprint}, function(auto, st)
     if args.enabled and not auto.enabled and auto.trigger.kind == 'file' then check_file_limit(id) end
     if auto.enabled ~= args.enabled then
       local t = now()
@@ -1339,43 +1333,34 @@ local function set_enabled(caller, args)
       if args.enabled and auto.trigger.kind == 'daily' then st.daily_base = slot(auto.trigger.at, t) or '' end
       auto.gen, auto.enabled, auto.updated_at = st.gen, args.enabled, t
     end
-    local result = commit_managed(id, auto, auto_rev, st, st_rev, {key = op_key('enable', caller.id, args.key), fingerprint = fingerprint})
-    if result then return result end
-  end
-  fail('unavailable', 'The automation changed during the change; try again')
+  end)
 end
 
 -- delete is the fence of B3: one commit marks the automation (the tombstone) and its state
 -- deleted, with a new gen. Every admission commit has if_rev on the state, so no new run, start or
 -- delivery of a queued run commits after it. The cleanup runs in later steps (cancel_step,
--- purge_step). The fence also deletes the preset row when it names this automation (with the
--- observed rev), so the preset can install again at once; purge_step never touches presets.
+-- purge_step). The fence also deletes the preset row when it names this automation, so the
+-- preset can install again at once; purge_step never touches presets.
 local function delete(caller, args)
   only(args, {id = true, key = true})
   local fingerprint = 'delete-v1/' .. canon({id = args.id})
   local prior = replay('delete', caller, args.key, fingerprint)
   if prior then return prior end
   local id = text_arg(args.id, 'id', 32)
-  for _ = 1, 5 do
-    local auto, st, auto_rev, st_rev = managed(id)
-    local extra
+  change_managed(id, {key = op_key('delete', caller.id, args.key), fingerprint = fingerprint, reply = {id = id, status = 'deleting'}}, function(auto, st)
     if auto.preset then
       local owner, p_rev = D.preset(auto.preset)
-      if owner == id then extra = function() D.delete_preset(auto.preset, p_rev) end end
+      if owner == id then D.delete_preset(auto.preset, p_rev) end
     end
     st.deleted = true
     st.gen = (st.gen or 0) + 1
     auto.deleted, auto.gen, auto.deleted_at, auto.deleted_by = true, st.gen, now(), caller.id
-    local result = commit_managed(id, auto, auto_rev, st, st_rev, {key = op_key('delete', caller.id, args.key), fingerprint = fingerprint,
-      reply = {id = id, status = 'deleting'}}, extra)
-    if result then return {id = id, status = 'deleting'} end
-  end
-  fail('unavailable', 'The automation changed during the delete; try again')
+  end)
+  return {id = id, status = 'deleting'}
 end
 
--- run_change applies a keyed change to one run. change(run, st, auto) changes the run and the
--- state, or refuses. The batch has if_rev on the run and on state/<id> (the fence), so a step
--- that moved the run or the state makes it read again.
+-- run_change applies a keyed change to one run, in one transaction with its reads. change(run, st,
+-- auto) changes the run and the state, or refuses.
 local MAX_DISMISSED = 10
 local function run_change(kind, caller, args, change)
   only(args, {run_key = true, key = true})
@@ -1385,24 +1370,19 @@ local function run_change(kind, caller, args, change)
   local run_key = text_arg(args.run_key, 'run_key', 1024)
   local id = run_key:match('^run/(%d+)/[dfm]/')
   if not id then fail('invalid_input', 'run_key is a run key from automations.runs') end
-  for _ = 1, 5 do
+  local done = atomic(function()
     local run, run_rev = D.run(run_key)
     if not run then fail('not_found', 'No run ' .. run_key) end
     local st, st_rev = D.state(id)
     if not st then fail('not_found', 'No automation ' .. id) end
     change(run, st, D.auto(id), run_key, id)
-    local done = commit(function()
-      D.put_run(run_key, run_rev, run)
-      D.put_state(id, st_rev, st)
-      return {run_key = run_key, status = run.status}
-    end, {key = op_key(kind, caller.id, args.key), fingerprint = fingerprint})
-    if done then
-      mark(id)
-      pump()
-      return done.replayed or done.reply
-    end
-  end
-  fail('unavailable', 'The run changed during the change; try again')
+    D.put_run(run_key, run_rev, run)
+    D.put_state(id, st_rev, st)
+    return {run_key = run_key, status = run.status}
+  end, {key = op_key(kind, caller.id, args.key), fingerprint = fingerprint})
+  mark(id)
+  pump()
+  return done.replayed or done.reply
 end
 
 -- retry is a new admission (design v2, B7): a failed, dismissed or cancelled run goes back to the
@@ -1524,7 +1504,7 @@ local function done(caller, args)
   if args.summary ~= nil and type(args.summary) ~= 'string' then fail('invalid_input', 'summary is text') end
   local id = run_key:match('^run/(%d+)/[dfm]/')
   if not id then fail('not_found', 'No run ' .. run_key) end
-  for _ = 1, 5 do
+  local done = atomic(function()
     -- done ends the run, so it takes a terminal sequence under the state fence.
     local run, run_rev = D.run(run_key)
     local st, st_rev = D.state(id)
@@ -1540,20 +1520,15 @@ local function done(caller, args)
       if over > 0 then run.summary = cut(run.summary, math.max(16, #run.summary - over - 8)) end
     end
     terminal(st, id, run)
-    local done = commit(function()
-      D.put_run(run_key, run_rev, run)
-      app.notice(run.agent, other_task(run.agent, run_key))
-      D.put_state(id, st_rev, st)
-      return {run_key = run_key, status = run.status}
-    end, {key = op_key('done', caller.id, args.key), fingerprint = fingerprint})
-    if done then
-      -- A delete cleanup can wait for this run.
-      mark(id)
-      pump()
-      return done.replayed or done.reply
-    end
-  end
-  fail('unavailable', 'The run changed during done; try again')
+    D.put_run(run_key, run_rev, run)
+    app.notice(run.agent, other_task(run.agent, run_key))
+    D.put_state(id, st_rev, st)
+    return {run_key = run_key, status = run.status}
+  end, {key = op_key('done', caller.id, args.key), fingerprint = fingerprint})
+  -- A delete cleanup can wait for this run.
+  mark(id)
+  pump()
+  return done.replayed or done.reply
 end
 
 local agent_handlers = {

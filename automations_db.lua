@@ -226,7 +226,21 @@ return function(A)
     T.counter = nil
     if ok then return out end
     if type(out) == 'table' and out.revision_conflict then return nil, out end
+    if type(out) == 'table' and out.abort then return nil, out.abort end
     error(out, 0)
+  end
+
+  -- abort(reason) ends the open commit with no write: commit answers nil and reason.
+  function M.abort(reason) error({abort = reason}, 0) end
+
+  -- atomic is commit for an operation that reads its rows in fn. The plugin has one open
+  -- transaction at a time (hub docs/sql.md, section 4), so no other commit can change the rows
+  -- between the read and the write, and a revision conflict is a defect. It answers the commit,
+  -- or nil and the reason of abort.
+  function M.atomic(fn, op)
+    local done, why = M.commit(fn, op)
+    if not done and type(why) == 'table' then fail('internal', 'A revision conflict in one transaction: ' .. tostring(why.what) .. ' ' .. tostring(why.key)) end
+    return done, why
   end
 
   return M

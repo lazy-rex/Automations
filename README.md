@@ -158,7 +158,8 @@ copies the hub.store records of the earlier version into the tables, one page at
 the copy is done, each tool answers `unavailable` ("importing") and the panel says so. A start on
 a database that the plugin does not recognize changes nothing and says why. The engine reads and
 writes the tables with SQL (`automations_db.lua`): one transaction for each engine step or
-operation, with its notices and its saved reply. The plan (`docs/sdk-port.md`) has the start states, the
+operation, with its notices and its saved reply. An operation reads its rows in its own
+transaction. The plan (`docs/sdk-port.md`) has the start states, the
 revision rules and the rollback procedure.
 
 ## Agents
@@ -230,6 +231,9 @@ cd ../../Automations && lazyrex-hub test
   start replays its key once.
 - large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits in one
   transaction, within the hub's transaction time; a failed page commit leaves no run and no marker.
+- transaction.lua: a failed commit of a create or of a manual run leaves no row, no revision
+  change and no saved reply, and the same key then makes the change once; manual runs take the
+  numbers 1 and 2 from the state, and a replay makes no run.
 - cutover.lua: the first start on an old store copies each record and saved reply exactly, with
   its rev, below the new revision counter, and the run columns equal the document; while the copy
   waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
