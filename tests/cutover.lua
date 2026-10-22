@@ -179,6 +179,7 @@ test('a delivery after the copy: the task and its notice commit together; a lost
   -- The delivery commit is held: the commits with this run key as a parameter are the creation
   -- (skip = 1) and then each try of the delivery, which fails until the test cancels it.
   local rk = manual(ids.a, (F.store('state/' .. ids.a).value.next_manual or 0) + 1)
+  local _, base = calls('none')
   local held = inject({match = {sql_commit_writes = 'runs', sql_param = rk}, skip = 1, fail = 'held delivery', fail_code = 'unavailable',
     times = 'always'})
   expect(alice:call('automations.run', {id = ids.a, key = 'cut-a-2'}).run_key).to_be(rk)
@@ -196,6 +197,13 @@ test('a delivery after the copy: the task and its notice commit together; a lost
   local seen = 0
   for _, t in ipairs(worker.pane:call('automations.read', {}).tasks) do if t.run_key == rk then seen = seen + 1 end end
   expect(seen).to_be(1)
+  -- The run, its delivery and its notice used no hub.store call: after the copy, no path reads or
+  -- writes the store, and the notice went through hub.sql (a store notify would be notices_moved).
+  for _, action in ipairs({'hub.store.batch', 'hub.store.get', 'hub.store.scan', 'hub.store.op'}) do
+    local list, reply = calls(action, {after = base.next})
+    expect(reply.dropped).to_be(false)
+    expect(#list).to_be(0)
+  end
   -- A lost reply: the commit happens, and the plugin gets an error. The run is delivered once.
   local lost = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'lost delivery reply', after = true, times = 1})
   local r2 = alice:call('automations.run', {id = ids.a, key = 'cut-a-3'})
