@@ -60,8 +60,10 @@ test('a mixed set over byte-limited pages: every run once, in phase order', func
   fault_release(gate)
 end)
 
--- 50 index entries whose run has another status (stale t/ entries, which the engine leaves alone
--- below 100 ended runs): the first page consumes 49 of them after the S read and returns no run.
+-- 50 terminal entries that the T phase skips: on SQL an entry is a run's t column, so these are
+-- 50 runs with a t/ entry and a status that is not terminal (queued, without a queue entry). In
+-- the store layout they were stale t/ entries of the done run. The first page consumes 49 of them
+-- after the S read and returns no run.
 test('a page of only skipped entries is empty and has next; the next page has the run', function()
   local id = automation('skipped')
   local run_key = run_now(id, 'skipped-1')
@@ -69,8 +71,12 @@ test('a page of only skipped entries is empty and has next; the next page has th
   F.worker(run.agent):call('automations.done', {run_key = run_key, attempt = run.attempt, key = 'skipped-done'})
   F.wait_status(run_key, 'done')
   local ops = {}
-  for n = 1, 50 do ops[n] = {key = string.format('t/%s/%012d', id, n), value = {run = run_key, seq = 0}} end
-  write(ops)
+  local task = F.run(run_key).task
+  for n = 1, 50 do
+    ops[n] = {key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), if_rev = '0', value = {v = 1, auto = id, kind = 'm',
+      k = string.format('%06d', 100 + n), status = 'queued', attempt = 0, starts = 0, task = task, t = string.format('t/%s/%012d', id, n), tseq = 0}}
+  end
+  F.write(ops)
   local one = alice:call('automations.runs', {id = id})
   expect(#one.runs).to_be(0)
   expect(one.next).to_be(string.format('T:t/%s/%012d', id, 49))
@@ -79,8 +85,8 @@ test('a page of only skipped entries is empty and has next; the next page has th
   expect(two.runs[1].run_key).to_be(run_key)
   expect(two.next).to_be(nil)
   local clean = {}
-  for n = 1, 50 do clean[n] = {key = string.format('t/%s/%012d', id, n), delete = true} end
-  write(clean)
+  for n = 1, 50 do clean[n] = {key = 'run/' .. id .. '/m/' .. string.format('%06d', 100 + n), delete = true} end
+  F.write(clean)
 end)
 
 test('the cursor crosses an empty phase: from the starting run to the queue', function()

@@ -60,16 +60,23 @@ local function cut(text, max)
   return text:sub(1, n) .. '…'
 end
 
+-- The sibling files (the Templates pattern): debug.getinfo gives the script's absolute path.
+local here = debug.getinfo(1, 'S').source:gsub('^@', '')
+local plugin_dir = assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute')
+-- The engine's storage is SQL (slice 2 cutover): the bridge gives it the store interface of
+-- today on the SQL tables. hub.store is read only by the copy (store_scan below).
+local bridge = dofile(plugin_dir .. '/automations_store.lua')({app = app, fail = fail})
+
 local function batch(ops, op)
   local request = {ops = ops, op = op}
   local n = size({type = 'request', id = 'control-0000000000', method = 'client.perform',
     payload = {client_id = hub_id, action = 'hub.store.batch', args = request, timeout_ms = 10000}})
   if n > REQUEST_BUDGET then fail('internal', 'A store batch is ' .. n .. ' bytes encoded; the budget is ' .. REQUEST_BUDGET) end
-  return hub('hub.store.batch', request)
+  return bridge.batch(request)
 end
 
 local function get(keys)
-  local records = hub('hub.store.get', {keys = keys}).records or {}
+  local records = bridge.get(keys)
   local out = {}
   for _, key in ipairs(keys) do
     local r = records[key]
@@ -80,12 +87,16 @@ local function get(keys)
 end
 local function get1(key) return get({key})[key] end
 
-local function scan(prefix, after, limit)
-  local page = hub('hub.store.scan', {prefix = prefix, after = after, limit = limit or 100})
+local function page_of(page)
   local keys = {}
   for key in pairs(page.records or {}) do keys[#keys + 1] = key end
   table.sort(keys)
   return keys, page.records or {}, page.next
+end
+local function scan(prefix, after, limit) return page_of(bridge.scan(prefix, after, limit)) end
+-- store_scan reads hub.store, for the copy only.
+local function store_scan(prefix, after, limit)
+  return page_of(hub('hub.store.scan', {prefix = prefix, after = after, limit = limit or 100}))
 end
 
 -- canon encodes a value with sorted object keys: the fingerprint of an operation's content.
@@ -310,7 +321,7 @@ local function op_key(kind, id, key) return kind .. '/' .. part(id) .. part(key)
 local function replay(kind, caller, key, fingerprint)
   text_arg(key, 'key', 128)
   for _, id in ipairs(caller.ids) do
-    local saved = hub('hub.store.op', {key = op_key(kind, id, key)})
+    local saved = bridge.op(op_key(kind, id, key))
     if saved.found then
       if saved.fingerprint ~= nil and saved.fingerprint ~= fingerprint then fail('conflict', 'The key ' .. key .. ' was used for other content') end
       return saved.result
@@ -1719,12 +1730,9 @@ local agent_handlers = {
   ['automations.read'] = read,
   ['automations.done'] = done,
 }
--- The panel and forms are a sibling file (the Templates pattern): debug.getinfo gives the
--- script's absolute path.
-local here = debug.getinfo(1, 'S').source:gsub('^@', '')
-local plugin_dir = assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute')
--- The SQL storage (slice 2): the schema and the import from hub.store. No path reads it yet.
-local sql = dofile(plugin_dir .. '/automations_sql.lua')({app = app, scan = scan, hub = hub})
+-- The SQL storage (slice 2): the schema and the copy from hub.store.
+local sql = dofile(plugin_dir .. '/automations_sql.lua')({app = app, fail = fail, scan = store_scan, hub = hub,
+  canonical = bridge.canonical, valid_counter = bridge.valid_counter})
 app.db.migrate(sql.migrations)
 local views = dofile(plugin_dir .. '/automations_view.lua')({
   fail = fail, hub = hub, get = get, get1 = get1, scan = scan, size = size, cut = cut, state_of = state_of, USER = USER,
@@ -1782,11 +1790,17 @@ local exports = {
       required = {'run_key', 'attempt', 'key'}, additionalProperties = false}},
 }
 
--- Each export is an SDK action without SQL and without SDK saved replies: the store engine and
--- its replay by key stay authoritative. A raised error keeps its code; any other error is internal.
+-- The gate (plan, "The cutover", point 2): until the copy is done, S.ready is false, and no entry
+-- point changes anything. S.not_ready is the text that the exports and the views give.
+S.not_ready = 'Starting: Automations is importing the automations'
+local function closed() fail('unavailable', S.not_ready) end
+
+-- Each export is an SDK action without SDK saved replies: the engine and its replay by key (the
+-- ops table) stay authoritative. A raised error keeps its code; any other error is internal.
 for _, e in ipairs(exports) do
   local handler = agent_handlers[e.name]
   app.action(e.name, e.args, function(ctx, args)
+    if not S.ready then closed() end
     args.key = ctx.key
     local ok, result = pcall(handler, caller_of(ctx), args)
     if ok then return result end
@@ -1796,19 +1810,29 @@ for _, e in ipairs(exports) do
 end
 
 -- The panel and the forms: raw views. The view module parses the routes and calls the handlers
--- above with the user as caller.
+-- above with the user as caller. tx = false: each batch is its own transaction, as in the engine,
+-- and no transaction spans a hub call.
 local view_handlers = {
-  render = function(_, args) return views.render(args).tree end,
-  ['view.action'] = function(_, args) return views.action(args) end,
+  render = function(_, args)
+    if not S.ready then return {title = 'Automations', nodes = {{id = 'not_ready', type = 'widget', text = S.not_ready}}} end
+    return views.render(args).tree
+  end,
+  ['view.action'] = function(_, args)
+    if not S.ready then closed() end
+    return views.action(args)
+  end,
 }
-app.view('/panels/automations*', view_handlers, {store = false})
-app.view('/forms/automation/*', view_handlers, {store = false})
+app.view('/panels/automations*', view_handlers, {store = false, tx = false})
+app.view('/forms/automation/*', view_handlers, {store = false, tx = false})
 app.command({id = 'automations', title = 'Automations…', description = 'List the automations and their runs, and add a preset', keywords = {'schedule', 'watch'},
   surface = 'panel', landing = true, route = '/panels/automations', user_only = 'navigation'})
 app.command({id = 'new_automation', title = 'New Automation…', description = 'Create an automation: a new file or a daily time starts an agent task',
   keywords = {'schedule', 'watch'}, route = '/forms/automation/new', action = 'automations.save'})
 
 app.on('hub.changed', function(args)
+  -- Before the copy is done, nothing: the start after it marks every automation, and its
+  -- reconcile drains each watch (the hub keeps the watch events).
+  if not S.ready then return end
   -- A worker change can finish a pending start or show a lost worker. The SDK replies after this
   -- function; the steps run in later callbacks.
   if args.what == 'workers' then
@@ -1824,45 +1848,61 @@ app.on('hub.changed', function(args)
   end
 end, {tx = false})
 
--- The import copies hub.store into the SQL tables one page at a time. Until the cutover it runs
--- only in a lab: the arg sql_import_file names a file, and the import starts at the first tick
--- after that file exists. Without the arg it never runs, and no path reads the tables. A failed
--- step tries again after RECHECK; a done import does nothing.
-local IMPORT_FILE = rex.args.sql_import_file
-local function import_step()
-  local ok, done = pcall(sql.import_step)
+-- The start (plan, "The cutover", points 1 to 3). The storage state picks one path: the copy
+-- from hub.store (on empty tables, or to resume it), SQL as it is (done), or a refusal with no
+-- write. The copy runs one step per callback; a failed step tries again after RECHECK. When the
+-- copy is done, the engine starts as at a start before the cutover.
+local function message(err) return type(err) == 'table' and tostring(err.message) or tostring(err) end
+local function open()
+  S.ready = true
+  -- A crash can come after a watch remove and before its markers retire: sweep them all once.
+  each_auto(function(id) mark(id); S.sweep[id] = true; S.prune[id] = true end)
+  S.last_sweep = wall()
+  tick()
+  ui_changed()
+end
+local function copy_step()
+  local ok, done = pcall(sql.copy_step)
   if not ok then
-    print('automations: import: ' .. (type(done) == 'table' and tostring(done.message) or tostring(done)))
-    rex.after(RECHECK, import_step)
+    print('automations: copy: ' .. message(done))
+    rex.after(RECHECK, copy_step)
   elseif not done then
-    rex.after(0, import_step)
+    rex.after(0, copy_step)
+  else
+    local open_ok, err = pcall(open)
+    if not open_ok then print('automations: startup: ' .. message(err)) end
   end
 end
-local function import_due()
-  if S.importing or not IMPORT_FILE then return end
-  local f = io.open(IMPORT_FILE, 'r')
-  if not f then return end
-  f:close()
-  S.importing = true
-  import_step()
+local function start()
+  local state, why = sql.state()
+  if state == nil then
+    S.not_ready = 'Automations cannot start: the storage state is not known (' .. why .. ')'
+    print('automations: refused: ' .. why)
+    return
+  end
+  if state == 'empty' then sql.begin(); state = 'copying' end
+  if state == 'copying' then rex.after(0, copy_step); return end
+  open()
 end
 
 -- Startup work is not in the main chunk: a catch there can split module-level locals.
 rex.after(0, function()
-  local ok, err = pcall(function()
-    -- Automations has no tab: a palette command and a side panel. The SDK registered first (its
-    -- start callback comes before this one).
-    hub('hub.ui.tabs', {tabs = {}})
-    S.ready = true
-    -- A crash can come after a watch remove and before its markers retire: sweep them all once.
-    each_auto(function(id) mark(id); S.sweep[id] = true; S.prune[id] = true end)
-    S.last_sweep = wall()
-    tick()
-  end)
-  if not ok then print('automations: startup: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end
+  local function attempt()
+    local ok, err = pcall(function()
+      -- Automations has no tab: a palette command and a side panel. The SDK registered first (its
+      -- start callback comes before this one).
+      hub('hub.ui.tabs', {tabs = {}})
+      start()
+    end)
+    if not ok then
+      print('automations: startup: ' .. message(err))
+      if not S.ready then rex.after(RECHECK, attempt) end
+    end
+  end
+  attempt()
   rex.every(TICK, function()
-    import_due()
+    if not S.ready then return end
     local tick_ok, tick_err = pcall(tick)
-    if not tick_ok then print('automations: tick: ' .. (type(tick_err) == 'table' and tostring(tick_err.message) or tostring(tick_err))) end
+    if not tick_ok then print('automations: tick: ' .. message(tick_err)) end
   end)
 end)

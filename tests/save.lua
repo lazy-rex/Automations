@@ -20,7 +20,7 @@ test('a title of 60 characters is accepted and its worker starts', function()
   for _, id in ipairs({ascii.id, wide.id}) do
     local manual = alice:call('automations.run', {id = id, key = 'title-run-' .. id})
     local run = wait('the run of ' .. id .. ' to finish its start', function()
-      local value = store(manual.run_key).value
+      local value = F.store(manual.run_key).value
       return value and (value.status == 'delivered' or value.status == 'failed') and value
     end, 20)
     expect(run.status).to_be('delivered')
@@ -29,11 +29,11 @@ end)
 
 -- The reviewer's case for 3b2cba7 (R2): save refuses it and stores nothing.
 test('a title of 61 characters is refused before anything is stored', function()
-  local before, next_id = count(), store('meta/next_id').rev
+  local before, next_id = count(), F.store('meta/next_id').rev
   expect_error(function() save('title-61', string.rep('t', 61)) end, 'invalid_input')
   expect_error(function() save('title-61-wide', string.rep('é', 61)) end, 'invalid_input')
   expect(count()).to_be(before)
-  expect(store('meta/next_id').rev).to_be(next_id)
+  expect(F.store('meta/next_id').rev).to_be(next_id)
 end)
 
 local function file_save(key, path, enabled)

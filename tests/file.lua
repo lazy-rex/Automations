@@ -16,8 +16,8 @@ end
 -- A new automation has gen 1, so its watch key is a-<id>-1 (B1).
 local function wkey(id) return 'a-' .. id .. '-1' end
 local function appearance(run) return run.run_key:match('/f/(.+)$') end
-local function marker(id, run) return store('seen/' .. id .. '/' .. appearance(run)) end
-local function retire(id, run) return store('rt/' .. id .. '/' .. appearance(run)) end
+local function marker(id, run) return F.store('seen/' .. id .. '/' .. appearance(run)) end
+local function retire(id, run) return F.store('rt/' .. id .. '/' .. appearance(run)) end
 
 local function names(runs)
   local out = {}

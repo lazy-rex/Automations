@@ -19,15 +19,15 @@ local function qkey(id, n) return string.format('q/%s/%012d', id, n) end
 local function run_now(id, key) return alice:call('automations.run', {id = id, key = key}).run_key end
 local function gone(id)
   return wait('automation ' .. id .. ' to be deleted', function()
-    return store('state/' .. id).rev == '0' and store('auto/' .. id).rev == '0'
+    return F.store('state/' .. id).rev == '0' and F.store('auto/' .. id).rev == '0'
   end, 30)
 end
 
 -- The reviewer's crash boundary for B3. Runs near the 12 KiB run budget (an 8 KiB encoded
 -- instruction and a 480-byte arg) fit about 4 to a cleanup batch, so 12 queued runs need several
 -- batches. A dropped spawn holds the first run in starting, so the others stay queued. A gate on
--- the third store batch (1: the fence, 2: the first cleanup batch) stops the cleanup between
--- batches; the hub crashes there. The hub keeps faults in memory, so the gate is gone after the
+-- the third SQL commit (one for each batch; 1: the fence, 2: the first cleanup batch) stops the
+-- cleanup between batches; the hub crashes there. The hub keeps faults in memory, so the gate is gone after the
 -- restart. This test is first in the file: no other automation makes batches during it.
 test('a crash between delete cleanup batches cancels every queued run once and delivers none', function()
   local id = automation('crash', {profile = 'tasked', args = {task = string.rep('t', 480)}}, string.rep('\1', 1365))
@@ -38,23 +38,23 @@ test('a crash between delete cleanup batches cancels every queued run once and d
   expect(F.wait_status(first, 'starting').starts).to_be(1)
   for n = 2, 13 do run_now(id, 'crash-' .. n) end
   for n = 2, 13 do
-    expect(store(manual(id, n)).value.status).to_be('queued')
-    expect(store(qkey(id, n)).value.run).to_be(manual(id, n))
+    expect(F.store(manual(id, n)).value.status).to_be('queued')
+    expect(F.store(qkey(id, n)).value.run).to_be(manual(id, n))
   end
-  local gate = fault({point = 'action', action = 'hub.store.batch', when = 'before', mode = 'gate', nth = 3})
+  local gate = fault({point = 'action', action = 'hub.sql.commit', when = 'before', mode = 'gate', nth = 3})
   expect(alice:call('automations.delete', {id = id, key = 'crash-delete'}).status).to_be('deleting')
   wait('the gated third batch', function() return fault_fired(gate) end, 10)
-  expect(store('auto/' .. id).value.deleted).to_be(true)
-  expect(store('state/' .. id).value.deleted).to_be(true)
+  expect(F.store('auto/' .. id).value.deleted).to_be(true)
+  expect(F.store('state/' .. id).value.deleted).to_be(true)
   local cancelled, queued = 0, 0
   for n = 2, 13 do
-    local run = store(manual(id, n)).value
+    local run = F.store(manual(id, n)).value
     if run.status == 'cancelled' then
       cancelled = cancelled + 1
-      expect(store(qkey(id, n)).rev).to_be('0')
+      expect(F.store(qkey(id, n)).rev).to_be('0')
     else
       expect(run.status).to_be('queued')
-      expect(store(qkey(id, n)).rev).not_to_be('0')
+      expect(F.store(qkey(id, n)).rev).not_to_be('0')
       queued = queued + 1
     end
   end
@@ -63,27 +63,27 @@ test('a crash between delete cleanup batches cancels every queued run once and d
   hub:restart({crash = true})
   wait('every queued run to be cancelled', function()
     for n = 2, 13 do
-      if store(manual(id, n)).value.status ~= 'cancelled' then return false end
+      if F.store(manual(id, n)).value.status ~= 'cancelled' then return false end
     end
     return true
   end, 30)
   for n = 2, 13 do
-    local run = store(manual(id, n)).value
+    local run = F.store(manual(id, n)).value
     expect(run.error).to_be('automation deleted')
     expect(run.agent).to_be(nil)
     expect(run.attempt).to_be(0)
-    expect(store(qkey(id, n)).rev).to_be('0')
+    expect(F.store(qkey(id, n)).rev).to_be('0')
   end
   expect(F.running('tasked')).to_be(0)
   -- The started run continues after the delete. Its start has no outcome; dismiss it, and the
   -- cleanup ends.
-  if store(first).value.status == 'starting' then
+  if F.store(first).value.status == 'starting' then
     F.set_clock(T0 + 601)
     F.wait_status(first, 'unknown_start')
     alice:call('automations.dismiss_start', {run_key = first, key = 'crash-dismiss'})
   end
   gone(id)
-  for n = 1, 13 do expect(store(manual(id, n)).rev).to_be('0') end
+  for n = 1, 13 do expect(F.store(manual(id, n)).rev).to_be('0') end
   F.set_clock(T0)
 end)
 
@@ -107,10 +107,10 @@ test('a delete during a pending start: the start delivers its run, and queued ru
   expect(#tasks).to_be(1)
   expect(tasks[1].run_key).to_be(first)
   rex.sleep(2)
-  expect(store('state/' .. id).rev).not_to_be('0')
+  expect(F.store('state/' .. id).rev).not_to_be('0')
   worker:call('automations.done', {run_key = first, attempt = 1, key = 'pending-done'})
   gone(id)
-  expect(store(first).rev).to_be('0')
+  expect(F.store(first).rev).to_be('0')
   expect(#F.workers('worker')).to_be(before + 1)
 end)
 
@@ -124,18 +124,18 @@ test('a worker loss after delete cancels the delivered runs and starts no worker
   expect(F.wait_status(b, 'delivered').agent).to_be(one.agent)
   alice:call('automations.delete', {id = id, key = 'loss-delete'})
   rex.sleep(2)
-  expect(store(a).value.status).to_be('delivered')
+  expect(F.store(a).value.status).to_be('delivered')
   local before = F.running('worker')
   -- Batches 1 and 2 cancel the two runs; the gate holds the purge, so the runs can be read.
-  local gate = fault({point = 'action', action = 'hub.store.batch', when = 'before', mode = 'gate', nth = 3})
+  local gate = fault({point = 'action', action = 'hub.sql.commit', when = 'before', mode = 'gate', nth = 3})
   expect(alice:hub('hub.stop', {spawn_id = one.spawn_id}).status).to_be('closed')
   wait('the gated purge', function() return fault_fired(gate) end, 20)
   for _, k in ipairs({a, b}) do
-    local run = store(k).value
+    local run = F.store(k).value
     expect(run.status).to_be('cancelled')
     expect(run.error).to_be('worker lost after delete')
     expect(run.attempt).to_be(1)
-    expect(store('box/' .. one.agent .. '/' .. k).rev).to_be('0')
+    expect(F.store('box/' .. one.agent .. '/' .. k).rev).to_be('0')
   end
   expect(notice(one.agent).pending).to_be(false)
   fault_release(gate)
@@ -155,12 +155,12 @@ test('delete of a file automation removes its watch, markers and runs', function
   local runs = F.wait_runs(alice, id, 1)
   local run = F.wait_status(runs[1].run_key, 'delivered')
   local marker = 'seen/' .. id .. '/' .. runs[1].run_key:match('/f/(.+)$')
-  expect(store(marker).rev).not_to_be('0')
+  expect(F.store(marker).rev).not_to_be('0')
   F.worker(run.agent):call('automations.done', {run_key = runs[1].run_key, attempt = 1, key = 'file-done'})
   alice:call('automations.delete', {id = id, key = 'file-delete'})
   gone(id)
-  expect(store(marker).rev).to_be('0')
-  expect(store(runs[1].run_key).rev).to_be('0')
+  expect(F.store(marker).rev).to_be('0')
+  expect(F.store(runs[1].run_key).rev).to_be('0')
   -- The watch is gone: a new file makes no run.
   F.put(dir .. '/b.md')
   rex.sleep(3)
@@ -197,7 +197,7 @@ test('retry queues a failed run again: a new spawn key after a start failure, at
   expect(run.starts).to_be(2)
   expect(run.attempt).to_be(1)
   expect(run.retries).to_be(1)
-  expect(store('state/' .. id).value.spawning).to_be(nil)
+  expect(F.store('state/' .. id).value.spawning).to_be(nil)
   expect_error(function() alice:call('automations.retry', {run_key = first, key = 'retry-delivered'}) end, 'not_retryable')
   local worker = F.worker(run.agent)
   worker:call('automations.done', {run_key = first, attempt = 1, key = 'retry-fail', outcome = 'failed', summary = 'No.'})
@@ -249,11 +249,11 @@ test('cancel of a queued run behind a start; the next run still goes; a delivere
   expect_error(function() alice:call('automations.cancel_run', {run_key = first, key = 'cancel-starting'}) end, 'not_cancellable')
   expect(alice:call('automations.cancel_run', {run_key = second, key = 'cancel-a'}).status).to_be('cancelled')
   expect(alice:call('automations.cancel_run', {run_key = second, key = 'cancel-a'}).status).to_be('cancelled')
-  expect(store(qkey(id, 2)).rev).to_be('0')
+  expect(F.store(qkey(id, 2)).rev).to_be('0')
   fault_release(gate)
   local one = F.wait_status(first, 'delivered')
   expect(F.wait_status(third, 'delivered').agent).to_be(one.agent)
-  expect(store(second).value.status).to_be('cancelled')
+  expect(F.store(second).value.status).to_be('cancelled')
   expect_error(function() alice:call('automations.cancel_run', {run_key = third, key = 'cancel-delivered'}) end, 'not_cancellable')
 end)
 
@@ -270,15 +270,15 @@ test('a start without an outcome for 10 minutes is unknown_start; dismiss lets t
   expect_error(function() alice:call('automations.dismiss_start', {run_key = first, key = 'dismiss-early'}) end, 'not_dismissable')
   F.set_clock(T0 + 601)
   F.wait_status(first, 'unknown_start')
-  expect(store(second).value.status).to_be('queued')
-  expect(store('state/' .. id).value.spawning.request.key).to_be(spawn_key(first))
+  expect(F.store(second).value.status).to_be('queued')
+  expect(F.store('state/' .. id).value.spawning.request.key).to_be(spawn_key(first))
   expect(alice:call('automations.dismiss_start', {run_key = first, key = 'dismiss'}).status).to_be('dismissed')
-  local run = store(first).value
+  local run = F.store(first).value
   expect(run.status).to_be('dismissed')
   expect(run.q).to_be(nil)
-  expect(store(qkey(id, 1)).rev).to_be('0')
+  expect(F.store(qkey(id, 1)).rev).to_be('0')
   expect(run.dismissed[1].key).to_be(spawn_key(first))
-  expect(store('state/' .. id).value.dismissed_spawn.key).to_be(spawn_key(first))
+  expect(F.store('state/' .. id).value.dismissed_spawn.key).to_be(spawn_key(first))
   local two = F.wait_status(second, 'delivered')
   expect(two.starts).to_be(1)
   expect_error(function() alice:call('automations.dismiss_start', {run_key = second, key = 'dismiss-delivered'}) end, 'not_dismissable')

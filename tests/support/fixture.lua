@@ -149,13 +149,212 @@ return function(H)
   -- size is the encoded size of a tree.
   function F.size(tree) return #rex.json.encode(tree) end
 
-  function F.run(key) return H.store(key).value end
+  -- The plugin's records in the layout of hub.store keys, on its SQL tables (the bridge,
+  -- automations_store.lua). F.store(key) reads a record as the harness store(key) did: {rev,
+  -- value}, rev '0' when absent. F.write(ops) writes records as the harness write(ops) did, with
+  -- if_rev and a new revision from meta.rev for each written row. It is for fixtures: each
+  -- statement is its own transaction. An index key (q/, t/, dv/, box/) has no row: F.write checks
+  -- that a run gives it after the other ops, and writes nothing for it.
+  local TABLES = {
+    {prefix = 'auto/', tbl = 'automations', col = 'id', strip = true},
+    {prefix = 'state/', tbl = 'states', col = 'id', strip = true},
+    {prefix = 'run/', tbl = 'runs', col = 'run_key'},
+    {prefix = 'preset/', tbl = 'presets', col = 'name', strip = true},
+    {prefix = 'seen/', tbl = 'seen', col = 'key'},
+    {prefix = 'rt/', tbl = 'retired', col = 'key'},
+  }
+  local function table_of(key)
+    for _, t in ipairs(TABLES) do
+      if key:sub(1, #t.prefix) == t.prefix then return t, t.strip and key:sub(#t.prefix + 1) or key end
+    end
+    error('no table for the key ' .. key, 3)
+  end
+  local function index_of(key) local k = key:match('^(%a+)/') if k == 'q' or k == 't' or k == 'dv' or k == 'box' then return k end end
+  local RUN_COLS = 'run_key, automation_id, rev, status, q, t, agent, doc'
+  local function giver(key)
+    local kind = index_of(key)
+    if kind == 'q' or kind == 't' then return H.sql('SELECT ' .. RUN_COLS .. ' FROM runs WHERE ' .. kind .. ' = ?', {key})[1] end
+    if kind == 'dv' then
+      local id, run_key = key:match('^dv/([^/]+)/(run/.+)$')
+      return H.sql('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND automation_id = ? AND status = 'delivered'", {run_key, id})[1]
+    end
+    local agent, run_key = key:match('^box/([^/]+)/(run/.+)$')
+    return H.sql('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND agent = ? AND status = 'delivered'", {run_key, agent})[1]
+  end
+  function F.store(key)
+    if key == 'meta/next_id' then
+      local n, r = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1], H.sql("SELECT value FROM meta WHERE name = 'next_id_rev'")[1]
+      if not n then return {rev = '0'} end
+      return {rev = r and r.value or '0', value = {n = tonumber(n.value)}}
+    end
+    local kind = index_of(key)
+    if kind then
+      local row = giver(key)
+      if not row then return {rev = '0'} end
+      local run = rex.json.decode(row.doc)
+      local value = ({q = {run = row.run_key}, t = {run = row.run_key, seq = run.tseq}, dv = {agent = row.agent},
+        box = {attempt = run.attempt, auto = row.automation_id}})[kind]
+      return {rev = row.rev, value = value}
+    end
+    local t, k = table_of(key)
+    local cols = t.tbl == 'presets' and 'rev, automation_id' or 'rev, doc'
+    local row = H.sql('SELECT ' .. cols .. ' FROM ' .. t.tbl .. ' WHERE ' .. t.col .. ' = ?', {k})[1]
+    if not row then return {rev = '0'} end
+    return {rev = row.rev, value = t.tbl == 'presets' and {id = row.automation_id} or rex.json.decode(row.doc)}
+  end
+  -- sql_write tries again while the plugin has an open transaction (busy).
+  local function sql_write(sql, params)
+    for _ = 1, 100 do
+      local ok, r = pcall(H.sql_write, sql, params)
+      if ok then return r end
+      if not tostring(type(r) == 'table' and r.code or r):find('busy') then error(r, 0) end
+      rex.sleep(0.05)
+    end
+    error('the SQL database stays busy', 2)
+  end
+  local function increment(r)
+    local i = #r
+    while i > 0 and r:sub(i, i) == '9' do i = i - 1 end
+    if i == 0 then return '1' .. string.rep('0', #r) end
+    return r:sub(1, i - 1) .. string.char(r:byte(i) + 1) .. string.rep('0', #r - i)
+  end
+  -- reserve takes the next n values of meta.rev with one compare and set, so a plugin commit
+  -- between the read and the write never gives one revision twice.
+  local function reserve(n)
+    if n == 0 then return {} end
+    for _ = 1, 100 do
+      local cur = H.sql("SELECT value FROM meta WHERE name = 'rev'")[1].value
+      local list, v = {}, cur
+      for i = 1, n do v = increment(v); list[i] = v end
+      if sql_write("UPDATE meta SET value = ? WHERE name = 'rev' AND value = ?", {v, cur}).changes == 1 then return list end
+    end
+    error('meta.rev changes too often', 2)
+  end
+  local function null(v) if v == nil then return {null = true} end return tostring(v) end
+  -- statements turns one record op into SQL statements {sql, params}. rev is the new revision: a
+  -- value, or {expr = <SQL expression>} for statements that take it from meta.rev when they run.
+  local function statements(o, rev)
+    local r, rp = '?', rev
+    if type(rev) == 'table' then r, rp = rev.expr, nil end
+    local function with(list, ...)
+      local out = {}
+      for _, v in ipairs(list) do
+        if v == '<rev>' then if rp ~= nil then out[#out + 1] = rp end else out[#out + 1] = v end
+      end
+      return out
+    end
+    if o.key == 'meta/next_id' then
+      return {{"INSERT INTO meta (name, value) VALUES ('next_id', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", {tostring(o.value.n)}},
+        {"INSERT INTO meta (name, value) VALUES ('next_id_rev', " .. r .. ") ON CONFLICT (name) DO UPDATE SET value = excluded.value", with({'<rev>'})}}
+    end
+    local t, k = table_of(o.key)
+    if o.delete then return {{'DELETE FROM ' .. t.tbl .. ' WHERE ' .. t.col .. ' = ?', {k}}} end
+    if t.tbl == 'runs' then
+      local v = o.value
+      return {{'INSERT INTO runs (run_key, automation_id, rev, status, q, t, agent, doc) VALUES (?, ?, ' .. r .. ', ?, ?, ?, ?, ?) '
+        .. 'ON CONFLICT (run_key) DO UPDATE SET rev = excluded.rev, status = excluded.status, q = excluded.q, t = excluded.t, '
+        .. 'agent = excluded.agent, doc = excluded.doc',
+        with({k, k:match('^run/([^/]+)/'), '<rev>', tostring(v.status), null(v.q), null(v.t), null(v.agent), rex.json.encode(v)})}}
+    end
+    if t.tbl == 'presets' then
+      return {{'INSERT INTO presets (name, rev, automation_id) VALUES (?, ' .. r .. ', ?) ON CONFLICT (name) DO UPDATE SET rev = excluded.rev, '
+        .. 'automation_id = excluded.automation_id', with({k, '<rev>', tostring(o.value.id)})}}
+    end
+    return {{'INSERT INTO ' .. t.tbl .. ' (' .. t.col .. ', rev, doc) VALUES (?, ' .. r .. ', ?) ON CONFLICT (' .. t.col .. ') '
+      .. 'DO UPDATE SET rev = excluded.rev, doc = excluded.doc', with({k, '<rev>', rex.json.encode(o.value)})}}
+  end
+  function F.write(ops)
+    for _, o in ipairs(ops) do
+      if o.if_rev ~= nil then
+        local cur = F.store(o.key).rev
+        if cur ~= o.if_rev then error({code = 'conflict', message = 'record ' .. o.key .. ' is at rev ' .. cur}, 2) end
+      end
+    end
+    -- The statements of one table merge into one statement (many VALUES rows, or IN for deletes),
+    -- in the order that the ops name the tables. So the plugin never sees a half-written table, as
+    -- the harness store write was one batch.
+    local indexes, n = {}, 0
+    for _, o in ipairs(ops) do
+      if index_of(o.key) then indexes[#indexes + 1] = o elseif not o.delete then n = n + 1 end
+    end
+    local revs, r = reserve(n), 0
+    local groups, order = {}, {}
+    for _, o in ipairs(ops) do
+      if not index_of(o.key) then
+        local rev
+        if not o.delete then r = r + 1; rev = revs[r] end
+        for _, st in ipairs(statements(o, rev)) do
+          local g = groups[st[1]]
+          if not g then g = {sql = st[1], rows = {}}; groups[st[1]] = g; order[#order + 1] = g end
+          g.rows[#g.rows + 1] = st[2]
+        end
+      end
+    end
+    for _, g in ipairs(order) do
+      local head, tuple, tail = g.sql:match('^(.- VALUES )(%b())(.*)$')
+      local del = g.sql:match('^(DELETE FROM .- WHERE [%w_]+) = %?$')
+      local sql, params = g.sql, {}
+      if #g.rows > 1 and head then
+        local tuples = {}
+        for i = 1, #g.rows do tuples[i] = tuple end
+        sql = head .. table.concat(tuples, ', ') .. tail
+      elseif #g.rows > 1 and del then
+        local marks = {}
+        for i = 1, #g.rows do marks[i] = '?' end
+        sql = del .. ' IN (' .. table.concat(marks, ', ') .. ')'
+      elseif #g.rows > 1 then
+        error('F.write cannot merge ' .. g.sql, 2)
+      end
+      for _, row in ipairs(g.rows) do for _, p in ipairs(row) do params[#params + 1] = p end end
+      sql_write(sql, params)
+    end
+    for _, o in ipairs(indexes) do
+      local given = F.store(o.key)
+      if o.delete and given.rev ~= '0' then error('F.write: a run still gives ' .. o.key, 2) end
+      if not o.delete and given.rev == '0' then error('F.write: no run gives ' .. o.key, 2) end
+    end
+  end
+  -- sql_ops gives the statements of record ops (no if_rev; index ops are left out: the runs
+  -- carry them) as {sql, params}. They take their revisions from meta.rev when they run, and
+  -- move it, all in the injection's transaction.
+  local function sql_ops(ops)
+    local out, n = {}, 0
+    for _, o in ipairs(ops) do
+      if not index_of(o.key) then
+        local rev
+        if not o.delete then
+          n = n + 1
+          rev = {expr = "CAST(CAST((SELECT value FROM meta WHERE name = 'rev') AS INTEGER) + " .. n .. " AS TEXT)"}
+        end
+        for _, s in ipairs(statements(o, rev)) do out[#out + 1] = {sql = s[1], params = s[2]} end
+      end
+    end
+    out[#out + 1] = {sql = "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + " .. n .. " AS TEXT) WHERE name = 'rev'"}
+    return out
+  end
+  -- F.inject_begin(ops, spec) commits record ops as another writer when the plugin next begins a
+  -- transaction (inject{match = {sql_begin = true}, sql = ...}). It calls hub.test.inject itself:
+  -- the harness inject() of hub 26c751d does not pass sql on.
+  function F.inject_begin(ops, spec)
+    spec = spec or {}
+    return H.hub('hub.test.inject', {plugin = 'automations', match = {sql_begin = true}, sql = sql_ops(ops), skip = spec.skip,
+      times = spec.times}).id
+  end
+
+  function F.run(key) return F.store(key).value end
   function F.wait_status(key, status, timeout)
     return H.wait('run ' .. key .. ' to be ' .. status, function()
-      local run = H.store(key).value
+      local run = F.store(key).value
       return run and run.status == status and run
     end, timeout or 20)
   end
+
+  -- The plugin's first start copies hub.store (empty in a new lab) into the SQL tables; until the
+  -- copy is done, every export answers unavailable. Each file starts after it.
+  H.wait('the first copy', function()
+    local r = H.sql("SELECT value FROM meta WHERE name = 'import'")[1]
+    return r and r.value == 'cutover-1:done'
+  end, 30)
 
   return F
 end

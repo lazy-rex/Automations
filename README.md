@@ -59,8 +59,8 @@ automation's cleanup never removes a newer install.
 
 ## How a run reaches an agent
 
-The plugin does not use Messaging. A run goes into the worker's task box (a record in this
-plugin's store), and the same store batch sets a hub notice for the worker. The hub writes the
+The plugin does not use Messaging. A run goes into the worker's task box (a delivered run in
+this plugin's SQL tables), and the same transaction sets a hub notice for the worker. The hub writes the
 notice text into the worker's pane when the worker is ready. The worker reads its tasks with
 `automations.read` and completes each one with `automations.done`.
 
@@ -149,8 +149,17 @@ automation's state record, in the same batch, so a clock change cannot reorder t
 removes the run from that order; when the run ends again, it is the newest. Active runs are never
 pruned, and pruning never deletes a file marker, so a pruned file run cannot come again.
 
-This store layout came before the first release: a lab store from an earlier commit needs a fresh
-store.
+## Storage
+
+The plugin keeps its data in its own SQL database (hub.sql), in one table for each entity
+(automations, states, runs, presets, file markers, operation replies). Each row has its record as
+a JSON document, and the fields that queries need as columns. The first start of this version
+copies the hub.store records of the earlier version into the tables, one page at a time; until
+the copy is done, each tool answers `unavailable` ("importing") and the panel says so. A start on
+a database that the plugin does not recognize changes nothing and says why. The engine still uses
+a store interface over the tables (`automations_store.lua`, a temporary adapter); SDK port plan
+slice 3 replaces it with direct SQL. The plan (`docs/sdk-port.md`) has the start states, the
+revision rules and the rollback procedure.
 
 ## Agents
 
@@ -170,8 +179,10 @@ The tests are Lua files in `tests/`. `lazyrex-hub test` runs them against the re
 isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No test touches your
 own Rex server.
 
-Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`). It needs a hub with the SDK
-launcher (hub 0ae7451, lab branch `hub/sql-r2`; not on hub main yet) and its `sdk/lua`.
+Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql. It needs a hub
+with the SDK launcher, hub.sql, the store fence and the SQL test hooks (lab branch `hub/sql-lab`
+26c751d or later; not on hub main yet), and an `sdk/lua` with the block join (ffa583f or later;
+with an older SDK, the two long-list tests of save.lua fail in the SDK).
 
 ```sh
 cd ../LazyRex/hub && go build -o ~/bin/lazyrex-hub ./cmd/hub
@@ -187,7 +198,7 @@ cd ../../Automations && lazyrex-hub test
   after its removal is acknowledged, also after a lost ack reply and a crash; a run over the budget
   fails without the path; a backlog of 120 files gives 120 runs.
 - lifecycle.lua: a hub crash between delete cleanup batches (near-limit runs, a gate on the third
-  store batch) cancels every queued run once and delivers none; a delete during a pending start
+  SQL commit) cancels every queued run once and delivers none; a delete during a pending start
   delivers that run and cancels the queued ones; a worker loss after delete cancels and starts no
   worker; a deleted file automation loses its watch, markers and runs; a deleted automation is not
   listed and refuses changes; retry after a start failure (new spawn key) and an agent failure
@@ -215,11 +226,14 @@ cd ../../Automations && lazyrex-hub test
   4000-byte instruction and full args fits the budget.
 - pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
   turns: no automation delivers its whole backlog before another delivers its first run.
-- sql_import.lua (needs hub.sql: lab branch `hub/sql-r2` f6f1a03 or later; the lab-only arg
-  `sql_import_file` starts the import): the import copies each store record and saved reply
-  exactly, with its rev, and the run columns equal the document; a failed page commit keeps the
-  page before it and its cursor, and the import resumes after a crash; after a lost commit reply
-  it goes on from the committed cursor; a run that meets another on its terminal entry stops it.
+- cutover.lua: the first start on an old store copies each record and saved reply exactly, with
+  its rev, below the new revision counter, and the run columns equal the document; while the copy
+  waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
+  replays under the identity and under a legacy ID, and the next ID is new; a delivery commits its
+  task and notice together, also after a failed commit and a lost reply; the revision counter
+  refuses at the int64 maximum and on a malformed value with no change; each unknown start state
+  refuses with no write, and a start on a done copy keeps the SQL changes; a crash during the copy
+  resumes from its cursor.
 - presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in

@@ -42,7 +42,7 @@ local function restarted(id, run_key)
   expect(run.status).to_be('starting')
   expect(run.starts).to_be(2)
   expect(run.restarted).to_be(spawn_key(run_key, 1))
-  local sp = store('state/' .. id).value.spawning
+  local sp = F.store('state/' .. id).value.spawning
   expect(sp.auto).to_be(true)
   expect(sp.request.key).to_be(spawn_key(run_key, 2))
 end
@@ -67,9 +67,9 @@ test('two not_created starts fail the run; Retry gets a new admission and starts
   expect(listed(id, run_key).restarted).to_be(spawn_key(run_key, 1))
   expect(run.dismissed).to_be(nil)
   expect(run.q).to_be(nil)
-  expect(store(q).rev).to_be('0')
-  expect(store('state/' .. id).value.spawning).to_be(nil)
-  expect(store(run.t).value.run).to_be(run_key)
+  expect(F.store(q).rev).to_be('0')
+  expect(F.store('state/' .. id).value.spawning).to_be(nil)
+  expect(F.store(run.t).value.run).to_be(run_key)
   -- The hub lists both starts as failed, and no worker of them runs.
   expect(#F.workers('worker')).to_be(before + 2)
   expect(count_not_created()).to_be(2)
@@ -79,7 +79,7 @@ test('two not_created starts fail the run; Retry gets a new admission and starts
   local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 3)})
   alice:call('automations.retry', {run_key = run_key, key = 'two-retry'})
   wait('the gated third start', function() return fault_fired(gate) end, 10)
-  local sp = store('state/' .. id).value.spawning
+  local sp = F.store('state/' .. id).value.spawning
   expect(sp.request.key).to_be(spawn_key(run_key, 3))
   expect(sp.auto).to_be(nil)
   fault_release(gate)
@@ -127,7 +127,7 @@ test('a not_created start, then another failure: the run fails with no third sta
   expect(run.starts).to_be(2)
   expect(run.restarted).to_be(spawn_key(run_key, 1))
   expect(run.error:sub(1, 11) ~= 'not_created').to_be(true)
-  expect(store('state/' .. id).value.spawning).to_be(nil)
+  expect(F.store('state/' .. id).value.spawning).to_be(nil)
   rex.sleep(3)
   expect(#F.workers('worker')).to_be(before + 2)
   expect(F.running('worker')).to_be(running)
@@ -144,7 +144,7 @@ test('a lost reply of the retry batch: the stored request /2 starts once', funct
   run_now(id, 'lost-run')
   wait('the gated first start', function() return fault_fired(g1) end, 10)
   local f1 = fault({point = 'spawn-create', mode = 'fail-sending', op = spawn_key(run_key, 1)})
-  local lost = fault({point = 'action', action = 'hub.store.batch', when = 'after', mode = 'lose-reply'})
+  local lost = fault({point = 'action', action = 'hub.sql.commit', when = 'after', mode = 'lose-reply'})
   local g2 = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 2)})
   fault_release(g1)
   wait('the gated second start', function() return fault_fired(g2) end, 20)
@@ -189,11 +189,11 @@ test('a delete while start 1 waits: not_created gives no second start, and the c
   run_now(id, 'delete-run')
   wait('the gated first start', function() return fault_fired(g1) end, 10)
   alice:call('automations.delete', {id = id, key = 'delete-delete'})
-  expect(store('state/' .. id).value.deleted).to_be(true)
+  expect(F.store('state/' .. id).value.deleted).to_be(true)
   local f1 = fault({point = 'spawn-create', mode = 'fail-sending', op = spawn_key(run_key, 1)})
   fault_release(g1)
   wait('the purge', function()
-    return store('auto/' .. id).rev == '0' and store('state/' .. id).rev == '0' and store(run_key).rev == '0'
+    return F.store('auto/' .. id).rev == '0' and F.store('state/' .. id).rev == '0' and F.store(run_key).rev == '0'
   end, 30)
   expect(fault_fired(f1)).to_be(true)
   expect(#F.workers('worker')).to_be(before + 1)
@@ -214,10 +214,10 @@ test('an unknown_start run whose start fails as not_created is starting again wi
   local g1 = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 1)})
   run_now(id, 'unknown-run')
   wait('the gated first start', function() return fault_fired(g1) end, 10)
-  local rec = store(run_key)
+  local rec = F.store(run_key)
   expect(rec.value.status).to_be('starting')
   rec.value.status = 'unknown_start'
-  write({{key = run_key, if_rev = rec.rev, value = rec.value}})
+  F.write({{key = run_key, if_rev = rec.rev, value = rec.value}})
   local f1 = fault({point = 'spawn-create', mode = 'fail-sending', op = spawn_key(run_key, 1)})
   local g2 = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 2)})
   fault_release(g1)

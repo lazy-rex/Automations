@@ -32,19 +32,19 @@ test('a daily run starts one worker, which reads and completes its task', functi
   local id = daily('first', 'save-first', 3)
   local before = #F.workers('worker')
   local run_key = 'run/' .. id .. '/d/2026-11-03'
-  expect(store(run_key).rev).to_be('0')
+  expect(F.store(run_key).rev).to_be('0')
   F.set_clock(F.at(2026, 11, 3, 9, 1))
   local run = F.wait_status(run_key, 'delivered')
   expect(run.attempt).to_be(1)
   expect(run.starts).to_be(1)
   expect(run.task.instruction).to_be('Check the vault for first.')
   expect(#F.workers('worker')).to_be(before + 1)
-  local st = store('state/' .. id).value
+  local st = F.store('state/' .. id).value
   expect(st.worker.agent_id).to_be(run.agent)
   expect(st.daily_high).to_be('2026-11-03')
   expect(st.spawning).to_be(nil)
   -- One box entry and the notice intent.
-  expect(store('box/' .. run.agent .. '/' .. run_key).value.attempt).to_be(1)
+  expect(F.store('box/' .. run.agent .. '/' .. run_key).value.attempt).to_be(1)
   expect(notice(run.agent).pending).to_be(true)
 
   local worker = F.worker(run.agent)
@@ -57,9 +57,9 @@ test('a daily run starts one worker, which reads and completes its task', functi
 
   local finished = worker:call('automations.done', {run_key = run_key, attempt = 1, key = 'done-first', summary = 'All good.'})
   expect(finished.status).to_be('done')
-  expect(store(run_key).value.status).to_be('done')
-  expect(store(run_key).value.summary).to_be('All good.')
-  expect(store('box/' .. run.agent .. '/' .. run_key).rev).to_be('0')
+  expect(F.store(run_key).value.status).to_be('done')
+  expect(F.store(run_key).value.summary).to_be('All good.')
+  expect(F.store('box/' .. run.agent .. '/' .. run_key).rev).to_be('0')
   expect(notice(run.agent).pending).to_be(false)
   expect(#worker:call('automations.read', {}).tasks).to_be(0)
   -- A replay of done with the same key gives the same result and changes nothing.
@@ -84,7 +84,7 @@ test('a second run goes to the running worker, not to a new one', function()
   expect(second.agent).to_be(first.agent)
   expect(#F.workers('worker')).to_be(count)
   -- A manual run does not move the daily schedule.
-  expect(store('state/' .. id).value.daily_high).to_be('2026-11-05')
+  expect(F.store('state/' .. id).value.daily_high).to_be('2026-11-05')
   local tasks = worker:call('automations.read', {}).tasks
   expect(#tasks).to_be(2)
   -- One done leaves the other task, so the notice stays pending.
@@ -120,7 +120,7 @@ test('done from another agent or for another attempt is refused and changes noth
   expect_error(function() alice:call('automations.done', {run_key = run_key, attempt = 1, key = 'alice-done'}) end, 'stale_delivery')
   local worker = F.worker(run.agent)
   expect_error(function() worker:call('automations.done', {run_key = run_key, attempt = 2, key = 'wrong-attempt'}) end, 'stale_delivery')
-  expect(store(run_key).value.status).to_be('delivered')
+  expect(F.store(run_key).value.status).to_be('delivered')
   expect(#alice:call('automations.read', {}).tasks).to_be(0)
   worker:call('automations.done', {run_key = run_key, attempt = 1, key = 'done-fence'})
   off(id, 'off-fence')

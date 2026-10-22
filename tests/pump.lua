@@ -40,7 +40,7 @@ test('three backlogs that are ready at once deliver in turns', function()
   for _, id in ipairs(ids) do
     for n = 2, BACKLOG + 1 do
       F.wait_status(manual(id, n), 'delivered', 60)
-      local rev = store('dv/' .. id .. '/' .. manual(id, n)).rev
+      local rev = F.store('dv/' .. id .. '/' .. manual(id, n)).rev
       expect(rev).not_to_be('0')
       if not first[id] or below(rev, first[id]) then first[id] = rev end
       if not last[id] or below(last[id], rev) then last[id] = rev end
