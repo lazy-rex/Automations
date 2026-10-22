@@ -233,9 +233,15 @@ that slice starts right after the cutover is approved on the branch.
    - `if_rev` on a derived record: `'0'` holds when no run before the batch gives it; another
      value holds when the run that gives it has that revision;
    - a batch write of a derived record holds when the run after the batch gives exactly that
-     value; a delete holds when no run after the batch gives it. Else the batch fails with
-     `conflict` and writes nothing. So a batch that deletes a run and its index records holds, and
-     a batch that writes an index record with no matching run fails;
+     value; a delete of `dv/` or `box/` holds when no run after the batch gives it. Else the batch
+     fails (`internal`, an engine rule is broken) and writes nothing. So a batch that deletes a run
+     and its index records holds, and a batch that writes an index record with no matching run
+     fails;
+   - a delete of a `q/` or `t/` entry that a run still gives after the batch clears that run's
+     column and document field, with a new revision. This is the store meaning: the entry goes,
+     the run stays, and the run is no longer in the queue or the terminal order. The purge needs
+     it: it deletes the `t/` entries of a deleted automation before its runs (observed in the
+     lab: without it, the purge batch failed again at each step);
    - a stale index record (an entry with no run that gives it) cannot exist in SQL. The prune step
      deletes such entries today; on the bridge that delete holds with no change;
    - `{notify = {agent, pending}}` becomes `app.notice(agent, pending)` in the same transaction;
