@@ -320,10 +320,12 @@ Progress:
      and backlog tests prove them, not the row count alone.
 - 3e: a commit is bounded by rows: a watch page (50 rows, at most 100 writes), 20 cancelled runs,
   50 purged rows, 50 pruned runs. The hub limits are per statement (64 KiB for one request; a run
-  is at most 12 KiB) and per transaction (5 s idle, 10 s in total; hub docs/sql.md, section 4), so
-  the bound is the number of statements. Proof: tests/large_page.lua (one page of 50 runs of more
-  than 8000 bytes each, about 100 statements), the 120-file backlog (file.lua) and the large
-  documents of retention.lua. The 48 KiB request measure, `fits` and the byte accounting go.
+  is at most 12 KiB) and per transaction (5 s idle, 10 s in total; hub docs/sql.md, section 4). The row counts
+  limit the work of one commit; a statement count alone does not prove its time. The tests run
+  these counts under the hub time limits: tests/large_page.lua (one page of 50 runs of more than
+  8000 bytes each, about 100 statements, committed in one transaction; observed 2 s from the retry
+  release to the commit, on hub/sql-lab 8510d50), the 120-file backlog (file.lua), the 41-run
+  delete crash (lifecycle.lua) and the large documents of retention.lua. The 48 KiB request measure, `fits` and the byte accounting go.
 
 ### Rollback
 
