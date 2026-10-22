@@ -149,8 +149,8 @@ return function(H)
   -- size is the encoded size of a tree.
   function F.size(tree) return #rex.json.encode(tree) end
 
-  -- The plugin's records in the layout of hub.store keys, on its SQL tables (the bridge,
-  -- automations_store.lua). F.store(key) reads a record as the harness store(key) did: {rev,
+  -- The plugin's records in the layout of hub.store keys, on its SQL tables (the layout
+  -- of the slice 1 version). F.store(key) reads a record as the harness store(key) did: {rev,
   -- value}, rev '0' when absent. F.write(ops) writes records as the harness write(ops) did, with
   -- if_rev and a new revision from meta.rev for each written row. It is for fixtures: each
   -- statement is its own transaction. An index key (q/, t/, dv/, box/) has no row: F.write checks

@@ -156,9 +156,9 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
 a JSON document, and the fields that queries need as columns. The first start of this version
 copies the hub.store records of the earlier version into the tables, one page at a time; until
 the copy is done, each tool answers `unavailable` ("importing") and the panel says so. A start on
-a database that the plugin does not recognize changes nothing and says why. The engine still uses
-a store interface over the tables (`automations_store.lua`, a temporary adapter); SDK port plan
-slice 3 replaces it with direct SQL. The plan (`docs/sdk-port.md`) has the start states, the
+a database that the plugin does not recognize changes nothing and says why. The engine reads and
+writes the tables with SQL (`automations_db.lua`): one transaction for each engine step or
+operation, with its notices and its saved reply. The plan (`docs/sdk-port.md`) has the start states, the
 revision rules and the rollback procedure.
 
 ## Agents
@@ -169,7 +169,7 @@ The exports are agent tools: `automations.save`, `automations.list`, `automation
 `automations.done`. A list page can be empty and still have `next`: follow `next` until it is
 absent. `automations.list` with `deleted = true` also lists the deleting automations.
 `automations.runs` gives the starting run first, then the delivered, queued and ended runs (the
-newest end first); its cursor is the last index entry that a page read. Each
+newest end first); its cursor is the last position that a page read. Each
 mutation takes `key`: a retry with the same key and content gives the same result; the same key
 with other content is a conflict.
 

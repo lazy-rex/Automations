@@ -12,7 +12,7 @@
 --   /forms/automation/delete/<id>                         the delete confirmation
 -- A profile picker page takes &profiles_after=<id>.
 return function(A)
-  local fail, hub, get, get1, scan, size, cut, state_of = A.fail, A.hub, A.get, A.get1, A.scan, A.size, A.cut, A.state_of
+  local fail, hub, D, size, cut = A.fail, A.hub, A.D, A.size, A.cut
   local USER, BUDGET = A.USER, A.PAGE_BUDGET
   local PANEL_PAGE, PROFILE_PAGE, RUNS_PAGE = 20, 50, 20
   local LABEL, DETAIL = 60, 200
@@ -76,8 +76,8 @@ return function(A)
   -- --- The panel ---
 
   -- panel_item reads, for one automation: the spawning run, the queue size (up to 21, shown as
-  -- 20+) and the run that ended last. The state comes from one get for the page, so a page of 20
-  -- makes at most 2 + 3 * 20 reads, plus the presets get.
+  -- 20+) and the run that ended last, after its state: a page of 20 makes at most 1 + 4 * 20
+  -- reads, plus the preset reads.
   local function panel_item(auto, st, listed)
     local id = auto.id
     local lines = {}
@@ -92,7 +92,7 @@ return function(A)
     end
     local sp = type(st.spawning) == 'table' and st.spawning.run or nil
     local status = auto.deleted and 'deleting' or (auto.enabled and 'on' or 'off')
-    local sprun = sp and state_of(get1(sp)) or nil
+    local sprun = sp and D.run(sp) or nil
     if sprun and sprun.status == 'unknown_start' then
       lines[#lines + 1] = 'Needs action: a worker start has no outcome. Open it to dismiss the start.'
       status = 'needs action'
@@ -103,19 +103,16 @@ return function(A)
     local queued = A.queue_size(id, 21) - (sp and 1 or 0)
     if queued > 0 then lines[#lines + 1] = 'Queued: ' .. (queued >= 20 and '20+' or tostring(queued)) .. ' runs.' end
     local lr = A.last_run(id)
-    if lr then lines[#lines + 1] = 'Last run: ' .. tostring(lr.value.status) .. ' (' .. when(lr.value.done_at or lr.value.at) .. ')' end
+    if lr then lines[#lines + 1] = 'Last run: ' .. tostring(lr.status) .. ' (' .. when(lr.done_at or lr.at) .. ')' end
     return {id = id, label = auto.name .. (auto.deleted and ' (deleting)' or ''), detail = table.concat(lines, '\n'), status = status,
       action = nav('open', 'Open…')}
   end
 
   local function preset_items()
-    local keys = {}
-    for _, n in ipairs(A.PRESET_NAMES) do keys[#keys + 1] = A.preset_key(n) end
-    local recs = get(keys)
     local items = {}
     for _, n in ipairs(A.PRESET_NAMES) do
-      local p, installed = A.PRESETS[n], state_of(recs[A.preset_key(n)])
-      items[#items + 1] = {id = n, label = p.name, detail = installed and ('Installed as automation ' .. tostring(installed.id) .. '.') or p.about,
+      local p, installed = A.PRESETS[n], D.preset(n)
+      items[#items + 1] = {id = n, label = p.name, detail = installed and ('Installed as automation ' .. tostring(installed) .. '.') or p.about,
         action = nav('add', 'Add…', installed == nil)}
     end
     return items
@@ -125,30 +122,22 @@ return function(A)
   -- when an item does not fit the budget.
   local function panel_page(after, room)
     if after ~= nil and (after:sub(1, 5) ~= 'auto/' or #after > 64) then fail('invalid_input', 'after is an automation key') end
-    local keys, records, more = scan('auto/', after, PANEL_PAGE)
-    local skeys = {}
-    for _, k in ipairs(keys) do
-      if type(records[k].value) == 'table' then skeys[#skeys + 1] = 'state/' .. records[k].value.id end
-    end
-    local states = #skeys > 0 and get(skeys) or {}
+    local page, more = D.autos(after and after:sub(6), PANEL_PAGE)
     local listed = {}
     for _, w in ipairs(hub('hub.watch.list').watches or {}) do listed[w.key] = w end
     local P = {items = {}, used = room, last = after}
-    for _, k in ipairs(keys) do
-      local auto = records[k].value
-      if type(auto) == 'table' then
-        local item = panel_item(auto, state_of(states['state/' .. auto.id]) or {}, listed)
-        local n = size(item) + 1
-        if P.used + n > BUDGET then
-          if P.last == after then fail('too_large', 'Automation ' .. auto.id .. ' is too large for the panel') end
-          return P.items, P.last
-        end
-        P.items[#P.items + 1] = item
-        P.used = P.used + n
+    for _, a in ipairs(page) do
+      local item = panel_item(a.value, D.state(a.key) or {}, listed)
+      local n = size(item) + 1
+      if P.used + n > BUDGET then
+        if P.last == after then fail('too_large', 'Automation ' .. a.key .. ' is too large for the panel') end
+        return P.items, P.last
       end
-      P.last = k
+      P.items[#P.items + 1] = item
+      P.used = P.used + n
+      P.last = 'auto/' .. a.key
     end
-    if type(more) == 'string' and more ~= '' then return P.items, P.last end
+    if more then return P.items, P.last end
     return P.items, nil
   end
 
@@ -173,8 +162,8 @@ return function(A)
   -- --- One automation ---
 
   local function load_auto(id)
-    local recs = get({'auto/' .. id, 'state/' .. id})
-    return state_of(recs['auto/' .. id]), recs['auto/' .. id].rev, state_of(recs['state/' .. id]) or {}
+    local auto, rev = D.auto(id)
+    return auto, rev, D.state(id) or {}
   end
 
   local RETRYABLE = {failed = true, dismissed = true, cancelled = true}
@@ -377,9 +366,9 @@ return function(A)
     if p then
       local preset = A.PRESETS[p]
       if not preset then fail('invalid_input', 'No preset ' .. p) end
-      local installed = state_of(get1(A.preset_key(p)))
+      local installed = D.preset(p)
       local warnings = {}
-      if installed then warnings[1] = {id = 'installed', type = 'widget', text = 'Preset ' .. p .. ' is installed as automation ' .. tostring(installed.id) .. '.'} end
+      if installed then warnings[1] = {id = 'installed', type = 'widget', text = 'Preset ' .. p .. ' is installed as automation ' .. tostring(installed) .. '.'} end
       local t = preset.trigger
       return {title = 'Add ' .. preset.name, base = base, keep = {}, profile = q.profile, preset = p, warnings = warnings,
         values = {name = preset.name, kind = t.kind, path = t.path, glob = t.glob, at = t.at, cwd = preset.cwd, instruction = preset.instruction}}

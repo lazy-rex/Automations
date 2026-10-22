@@ -295,6 +295,29 @@ Progress:
   (`Q:q/...`, `T:t/...`, `D:dv/<id>/<run key>`, `box/<agent>/<run key>`).
 - The third row (run writes with `WHERE rev = ?`) moves to 3b: each run write commits with the
   state fence in one batch, so the run and state writes leave the bridge together.
+- 3b to 3d are one commit (reviewer, 2026-10-22): each engine batch mixes tables (a run, its
+  state fence, a marker, a notice, a saved reply), so a step for one table needs a mixed adapter.
+  `automations_db.lua` replaces the bridge, with these rules (the reviewer's corrections):
+  1. The counter: a commit reads `meta.rev` once and checks it (canonical decimal, at most the
+     int64 maximum). Each write takes the next value with the exact text increment, and the
+     commit writes the counter back once, guarded by the value that it read. At the maximum the
+     write fails and the commit rolls back, the counter too. Tests: a malformed value, a value
+     above the maximum, the maximum, and a later write of a commit that finds the maximum.
+  2. Typed functions for each table (`auto`, `put_auto`, `state`, `put_state`, `run`, `put_run`,
+     `preset`, `put_preset`, `marker`, `put_marker`, `put_retired`, the next ID, and the deletes).
+     No key-prefix dispatch and no record envelope: a read answers the value and its revision.
+  3. `commit(fn, op)` is one transaction: the revision checks, the writes, the notices
+     (`app.notice`) and the saved reply. A revision conflict rolls back every write and the
+     counter, and the caller reads again. An operation key with another fingerprint fails
+     `conflict` (a retry cannot pass); it is not a revision conflict.
+  4. The if_rev rules are those of the bridge: a write with `'0'` holds only for a new row, and
+     another value only for the row at that revision (an UPDATE, so a missing row is a conflict);
+     no if_rev writes in any case. A delete without if_rev also holds for a missing row; with
+     `'0'` it holds only when the row does not exist. The replay reads `ops` under every ID of the
+     caller, so an imported reply under a legacy ID still replays.
+  5. 3e (a separate commit) changes the byte bounds of a page of writes to row counts. The row
+     counts must fit the hub transaction limits for valid maximum-size records: the large-record
+     and backlog tests prove them, not the row count alone.
 
 ### Rollback
 

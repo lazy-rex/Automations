@@ -235,6 +235,22 @@ test('the revision counter refuses at the int64 maximum and changes nothing', fu
   sql_write("UPDATE meta SET value = ? WHERE name = 'rev'", {'0123'})
   expect_error(function() save('bad-1') end, 'internal')
   expect(same(counts(), before)).to_be(true)
+  -- A value above the maximum, and text that is not a number, refuse too.
+  for i, bad in ipairs({'9223372036854775808', '12a'}) do
+    sql_write("UPDATE meta SET value = ? WHERE name = 'rev'", {bad})
+    expect_error(function() save('bad-' .. (i + 1)) end, 'internal')
+    expect(same(counts(), before)).to_be(true)
+    expect(meta('rev')).to_be(bad)
+  end
+  -- A commit whose later write finds the maximum rolls back its earlier writes and the counter:
+  -- from MAX - 2, a save takes two revisions, and its third write fails.
+  local next_id = meta('next_id')
+  sql_write("UPDATE meta SET value = ? WHERE name = 'rev'", {'9223372036854775805'})
+  err = expect_error(function() save('max-3') end, 'internal')
+  expect(err.message).to_match('maximum')
+  expect(same(counts(), before)).to_be(true)
+  expect(meta('rev')).to_be('9223372036854775805')
+  expect(meta('next_id')).to_be(next_id)
   -- The counter stays at the maximum: a lower value could give a revision again. The crash test
   -- after this one copies again and takes a new R.
   sql_write("UPDATE meta SET value = ? WHERE name = 'rev'", {MAX_REV})

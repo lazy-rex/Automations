@@ -2,9 +2,9 @@
 -- 2026-10-22: the target schema of release 4). Each record value of the hub.store layout stays one
 -- JSON document. The fields that queries need are extra columns, and only the write functions set
 -- them, from the document, in the same statement. This module has the schema and the copy from
--- hub.store; the runtime writes are in the bridge (automations_store.lua).
+-- hub.store; the runtime reads and writes are in automations_db.lua.
 -- Load it with dofile(...)(A): A.app (the SDK app), A.fail, A.scan (the hub.store scan of the
--- plugin), A.hub (the plugin's hub call), A.canonical and A.valid_counter (from the bridge).
+-- plugin), A.hub (the plugin's hub call), A.canonical and A.valid_counter (from automations_db.lua).
 return function(A)
   local db, fail = A.app.db, A.fail
   local M = {}
