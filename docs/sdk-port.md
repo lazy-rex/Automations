@@ -81,8 +81,9 @@ later cutover (slice 2): no release has SQL reads beside store writes.
   launcher (`boot.lua`, hub 0ae7451 on the lab branch `hub/sql-r2`), which puts the SDK in
   `package.path`. The plugin has no path setup of its own. Until the launcher is live, slice 1 runs
   in a lab only (slice 1 is 6fb8b4a, approved for its branch).
-- Removed: `client.keymap`, `hub.register`, the `exports` table, the dispatch and `agent_caller`'s
-  `hub.identify` call. Measured at the end of the slice.
+- Removed: `client.keymap`, `hub.register`, the dispatch, `client.set_label` and the `hub.identify`
+  call of the caller. The `exports` table stays as the source of the names, schemas, titles and
+  descriptions. Measured: `automations.lua` 1849 to 1840 lines.
 
 ## The SQL schema (slice 2: document tables)
 
