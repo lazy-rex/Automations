@@ -170,6 +170,9 @@ The tests are Lua files in `tests/`. `lazyrex-hub test` runs them against the re
 isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No test touches your
 own Rex server.
 
+Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`). It needs a hub with the SDK
+launcher (hub 0ae7451, lab branch `hub/sql-r2`; not on hub main yet) and its `sdk/lua`.
+
 ```sh
 cd ../LazyRex/hub && go build -o ~/bin/lazyrex-hub ./cmd/hub
 cd ../../Automations && lazyrex-hub test

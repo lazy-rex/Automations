@@ -8,8 +8,12 @@
 -- fields (a closure write to a captured local can be lost after a caught error); the main chunk
 -- catches no error (startup work runs in rex.after(0)); complex values go into a local before a
 -- generic for; no swap assignment.
-local hub_id = assert(rex.args.hub_client_id, 'hub_client_id is required')
-local instance_id = assert(rex.args.instance_id, 'instance_id is required')
+--
+-- The LazyRex Plugin SDK (hub sdk/lua) does the registration and the dispatch. The hub starts the
+-- plugin through the SDK launcher (manifest "sdk": "0"), which puts the SDK in package.path. The
+-- store engine, its replay and the hub calls below stay the plugin's own (SDK port plan, slice 1).
+local app = require('lazyrex').plugin('automations')
+local hub_id = app.hub_id
 
 local function fail(code, message) error({code = code, message = message}, 0) end
 
@@ -283,18 +287,17 @@ end
 -- (read, done) belongs to the agent that holds the delivery. caller.ids are every ID of the agent:
 -- its identity and the legacy IDs it took over.
 local USER = {id = 'user', ids = {'user'}}
-local function agent_caller(pid)
-  if type(pid) ~= 'number' or pid <= 0 or pid % 1 ~= 0 then fail('refused', 'A positive requester PID is required') end
-  local r = hub('hub.identify', {pid = pid})
-  if r.found ~= true or type(r.agent) ~= 'string' or r.agent == '' then fail('refused', 'The hub does not recognize this agent') end
-  local ids = {r.agent}
-  for _, l in ipairs(type(r.legacy) == 'table' and r.legacy or {}) do
+-- The SDK identifies an agent caller (hub.identify): ctx.agent and its legacy IDs in ctx.aliases.
+local function caller_of(ctx)
+  if ctx.user then return USER end
+  local ids = {ctx.agent}
+  for _, l in ipairs(type(ctx.aliases) == 'table' and ctx.aliases or {}) do
     if type(l) == 'string' and l ~= '' then ids[#ids + 1] = l end
   end
   for _, id in ipairs(ids) do
     if #id > 128 or id:find('[%c/]') then fail('refused', 'An ID of this agent has a slash or control characters, or is over 128 bytes') end
   end
-  return {id = r.agent, ids = ids}
+  return {id = ctx.agent, ids = ids}
 end
 local function holds(caller, agent)
   for _, id in ipairs(caller.ids) do if id == agent then return true end end
@@ -1775,66 +1778,54 @@ local exports = {
       required = {'run_key', 'attempt', 'key'}, additionalProperties = false}},
 }
 
-local actions, export_names = {}, {}
+-- Each export is an SDK action without SQL and without SDK saved replies: the store engine and
+-- its replay by key stay authoritative. A raised error keeps its code; any other error is internal.
 for _, e in ipairs(exports) do
-  export_names[#export_names + 1] = e.name
-  actions[#actions + 1] = {name = e.name, kind = 'client', title = e.title, description = e.description, args = e.args}
+  local handler = agent_handlers[e.name]
+  app.action(e.name, e.args, function(ctx, args)
+    args.key = ctx.key
+    local ok, result = pcall(handler, caller_of(ctx), args)
+    if ok then return result end
+    if type(result) == 'table' and type(result.code) == 'string' then error(result, 0) end
+    fail('internal', tostring(result))
+  end, {tx = false, store = false, title = e.title, description = e.description})
 end
-for _, name in ipairs({'view.render', 'view.action', 'view.seen', 'hub.changed'}) do
-  actions[#actions + 1] = {name = name, kind = 'client', title = name, args = {type = 'object', additionalProperties = true}}
-end
--- Only the hub can assert the original caller of a forwarded export.
-actions[#actions + 1] = {name = 'hub.forward', kind = 'client', title = 'Forward an agent action',
-  args = {type = 'object', properties = {action = {type = 'string'}, args = {type = 'object'}, requester_pid = {type = 'integer'}},
-    required = {'action', 'args', 'requester_pid'}, additionalProperties = false}}
-rex.call('client.keymap', {actions = actions})
-hub('hub.register', {plugin = 'automations', instance_id = instance_id, exports = export_names, commands = {
-  {id = 'automations', title = 'Automations…', description = 'List the automations and their runs, and add a preset', keywords = {'schedule', 'watch'},
-    surface = 'panel', landing = true, route = '/panels/automations', user_only = 'navigation'},
-  {id = 'new_automation', title = 'New Automation…', description = 'Create an automation: a new file or a daily time starts an agent task',
-    keywords = {'schedule', 'watch'}, route = '/forms/automation/new', action = 'automations.save'}}})
--- Automations has no tab: a palette command and a side panel.
-hub('hub.ui.tabs', {tabs = {}})
 
-rex.on('client_perform_requested', function(ctx, ev)
-  local call_id = ev.call_id
-  local ok, result = pcall(function()
-    if not ev.requester or ev.requester.client_id ~= hub_id then fail('refused', 'Only the hub calls this plugin') end
-    local args = ev.args or {}
-    if ev.action == 'hub.forward' then
-      local handler = agent_handlers[args.action]
-      if not handler then fail('refused', 'The forwarded action is not exported') end
-      return handler(agent_caller(args.requester_pid), type(args.args) == 'table' and args.args or {})
-    end
-    if ev.action == 'view.render' then return views.render(args) end
-    if ev.action == 'view.action' then return views.action(args) end
-    if ev.action == 'hub.changed' then
-      -- A worker change can finish a pending start or show a lost worker. Reply first; the steps
-      -- run in later callbacks.
-      if args.what == 'workers' then
-        each_auto(function(id) mark(id); S.retry_at[id] = nil end)
-        pump()
-        ui_changed()
-      end
-      -- A watch nudge: drain that automation's watch. The drain reads the watch_id from the
-      -- reconcile, so a nudge for an old watch_id changes nothing.
-      if args.what == 'watch' and type(args.key) == 'string' then
-        local owner = watch_owner(args.key)
-        if owner then drain_later(owner); pump() end
-      end
-      return {}
-    end
-    if ev.action == 'view.seen' then return {} end
-    fail('not_supported', 'Unknown action ' .. tostring(ev.action))
-  end)
-  rex.call('client.reply', {call_id = call_id, result = ok and result or nil,
-    error = not ok and (type(result) == 'table' and result or {code = 'internal', message = tostring(result)}) or nil})
-end)
-rex.call('client.set_label', {label = 'lazyrex-plugin:automations'})
+-- The panel and the forms: raw views. The view module parses the routes and calls the handlers
+-- above with the user as caller.
+local view_handlers = {
+  render = function(_, args) return views.render(args).tree end,
+  ['view.action'] = function(_, args) return views.action(args) end,
+}
+app.view('/panels/automations*', view_handlers, {store = false})
+app.view('/forms/automation/*', view_handlers, {store = false})
+app.command({id = 'automations', title = 'Automations…', description = 'List the automations and their runs, and add a preset', keywords = {'schedule', 'watch'},
+  surface = 'panel', landing = true, route = '/panels/automations', user_only = 'navigation'})
+app.command({id = 'new_automation', title = 'New Automation…', description = 'Create an automation: a new file or a daily time starts an agent task',
+  keywords = {'schedule', 'watch'}, route = '/forms/automation/new', action = 'automations.save'})
+
+app.on('hub.changed', function(args)
+  -- A worker change can finish a pending start or show a lost worker. The SDK replies after this
+  -- function; the steps run in later callbacks.
+  if args.what == 'workers' then
+    each_auto(function(id) mark(id); S.retry_at[id] = nil end)
+    pump()
+    ui_changed()
+  end
+  -- A watch nudge: drain that automation's watch. The drain reads the watch_id from the
+  -- reconcile, so a nudge for an old watch_id changes nothing.
+  if args.what == 'watch' and type(args.key) == 'string' then
+    local owner = watch_owner(args.key)
+    if owner then drain_later(owner); pump() end
+  end
+end, {tx = false})
 
 -- Startup work is not in the main chunk: a catch there can split module-level locals.
 rex.after(0, function()
   local ok, err = pcall(function()
+    -- Automations has no tab: a palette command and a side panel. The SDK registered first (its
+    -- start callback comes before this one).
+    hub('hub.ui.tabs', {tabs = {}})
     S.ready = true
     -- A crash can come after a watch remove and before its markers retire: sweep them all once.
     each_auto(function(id) mark(id); S.sweep[id] = true; S.prune[id] = true end)

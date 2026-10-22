@@ -1,6 +1,7 @@
 {
  "name": "automations",
  "main": "automations.lua",
+ "sdk": "0",
  "notice": "Automation task. Call automations_read.",
  "test": {
   "agents": [
