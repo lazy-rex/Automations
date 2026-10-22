@@ -175,15 +175,15 @@ that slice starts right after the cutover is approved on the branch.
    | State at start | Path |
    |---|---|
    | every table empty | write `cutover-1:copying` and the cursor `1:`, then copy |
-   | `cutover-1:copying` | resume the copy from its committed cursor |
-   | `cutover-1:done` | open SQL: the engine starts on the tables |
-   | the lab import layout: no `meta.import`, the meta names are a subset of `imported` (value `store`), `import_cursor` and `next_id` | delete every row of every table in one transaction, then as "every table empty" |
-   | any other state: another or newer version, another state word, rows without `meta.import` that are not the lab layout | refuse to start: no write; each export answers `unavailable` ("the storage state is not known"); views show that text; the log names the state |
+   | `cutover-1:copying` with a valid cursor (`<n>:<key>`, n from 1 to the step count) | resume the copy from its committed cursor |
+   | `cutover-1:done` with `meta.rev` (a decimal string) and `meta.next_id` | open SQL: the engine starts on the tables |
+   | any other state: rows without `meta.import` (also the lab import layout), another or newer version, another state word, a bad cursor, `done` without its metadata | refuse to start: no write; each export answers `unavailable` ("the storage state is not known"); views show that text; the log names the state |
 
-   Only the layout of the lab import (f962e2b, never on main) is rebuilt. A damaged marker or a
-   future version never makes the plugin copy the old store again. Tests: each row of the table,
-   and a restart after SQL-only changes (a save and a delivery after `done`) that keeps them and
-   does not copy again.
+   The plugin never deletes rows at start. A database with rows and no valid marker is damaged
+   state, and the plugin refuses it. A lab with the tables of the lab import (f962e2b, never on
+   main) is reset outside the plugin (the test harness empties the tables). Tests: each row of the
+   table, and a restart after SQL-only changes (a save and a delivery after `done`) that keeps
+   them and does not copy again.
 2. **No other writer during the copy.** Every entry point checks one gate (`S.ready`), and the
    copy sets it only after `done`:
    - exports: `unavailable` ("starting: importing the automations");
@@ -207,7 +207,8 @@ that slice starts right after the cutover is approved on the branch.
    (stored request, no result) replays its key after `done` and gives one worker.
 3. **The copy.** The approved import steps. Then one store batch writes `meta/cutover` and gives
    its revision R. The last SQL transaction sets `meta.rev = R`, `meta.next_id` and
-   `cutover-1:done`. A crash between the two writes the marker again (a later R) at the next start.
+   `cutover-1:done`. A lost store reply or a crash between the two writes the marker again at the
+   next try, and gives a later R. A later R is correct: no SQL runtime write happens before `done`.
    Then the engine starts, as at a start today.
 4. **The bridge** (temporary adapter, see the inventory below). It gives the store interface of
    today (`get`, `get1`, `scan`, `batch` with `if_rev`, the op records) on the SQL tables:
@@ -217,7 +218,12 @@ that slice starts right after the cutover is approved on the branch.
      store gave (R is the store's own next revision). Each written row takes the next value, as
      each written store record does today. The counter is a decimal string; SQLite adds one in
      64-bit integers (`CAST(CAST(value AS INTEGER) + 1 AS TEXT)`), so Lua never holds it as a
-     number. No revision is used twice, and an imported revision keeps its text;
+     number. Before each increment, the bridge compares the counter text with the int64 maximum
+     (`9223372036854775807`; length, then text). At the maximum it fails the batch (`internal`),
+     before SQLite can give a REAL, and the transaction rolls back with no row changed. No
+     revision is used twice, and an imported revision keeps its text. Tests: the boundary (a
+     counter one below the maximum gives one write, then the refusal with no change), and R after
+     a lost store reply;
    - `if_rev` is checked in the transaction: the row's `rev` equal, or the row absent for `'0'`;
    - the derived index records (`q/`, `t/`, `dv/`, `box/`) have no row. A derived record exists
      when a run has that column value (`q`, `t`; `dv` and `box` for a delivered run with its
@@ -246,8 +252,8 @@ that slice starts right after the cutover is approved on the branch.
 7. **Tests.** All 20 files run on the cutover version. The harness store calls (`store()`,
    `write()`, `inject` on store batches) change to SQL (`sql()`, `sql_write()`, the commit
    faults); the assertions stay. New, besides the tests in 1 to 4:
-   - a crash during the copy resumes from its committed cursor and copies each record once; only
-     the lab import layout is rebuilt;
+   - a crash during the copy resumes from its committed cursor and copies each record once; a
+     database with rows and no valid marker refuses to start and changes nothing;
    - an old Run now key replays from `ops` under the identity and under a legacy ID. When it
      passes, the lazy `hub.store.op` lookup goes; until then it stays;
    - a delivery: the task and its notice commit together; a failed commit has neither; a lost
