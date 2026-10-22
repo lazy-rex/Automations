@@ -286,6 +286,16 @@ bridge; slice 3 follows as a plugin release.
 After 3e the plugin has no call to `hub.store.*`, except the copy steps of the import, which
 slice 4 deletes when no install can be older than the cutover.
 
+Progress:
+
+- 3a (branch sdk-slice3) did the first two rows. The engine reads the queue, the terminal order
+  and the deliveries with queries on the runs columns (`run_page` in automations.lua), and its
+  batches have no index ops. The bridge rules for derived records (point 4 above) are deleted,
+  with the q/t delete rule and its test. The runs and read cursors keep their form
+  (`Q:q/...`, `T:t/...`, `D:dv/<id>/<run key>`, `box/<agent>/<run key>`).
+- The third row (run writes with `WHERE rev = ?`) moves to 3b: each run write commits with the
+  state fence in one batch, so the run and state writes leave the bridge together.
+
 ### Rollback
 
 Code rollback alone is not a rollback. At hub f6f1a03, the first SQL commit with a notice writes

@@ -4,8 +4,8 @@
 -- Load it with dofile(...)(A): A.app (the SDK app), A.fail.
 --
 -- Record keys: auto/<id>, state/<id>, run/<id>/..., preset/<name>, seen/..., rt/... and
--- meta/next_id name a row. The index keys q/, t/, dv/ and box/ have no row: a run gives them
--- (its q or t column, or a delivered status with its agent), and their rev is the run's rev.
+-- meta/next_id name a row. The engine reads the queue, the terminal order and the deliveries from
+-- the runs table itself (slice 3a).
 return function(A)
   local db, fail = A.app.db, A.fail
   local encode, decode = rex.json.encode, rex.json.decode
@@ -61,7 +61,6 @@ return function(A)
       if key:sub(1, #t.prefix) == t.prefix then return t, t.strip and key:sub(#t.prefix + 1) or key end
     end
   end
-  local function index_of(key) local kind = key:match('^(%a+)/') if kind == 'q' or kind == 't' or kind == 'dv' or kind == 'box' then return kind end end
 
   local function doc_of(t, row)
     if t.tbl == 'presets' then return {id = row.automation_id} end
@@ -69,55 +68,12 @@ return function(A)
   end
   local function columns(t) return t.tbl == 'presets' and 'name, rev, automation_id' or (t.col .. ', rev, doc') end
 
-  -- The run that gives an index key, as the tables are now (inside the batch: after its writes).
-  -- INDEX_COLS are the columns of an index record: never the document, so a page of index
-  -- records stays small, as the store's index records were (a run document is up to 12 KiB, and
-  -- one hub.sql reply holds about 1 MB: 100 runs with full documents can need two replies, and a
-  -- short page then stops the prune). RUN_COLS add the document, for the run that gives one key.
-  local INDEX_COLS = "run_key, automation_id, rev, status, q, t, agent, json_extract(doc, '$.tseq') AS tseq, "
-    .. "json_extract(doc, '$.attempt') AS attempt"
-  local RUN_COLS = INDEX_COLS .. ', doc'
-  local function giver(key)
-    local kind = index_of(key)
-    if kind == 'q' then return db.first('SELECT ' .. RUN_COLS .. ' FROM runs WHERE q = ?', key) end
-    if kind == 't' then return db.first('SELECT ' .. RUN_COLS .. ' FROM runs WHERE t = ?', key) end
-    if kind == 'dv' then
-      local id, run_key = key:match('^dv/([^/]+)/(run/.+)$')
-      if not id then return nil end
-      return db.first('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND automation_id = ? AND status = 'delivered'", run_key, id)
-    end
-    local agent, run_key = key:match('^box/([^/]+)/(run/.+)$')
-    if not agent then return nil end
-    return db.first('SELECT ' .. RUN_COLS .. " FROM runs WHERE run_key = ? AND agent = ? AND status = 'delivered'", run_key, agent)
-  end
-  -- The value of an index record, from the run that gives it (the values of today's records).
-  local function index_value(kind, row)
-    if kind == 'q' then return {run = row.run_key} end
-    if kind == 't' then return {run = row.run_key, seq = tonumber(row.tseq)} end
-    if kind == 'dv' then return {agent = row.agent} end
-    return {attempt = tonumber(row.attempt), auto = row.automation_id}
-  end
-
-  local function same(a, b)
-    if type(a) ~= type(b) then return false end
-    if type(a) ~= 'table' then return a == b end
-    for k, v in pairs(a) do if not same(v, b[k]) then return false end end
-    for k in pairs(b) do if a[k] == nil then return false end end
-    return true
-  end
-
   -- record answers {rev, value} for a key, or {rev = '0'} when it does not exist.
   local function record(key)
     if key == 'meta/next_id' then
       local n, r = db.first("SELECT value FROM meta WHERE name = 'next_id'"), db.first("SELECT value FROM meta WHERE name = 'next_id_rev'")
       if not n then return {rev = '0'} end
       return {rev = r and r.value or '0', value = {n = tonumber(n.value)}}
-    end
-    local kind = index_of(key)
-    if kind then
-      local row = giver(key)
-      if not row then return {rev = '0'} end
-      return {rev = row.rev, value = index_value(kind, row)}
     end
     local t, k = table_of(key)
     if not t then fail('internal', 'The bridge has no table for the key ' .. key) end
@@ -134,7 +90,7 @@ return function(A)
       return
     end
     local t, k = table_of(key)
-    if not t or index_of(key) then fail('internal', 'The bridge has no table for the key ' .. key) end
+    if not t then fail('internal', 'The bridge has no table for the key ' .. key) end
     -- ON CONFLICT names the key column only: a conflict on another UNIQUE index (runs.q, runs.t)
     -- fails the batch, and never deletes another row as REPLACE would.
     if t.tbl == 'runs' then
@@ -183,29 +139,6 @@ return function(A)
     limit = limit or 100
     after = after or ''
     local n = limit + 1
-    local kind = index_of(prefix)
-    if kind == 'q' or kind == 't' then
-      local col = kind
-      local rows, more = db.query('SELECT ' .. INDEX_COLS .. ' FROM runs WHERE ' .. col .. ' > ? AND substr(' .. col .. ', 1, ?) = ? ORDER BY '
-        .. col .. ' LIMIT ?', after, #prefix, prefix, n)
-      return page(rows, limit, more, function(row) return row[col] end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
-    end
-    if kind == 'dv' then
-      local id = prefix:match('^dv/([^/]+)/$')
-      if not id then fail('internal', 'The bridge scans dv/<id>/ only, not ' .. prefix) end
-      local from = after:sub(1, #prefix) == prefix and after:sub(#prefix + 1) or ''
-      local rows, more = db.query('SELECT ' .. INDEX_COLS .. " FROM runs WHERE automation_id = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
-        id, from, n)
-      return page(rows, limit, more, function(row) return prefix .. row.run_key end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
-    end
-    if kind == 'box' then
-      local agent = prefix:match('^box/([^/]+)/$')
-      if not agent then fail('internal', 'The bridge scans box/<agent>/ only, not ' .. prefix) end
-      local from = after:sub(1, #prefix) == prefix and after:sub(#prefix + 1) or ''
-      local rows, more = db.query('SELECT ' .. INDEX_COLS .. " FROM runs WHERE agent = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key LIMIT ?",
-        agent, from, n)
-      return page(rows, limit, more, function(row) return prefix .. row.run_key end, function(row) return {rev = row.rev, value = index_value(kind, row)} end)
-    end
     local t = table_of(prefix)
     if not t then fail('internal', 'The bridge has no table for the prefix ' .. prefix) end
     local p = t.strip and prefix:sub(#t.prefix + 1) or prefix
@@ -227,7 +160,7 @@ return function(A)
   -- batch(request) applies {ops, op} in one transaction and answers as hub.store.batch: {revs},
   -- {conflict = {kind, key, rev?}} or {op_exists = {fingerprint, result}}. The checks come before
   -- any write, as in the store: a saved op first, then each if_rev against the tables before the
-  -- batch. An index write must match the run that the batch leaves; else the batch fails.
+  -- batch.
   function M.batch(request)
     return db.transaction(function()
       local op = request.op
@@ -245,12 +178,10 @@ return function(A)
         end
       end
       local c = counter()
-      local revs, indexes = {}, {}
+      local revs = {}
       for _, o in ipairs(request.ops or {}) do
         if o.notify then
           A.app.notice(o.notify.agent, o.notify.pending)
-        elseif index_of(o.key) then
-          indexes[#indexes + 1] = o
         elseif o.delete then
           remove(o.key)
           revs[o.key] = '0'
@@ -258,28 +189,6 @@ return function(A)
           local rev = c.next()
           write(o.key, rev, o.value)
           revs[o.key] = rev
-        end
-      end
-      for _, o in ipairs(indexes) do
-        local row = giver(o.key)
-        local kind = index_of(o.key)
-        if o.delete then
-          if row and (kind == 'q' or kind == 't') then
-            -- In the store, the entry goes and the run stays: the run is then not in the queue or
-            -- the terminal order (the purge deletes the t/ entries before the runs). Here the
-            -- entry is the run's column, so the delete clears it and its document field.
-            local run = decode(row.doc)
-            run[kind] = nil
-            write(row.run_key, c.next(), run)
-          elseif row then
-            fail('internal', 'The bridge: ' .. o.key .. ' is deleted, but run ' .. row.run_key .. ' still gives it')
-          end
-          revs[o.key] = '0'
-        else
-          if not row or not same(index_value(kind, row), o.value) then
-            fail('internal', 'The bridge: no run of this batch gives ' .. o.key .. ' with its value')
-          end
-          revs[o.key] = row.rev
         end
       end
       if op and op.key then

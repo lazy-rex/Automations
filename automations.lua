@@ -349,8 +349,33 @@ end
 
 local function run_prefix(id) return 'run/' .. id .. '/' end
 local function queue_key(id, n) return string.format('q/%s/%012d', id, n) end
-local function box_key(agent, run_key) return 'box/' .. agent .. '/' .. run_key end
-local function delivered_key(id, run_key) return 'dv/' .. id .. '/' .. run_key end
+
+-- The runs table answers what the index records q/, t/, dv/ and box/ answered (slice 3a): a run
+-- in the queue has q, a terminal run has t, and a delivered run has status delivered and its
+-- agent. A run write sets these columns from the document. run_page answers at most limit runs
+-- as records {key, rev, value}, and whether more follow (also when one reply did not hold them).
+local db = app.db
+local function run_page(where, args, limit)
+  args[#args + 1] = limit + 1
+  local rows, partial = db.query('SELECT run_key, rev, doc FROM runs WHERE ' .. where .. ' LIMIT ?', unpack(args))
+  local out = {}
+  for i = 1, math.min(#rows, limit) do out[i] = {key = rows[i].run_key, rev = rows[i].rev, value = rex.json.decode(rows[i].doc)} end
+  return out, #rows > limit or partial == true
+end
+local function queued_runs(id, after, limit)
+  return run_page('automation_id = ? AND q > ? ORDER BY q', {id, after or ''}, limit)
+end
+local function delivered_runs(id, after, limit)
+  return run_page("automation_id = ? AND status = 'delivered' AND run_key > ? ORDER BY run_key", {id, after or ''}, limit)
+end
+local function terminal_runs(id, after, limit)
+  return run_page('automation_id = ? AND t > ? ORDER BY t', {id, after or ''}, limit)
+end
+-- For the panel: the number of runs in the queue, up to max, and the run that ended last.
+local function queue_size(id, max)
+  return db.first('SELECT count(*) AS n FROM (SELECT 1 FROM runs WHERE automation_id = ? AND q IS NOT NULL LIMIT ?)', id, max).n
+end
+local function last_run(id) return terminal_runs(id, nil, 1)[1] end
 
 -- The engine's per-automation fence is state/<id>: every batch that creates, starts or delivers
 -- a run writes it with if_rev. Every management change (save, set_enabled, delete, retry,
@@ -418,8 +443,7 @@ local function create_run(id, gen, kind, k, extra, op)
     if size(run) > RUN_BUDGET then fail('internal', 'The run record is over ' .. RUN_BUDGET .. ' bytes encoded') end
     st.next_q = n
     if extra then extra(st) end
-    local ops = {{key = run_key, if_rev = '0', value = run}, {key = run.q, if_rev = '0', value = {run = run_key}},
-      {key = 'state/' .. id, if_rev = recs['state/' .. id].rev, value = st}}
+    local ops = {{key = run_key, if_rev = '0', value = run}, {key = 'state/' .. id, if_rev = recs['state/' .. id].rev, value = st}}
     local stored = batch(ops, op and op.record)
     local done, conflict = committed(stored, 'a run')
     if done then mark(id); return run_key, 'created', done end
@@ -463,33 +487,22 @@ local function worker_runs(worker)
   fail('unavailable', 'hub.agents does not list ' .. resolved.id .. ' yet')
 end
 
--- other_box says whether the agent ID has a box entry other than box. A notice row belongs to one
--- agent ID (the hub keeps one per plugin and ID), and each box is keyed by the ID that got the
--- delivery, so the row stays pending exactly while that box is not empty.
-local function other_box(agent, box)
-  local keys = scan('box/' .. agent .. '/', nil, 2)
-  for _, k in ipairs(keys) do
-    if k ~= box then return true end
-  end
-  return false
+-- other_task says whether the agent ID has a delivered run other than run_key. A notice row
+-- belongs to one agent ID (the hub keeps one per plugin and ID), and each delivery is to the ID
+-- that got it, so the row stays pending exactly while that ID has a task.
+local function other_task(agent, run_key)
+  return db.first("SELECT run_key FROM runs WHERE status = 'delivered' AND agent = ? AND run_key <> ? LIMIT 1", agent, run_key) ~= nil
 end
 
--- deliver_ops: the run becomes delivered to agent, with a new attempt; its box entry and the
--- notice intent commit with it. The queue entry goes; dv/ lists the delivered run.
-local function deliver_ops(id, run_key, run_rec, agent, spawn_id)
+-- deliver_ops: the run leaves the queue and becomes delivered to agent, with a new attempt; the
+-- notice intent commits with it.
+local function deliver_ops(run_key, run_rec, agent, spawn_id)
   local run = run_rec.value
   run.status, run.agent, run.spawn_id = 'delivered', agent, spawn_id
   run.attempt = (run.attempt or 0) + 1
   run.delivered_at = now()
-  local q = run.q
   run.q = nil
-  return {
-    {key = run_key, if_rev = run_rec.rev, value = run},
-    {key = q, delete = true},
-    {key = delivered_key(id, run_key), value = {agent = agent}},
-    {key = box_key(agent, run_key), if_rev = '0', value = {attempt = run.attempt, auto = id}},
-    {notify = {agent = agent, pending = true}},
-  }
+  return {{key = run_key, if_rev = run_rec.rev, value = run}, {notify = {agent = agent, pending = true}}}
 end
 
 local function spawn_request(run_key, starts, task)
@@ -517,17 +530,15 @@ end
 -- --- Run retention (design v2 section 10; retention amendment 1) ---
 
 -- Every batch that makes a run terminal takes the next terminal sequence from state.next_t (the
--- batch has the state fence) and writes the index entry t/<id>/<inv> = {run, seq}. inv counts
--- down from MAX_T, so a scan gives the newest first. The order never depends on the clock.
+-- batch has the state fence) and sets run.t = t/<id>/<inv>. inv counts down from MAX_T, so the
+-- order of t gives the newest first. The order never depends on the clock.
 local MAX_T = 999999999999
-local function terminal_op(st, id, run_key, run)
+local function terminal(st, id, run)
   local n = (st.next_t or 0) + 1
   if n > MAX_T then fail('internal', 'Automation ' .. id .. ' has used every terminal sequence') end
   st.next_t = n
-  local key = string.format('t/%s/%012d', id, MAX_T - n)
-  run.t, run.tseq = key, n
+  run.t, run.tseq = string.format('t/%s/%012d', id, MAX_T - n), n
   S.prune[id] = true
-  return {key = key, if_rev = '0', value = {run = run_key, seq = n}}
 end
 
 -- --- Engine steps (design v2 section 5; amendment 1, B1) ---
@@ -547,7 +558,7 @@ local function spawn_step(id, st_rec)
   if result.status == 'open' and type(result.agent_id) == 'string' and result.agent_id ~= '' then
     st.worker = {spawn_id = result.spawn_id, agent_id = result.agent_id, spec = spec(run_rec.value.task)}
     st.spawning = nil
-    local ops = deliver_ops(id, sp.run, run_rec, result.agent_id, result.spawn_id)
+    local ops = deliver_ops(sp.run, run_rec, result.agent_id, result.spawn_id)
     ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
     batch(ops)
     return true
@@ -582,52 +593,38 @@ local function spawn_step(id, st_rec)
   end
   run.status = 'failed'
   run.error = cut(tostring(result.error or ('The start ended as ' .. tostring(result.status))), MAX_ERROR)
-  local q = run.q
   run.q = nil
   st.spawning = nil
-  local t_op = terminal_op(st, id, sp.run, run)
-  batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, t_op, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+  terminal(st, id, run)
+  batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
   return true
 end
 
 -- requeue_ops: a delivered run whose worker no longer runs goes back to the queue (design v2,
--- 5e). Its box entry goes, and the old agent's notice row follows its remaining box. The run
--- keeps its attempt, so the next delivery has attempt + 1 and a done of the old attempt is
--- refused. It also keeps starts: a later start uses a new key.
+-- 5e). The old agent's notice row follows its remaining tasks. The run keeps its attempt, so the
+-- next delivery has attempt + 1 and a done of the old attempt is refused. It also keeps starts:
+-- a later start uses a new key.
 local function requeue_ops(id, st, run_key, run_rec)
   local run = run_rec.value
-  local box = box_key(run.agent, run_key)
   local n = (st.next_q or 0) + 1
   st.next_q = n
   run.lost = {agent = run.agent, spawn_id = run.spawn_id, attempt = run.attempt, at = now()}
   local agent = run.agent
   run.status, run.agent, run.spawn_id, run.delivered_at = 'queued', nil, nil, nil
   run.q = queue_key(id, n)
-  return {
-    {key = run_key, if_rev = run_rec.rev, value = run},
-    {key = run.q, if_rev = '0', value = {run = run_key}},
-    {key = delivered_key(id, run_key), delete = true},
-    {key = box, delete = true},
-    {notify = {agent = agent, pending = other_box(agent, box)}},
-  }
+  return {{key = run_key, if_rev = run_rec.rev, value = run}, {notify = {agent = agent, pending = other_task(agent, run_key)}}}
 end
 
 -- lost_ops: after a delete, a lost worker's run is cancelled, not requeued (B3): no new worker
--- starts for a deleted automation. Its box entry and the notice change in the same batch.
+-- starts for a deleted automation. The notice changes in the same batch.
 local function lost_ops(id, st, run_key, run_rec)
   if not st.deleted then return requeue_ops(id, st, run_key, run_rec) end
   local run = run_rec.value
   local agent = run.agent
-  local box = box_key(agent, run_key)
   run.lost = {agent = agent, spawn_id = run.spawn_id, attempt = run.attempt, at = now()}
   run.status, run.error = 'cancelled', 'worker lost after delete'
-  return {
-    terminal_op(st, id, run_key, run),
-    {key = run_key, if_rev = run_rec.rev, value = run},
-    {key = delivered_key(id, run_key), delete = true},
-    {key = box, delete = true},
-    {notify = {agent = agent, pending = other_box(agent, box)}},
-  }
+  terminal(st, id, run)
+  return {{key = run_key, if_rev = run_rec.rev, value = run}, {notify = {agent = agent, pending = other_task(agent, run_key)}}}
 end
 
 -- lost_step requeues one delivered run whose worker is gone (after a delete it cancels it). A
@@ -637,25 +634,16 @@ end
 -- requeued on a guess.
 -- The scan goes one page at a time from S.dv_after[id] and wraps at the end, so a page of live
 -- tasks never hides a later lost one (review of the 6a plan, point 2). A page with a requeue or a
--- repair is read again by the next step. It returns nil when the page has no lost run.
+-- requeue is read again by the next step. It returns nil when the page has no lost run.
 local DV_PAGE = 20
 local function lost_step(id, st_rec)
   local st = st_rec.value
-  local prefix = 'dv/' .. id .. '/'
-  local keys, _, more = scan(prefix, S.dv_after[id], DV_PAGE)
-  if #keys == 0 then S.dv_after[id] = nil; return nil end
+  local page, more = delivered_runs(id, S.dv_after[id], DV_PAGE)
+  if #page == 0 then S.dv_after[id] = nil; return nil end
   local current = type(st.worker) == 'table' and st.worker.spawn_id or nil
   local seen = {}
-  for _, key in ipairs(keys) do
-    local run_key = key:sub(#prefix + 1)
-    local run_rec = get1(run_key)
-    if run_rec.rev == '0' or run_rec.value.status ~= 'delivered' then
-      -- An index entry whose run is not delivered. done and requeue delete the entry in their
-      -- own batch, so this is only a repair: remove it under the fence.
-      batch({{key = key, delete = true}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
-      return true
-    end
-    local run = run_rec.value
+  for _, run_rec in ipairs(page) do
+    local run_key, run = run_rec.key, run_rec.value
     local sid = tostring(run.spawn_id)
     if seen[sid] == nil then
       if run.spawn_id == current then seen[sid] = worker_runs(st.worker)
@@ -669,7 +657,7 @@ local function lost_step(id, st_rec)
       return true
     end
   end
-  if type(more) == 'string' and more ~= '' then S.dv_after[id] = keys[#keys] else S.dv_after[id] = nil end
+  S.dv_after[id] = more and page[#page].key or nil
   return nil
 end
 
@@ -825,9 +813,8 @@ local function drain_step(id)
       local run_key = run_prefix(id) .. 'f/' .. row.appearance_key
       local n = B.next_q + 1
       local run = file_run(id, auto, row, n)
+      if run.status == 'failed' then terminal(B.st, id, run) end
       local ops = {{key = run_key, if_rev = '0', value = run}, {key = mk, if_rev = '0', value = {run = run_key}}}
-      if run.q then ops[#ops + 1] = {key = run.q, if_rev = '0', value = {run = run_key}} end
-      if run.status == 'failed' then ops[#ops + 1] = terminal_op(B.st, id, run_key, run) end
       -- add_ops may first commit the earlier ops, with the earlier next_q.
       if not add_ops(id, B, ops) then return true end
       if run.q then B.next_q = n end
@@ -930,25 +917,20 @@ local function send_fenced(B)
   batch(B.ops)
 end
 
--- cancel_step cancels the queued runs of a deleted automation, one batch for each step. A queue
--- entry of a starting or unknown_start run stays: that run continues (design v2, 5f). It returns
--- nil when no queued run is left.
+-- cancel_step cancels the queued runs of a deleted automation, one batch for each step. A
+-- starting or unknown_start run keeps its place in the queue: that run continues (design v2,
+-- 5f). It returns nil when no queued run is left.
 local function cancel_step(id, st_rec)
-  local keys, records = scan('q/' .. id .. '/', nil, CLEANUP_RUNS + 1)
-  if #keys == 0 then return nil end
-  local run_keys = {}
-  for _, key in ipairs(keys) do run_keys[#run_keys + 1] = records[key].value.run end
-  local runs = get(run_keys)
+  local page = queued_runs(id, nil, CLEANUP_RUNS + 1)
   local B = fenced(id, st_rec)
-  for i, key in ipairs(keys) do
-    local run_rec = runs[run_keys[i]]
-    if run_rec.rev ~= '0' and run_rec.value.status == 'queued' then
+  for _, run_rec in ipairs(page) do
+    if run_rec.value.status == 'queued' then
       local run = run_rec.value
       run.status, run.error, run.q = 'cancelled', 'automation deleted', nil
       if B.n >= CLEANUP_RUNS then break end
       -- A run that does not fit keeps its sequence unused: a gap, never a reuse.
-      local t_op = terminal_op(st_rec.value, id, run_keys[i], run)
-      if not fits(B, {{key = run_keys[i], if_rev = run_rec.rev, value = run}, {key = key, delete = true}, t_op}) then break end
+      terminal(st_rec.value, id, run)
+      if not fits(B, {{key = run_rec.key, if_rev = run_rec.rev, value = run}}) then break end
     end
   end
   if B.n == 0 then return nil end
@@ -957,9 +939,8 @@ local function cancel_step(id, st_rec)
 end
 
 -- purge_step deletes the records of a deleted automation when no run is active: markers, rt
--- entries, queue entries left over, and the terminal runs. The last batch deletes the state and
--- the auto tombstone.
-local PURGE = {'seen/', 'rt/', 'q/', 't/', 'run/'}
+-- entries, and the terminal runs. The last batch deletes the state and the auto tombstone.
+local PURGE = {'seen/', 'rt/', 'run/'}
 local ACTIVE = {queued = true, starting = true, unknown_start = true, delivered = true}
 local function purge_step(id, st_rec)
   for _, p in ipairs(PURGE) do
@@ -983,40 +964,21 @@ end
 -- prune_step keeps the newest KEEP_RUNS terminal runs. It reads state/<id> first: every change of
 -- the terminal set (a terminal change, a retry) writes it, and the prune batch writes it back
 -- unchanged with the observed rev. So a change after the read makes the batch fail, and the next
--- step computes the cutoff again (review of 451691c, R1). Then it reads the entries after the newest
--- KEEP_RUNS (the scan gives each entry's rev) and gets their runs. A run whose run.t is that
--- entry and that is terminal goes with its entry; any other entry is stale and goes alone. Each
--- delete has the observed rev, so a run that a retry made active, or a changed entry, stays: the
--- batch commits nothing, and a later step reads again. Markers are never touched (B2).
+-- step computes the cutoff again (review of 451691c, R1). Then it deletes the terminal runs after
+-- the newest KEEP_RUNS, in t order, each with its observed rev, so a run that a retry made active
+-- stays: the batch commits nothing, and a later step reads again. The query reads no document
+-- (a page of 100 documents can need more than one reply). Markers are never touched (B2).
 local KEEP_RUNS, PRUNE_PAGE = 100, 50
 local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true}
 local function prune_step(id)
-  local prefix = 't/' .. id .. '/'
   local st_rec = get1('state/' .. id)
   if not state_of(st_rec) then S.prune[id] = nil; return false end
-  local keep, _, more = scan(prefix, nil, KEEP_RUNS)
-  if #keep < KEEP_RUNS or type(more) ~= 'string' or more == '' then S.prune[id] = nil; return false end
-  local old, records = scan(prefix, keep[#keep], PRUNE_PAGE)
+  local old = db.query("SELECT run_key, rev FROM runs WHERE automation_id = ? AND t IS NOT NULL "
+    .. "AND status IN ('done', 'failed', 'cancelled', 'dismissed') ORDER BY t LIMIT ? OFFSET ?", id, PRUNE_PAGE, KEEP_RUNS)
   if #old == 0 then S.prune[id] = nil; return false end
-  local run_keys, seen = {}, {}
-  for _, k in ipairs(old) do
-    local v = records[k].value
-    local rk = type(v) == 'table' and v.run or nil
-    if type(rk) == 'string' and rk:sub(1, #run_prefix(id)) == run_prefix(id) and not seen[rk] then
-      seen[rk] = true
-      run_keys[#run_keys + 1] = rk
-    end
-  end
-  local runs = #run_keys > 0 and get(run_keys) or {}
   local B = fenced(id, st_rec)
-  for _, k in ipairs(old) do
-    local v = records[k].value
-    local rr = type(v) == 'table' and runs[v.run] or nil
-    local ops = {{key = k, if_rev = records[k].rev, delete = true}}
-    if rr and rr.rev ~= '0' and type(rr.value) == 'table' and rr.value.t == k and TERMINAL[rr.value.status] then
-      ops[2] = {key = v.run, if_rev = rr.rev, delete = true}
-    end
-    if not fits(B, ops) then break end
+  for _, row in ipairs(old) do
+    if not fits(B, {{key = row.run_key, if_rev = row.rev, delete = true}}) then break end
   end
   send_fenced(B)
   return true
@@ -1043,17 +1005,16 @@ local function step(id)
   local lost = lost_step(id, st_rec)
   if lost ~= nil then return lost end
   if st.deleted then
-    if #scan('dv/' .. id .. '/', nil, 1) > 0 then return S.dv_after[id] ~= nil end
+    if #delivered_runs(id, nil, 1) > 0 then return S.dv_after[id] ~= nil end
     return purge_step(id, st_rec)
   end
-  local keys, records = scan('q/' .. id .. '/', nil, 1)
+  local run_rec = queued_runs(id, nil, 1)[1]
   -- A delivered-run pass that is not at its end continues in the next step.
-  if #keys == 0 then return S.dv_after[id] ~= nil end
-  local run_key = records[keys[1]].value.run
-  local run_rec = get1(run_key)
-  if run_rec.rev == '0' or run_rec.value.status ~= 'queued' then fail('internal', 'Queue entry ' .. keys[1] .. ' names no queued run') end
+  if not run_rec then return S.dv_after[id] ~= nil end
+  local run_key = run_rec.key
+  if run_rec.value.status ~= 'queued' then fail('internal', 'The first run in the queue, ' .. run_key .. ', is ' .. tostring(run_rec.value.status)) end
   if type(st.worker) == 'table' and st.worker.spec == spec(run_rec.value.task) and worker_runs(st.worker) then
-    local ops = deliver_ops(id, run_key, run_rec, st.worker.agent_id, st.worker.spawn_id)
+    local ops = deliver_ops(run_key, run_rec, st.worker.agent_id, st.worker.spawn_id)
     ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
     batch(ops)
     return true
@@ -1066,10 +1027,9 @@ local function step(id)
   if problem then
     run.status = 'failed'
     run.error = cut(problem, MAX_ERROR)
-    local q = run.q
     run.q = nil
-    local t_op = terminal_op(st, id, run_key, run)
-    batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = q, delete = true}, t_op, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+    terminal(st, id, run)
+    batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
     return true
   end
   run.starts = (run.starts or 0) + 1
@@ -1323,10 +1283,9 @@ local function presets(_, args)
 end
 
 -- runs lists the runs of one automation by phase (6b plan, amendments 1 and 2). Each run is in
--- one phase by its status: S, the run of state.spawning (starting or unknown_start); D, the dv/
--- index (delivered); Q, the q/ index in queue order (queued, without the S run); T, the t/ index
--- (terminal, the newest end first). An index entry whose run has another status is skipped; the
--- engine repairs it. The cursor is the last consumed position: '<P>' (phase P, nothing consumed
+-- one phase by its status: S, the run of state.spawning (starting or unknown_start); D, the
+-- delivered runs; Q, the runs in queue order (queued, without the S run); T, the runs in t order
+-- (terminal, the newest end first). The cursor is the last consumed position: '<P>' (phase P, nothing consumed
 -- yet) or '<P>:<key>' ('S:1' for the spawning item). One request consumes at most READ_LIMIT
 -- entries. A visible run that does not fit the byte budget is not consumed, so it comes first on
 -- the next page. It changes nothing.
@@ -1387,33 +1346,26 @@ local function runs(_, args)
       C.reads = C.reads + 1
       phase, pos = 'D', nil
     else
-      local prefix, rp = PHASE_PREFIX[phase] .. id .. '/', run_prefix(id)
+      -- A position is the run's q or t, or dv/<id>/<run key> for D (the cursors of the index
+      -- records stay valid).
+      local prefix = PHASE_PREFIX[phase] .. id .. '/'
       local ended = false
       while not ended do
         if full() then return {runs = C.out, next = at(phase, pos)} end
-        local keys, records, more = scan(prefix, pos, READ_LIMIT - C.reads)
-        local named, want, seen = {}, {}, {}
-        for _, k in ipairs(keys) do
-          local v = records[k].value
-          local rk = phase == 'D' and k:sub(#prefix + 1) or (type(v) == 'table' and v.run or nil)
-          if type(rk) == 'string' and rk:sub(1, #rp) == rp then
-            named[k] = rk
-            if not seen[rk] then seen[rk] = true; want[#want + 1] = rk end
-          end
-        end
-        local recs = #want > 0 and get(want) or {}
-        for _, k in ipairs(keys) do
+        local page, more
+        if phase == 'D' then page, more = delivered_runs(id, pos and pos:sub(#prefix + 1), READ_LIMIT - C.reads)
+        elseif phase == 'Q' then page, more = queued_runs(id, pos, READ_LIMIT - C.reads)
+        else page, more = terminal_runs(id, pos, READ_LIMIT - C.reads) end
+        for _, rec in ipairs(page) do
           if #C.out >= limit then return {runs = C.out, next = at(phase, pos)} end
-          local rk = named[k]
-          local run = rk and state_of(recs[rk]) or nil
-          local visible = run ~= nil and ((phase == 'D' and run.status == 'delivered')
-            or (phase == 'Q' and run.status == 'queued' and rk ~= spawning)
-            or (phase == 'T' and TERMINAL[run.status] and run.t == k))
+          local rk, run = rec.key, rec.value
+          local k = phase == 'D' and prefix .. rk or (phase == 'Q' and run.q or run.t)
+          local visible = phase == 'D' or (phase == 'Q' and run.status == 'queued' and rk ~= spawning) or (phase == 'T' and TERMINAL[run.status])
           if visible and not add(rk, run, phase .. ':' .. k) then return {runs = C.out, next = at(phase, pos)} end
           C.reads = C.reads + 1
           pos = k
         end
-        if #keys == 0 or type(more) ~= 'string' or more == '' then ended = true end
+        if #page == 0 or not more then ended = true end
       end
       phase, pos = PHASE_NEXT[phase], nil
     end
@@ -1520,8 +1472,8 @@ local function delete(caller, args)
 end
 
 -- run_change applies a keyed change to one run. change(run, st, auto) changes the run and the
--- state, or refuses; it returns the extra ops. The batch has if_rev on the run and on
--- state/<id> (the fence), so a step that moved the run or the state makes it read again.
+-- state, or refuses. The batch has if_rev on the run and on state/<id> (the fence), so a step
+-- that moved the run or the state makes it read again.
 local MAX_DISMISSED = 10
 local function run_change(kind, caller, args, change)
   only(args, {run_key = true, key = true})
@@ -1538,10 +1490,8 @@ local function run_change(kind, caller, args, change)
     local st = state_of(st_rec)
     if not st then fail('not_found', 'No automation ' .. id) end
     local run = run_rec.value
-    local ops = change(run, st, state_of(recs['auto/' .. id]), run_key, id)
-    ops[#ops + 1] = {key = run_key, if_rev = run_rec.rev, value = run}
-    ops[#ops + 1] = {key = 'state/' .. id, if_rev = st_rec.rev, value = st}
-    local stored = batch(ops, {key = op_key(kind, caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
+    change(run, st, state_of(recs['auto/' .. id]), run_key, id)
+    local stored = batch({{key = run_key, if_rev = run_rec.rev, value = run}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}},{key = op_key(kind, caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
     local result, conflict = committed(stored, kind)
     if result then
       mark(id)
@@ -1573,11 +1523,8 @@ local function retry(caller, args)
     run.q = queue_key(id, n)
     run.retries = (run.retries or 0) + 1
     run.retried = {by = caller.id, at = now()}
-    local ops = {{key = run.q, if_rev = '0', value = {run = run_key}}}
-    -- The run is active again: its terminal entry goes, and its next end gets a new sequence.
-    if run.t then ops[2] = {key = run.t, delete = true} end
+    -- The run is active again: it leaves the terminal order, and its next end gets a new sequence.
     run.t, run.tseq = nil, nil
-    return ops
   end)
 end
 
@@ -1585,10 +1532,9 @@ end
 local function cancel_run(caller, args)
   return run_change('cancel', caller, args, function(run, st, _, run_key, id)
     if run.status ~= 'queued' then fail('not_cancellable', 'Run ' .. run_key .. ' is ' .. tostring(run.status) .. '; only a queued run can be cancelled') end
-    local q = run.q
     run.status, run.q, run.error = 'cancelled', nil, nil
     run.cancelled = {by = caller.id, at = now()}
-    return {{key = q, delete = true}, terminal_op(st, id, run_key, run)}
+    terminal(st, id, run)
   end)
 end
 
@@ -1607,11 +1553,8 @@ local function dismiss_start(caller, args)
     run.dismissed = list
     st.dismissed_spawn = {run = run_key, key = ref.key, at = ref.at}
     st.spawning = nil
-    local q = run.q
     run.status, run.q = 'dismissed', nil
-    local ops = {terminal_op(st, id, run_key, run)}
-    if q then ops[2] = {key = q, delete = true} end
-    return ops
+    terminal(st, id, run)
   end)
 end
 
@@ -1620,8 +1563,9 @@ local function task_view(run_key, run)
     kind = run.kind, slot = run.slot, item = run.item, task = run.task, delivered_at = run.delivered_at}
 end
 
--- read lists the caller's delivered tasks, one page at a time, in box key order. It changes
--- nothing, so a lost reply reads the same page again.
+-- read lists the caller's delivered tasks, one page at a time, in the order of the box key
+-- box/<agent ID>/<run key> (the cursor). It changes nothing, so a lost reply reads the same page
+-- again.
 local function read(caller, args)
   only(args, {after = true, limit = true})
   local limit = args.limit or 20
@@ -1639,33 +1583,27 @@ local function read(caller, args)
       if args.after:sub(1, #prefix) == prefix then after = args.after
       elseif args.after > prefix then skip = true end
     end
-    local keys, records, more = {}, {}, nil
+    local page, more = {}, false
     if not skip then
-      local k, r, m = scan(prefix, after, limit + 1)
-      keys = k
-      records = r
-      more = m
+      page, more = run_page("status = 'delivered' AND agent = ? AND run_key > ? ORDER BY run_key",
+        {prefix:sub(5, -2), after and after:sub(#prefix + 1) or ''}, limit + 1)
     end
-    for _, key in ipairs(keys) do
+    for _, rec in ipairs(page) do
       if #tasks >= limit then cursor = tasks[#tasks].box break end
-      local run_key = key:sub(#prefix + 1)
-      local run_rec = get1(run_key)
-      local run = run_rec.value
-      if run_rec.rev ~= '0' and run.status == 'delivered' and 'box/' .. run.agent .. '/' == prefix and run.attempt == records[key].value.attempt then
-        local view = task_view(run_key, run)
-        local n = size(view) + 1
-        if used + n > PAGE_BUDGET then
-          if #tasks == 0 then fail('too_large', 'Task ' .. run_key .. ' is too large to list; use after = "' .. key .. '"') end
-          cursor = tasks[#tasks].box
-          break
-        end
-        view.box = key
-        tasks[#tasks + 1] = view
-        used = used + n
+      local key = prefix .. rec.key
+      local view = task_view(rec.key, rec.value)
+      local n = size(view) + 1
+      if used + n > PAGE_BUDGET then
+        if #tasks == 0 then fail('too_large', 'Task ' .. rec.key .. ' is too large to list; use after = "' .. key .. '"') end
+        cursor = tasks[#tasks].box
+        break
       end
+      view.box = key
+      tasks[#tasks + 1] = view
+      used = used + n
     end
     if cursor then break end
-    if #tasks >= limit and type(more) == 'string' and more ~= '' then cursor = tasks[#tasks].box break end
+    if #tasks >= limit and more then cursor = tasks[#tasks].box break end
   end
   for _, task in ipairs(tasks) do task.box = nil end
   return {tasks = tasks, next = cursor}
@@ -1701,15 +1639,10 @@ local function done(caller, args)
       local over = size(run) - RUN_BUDGET
       if over > 0 then run.summary = cut(run.summary, math.max(16, #run.summary - over - 8)) end
     end
-    local box = box_key(run.agent, run_key)
-    local others = other_box(run.agent, box)
-    local t_op = terminal_op(st, id, run_key, run)
+    terminal(st, id, run)
     local stored = batch({
       {key = run_key, if_rev = run_rec.rev, value = run},
-      {key = box, delete = true},
-      {key = delivered_key(id, run_key), delete = true},
-      {notify = {agent = run.agent, pending = others}},
-      t_op,
+      {notify = {agent = run.agent, pending = other_task(run.agent, run_key)}},
       {key = 'state/' .. id, if_rev = st_rec.rev, value = st},
     }, {key = op_key('done', caller.id, args.key), fingerprint = fingerprint, result = {run_key = run_key, status = run.status}})
     local result, conflict = committed(stored, 'done')
@@ -1745,7 +1678,7 @@ local sql = dofile(plugin_dir .. '/automations_sql.lua')({app = app, fail = fail
 app.db.migrate(sql.migrations)
 local views = dofile(plugin_dir .. '/automations_view.lua')({
   fail = fail, hub = hub, get = get, get1 = get1, scan = scan, size = size, cut = cut, state_of = state_of, USER = USER,
-  PAGE_BUDGET = PAGE_BUDGET, PRESETS = PRESETS, PRESET_NAMES = PRESET_NAMES, preset_key = preset_key, run_prefix = run_prefix,
+  queue_size = queue_size, last_run = last_run, PAGE_BUDGET = PAGE_BUDGET, PRESETS = PRESETS, PRESET_NAMES = PRESET_NAMES, preset_key = preset_key, run_prefix = run_prefix,
   watch_view = watch_view, watch_key = watch_key, save = save, runs = runs, run_now = run_now, set_enabled = set_enabled,
   delete = delete, retry = retry, cancel_run = cancel_run, dismiss_start = dismiss_start,
 })

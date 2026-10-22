@@ -75,9 +75,9 @@ return function(A)
 
   -- --- The panel ---
 
-  -- panel_item reads, for one automation: the newest terminal entry, the queue (21 entries, shown
-  -- as 20+) and one get for the spawning run and the last run. The state comes from one get for the
-  -- page, so a page of 20 makes at most 2 + 3 * 20 reads, plus the presets get.
+  -- panel_item reads, for one automation: the spawning run, the queue size (up to 21, shown as
+  -- 20+) and the run that ended last. The state comes from one get for the page, so a page of 20
+  -- makes at most 2 + 3 * 20 reads, plus the presets get.
   local function panel_item(auto, st, listed)
     local id = auto.id
     local lines = {}
@@ -90,27 +90,20 @@ return function(A)
         lines[#lines + 1] = 'Watch: ' .. tostring(w.state) .. (w.error and (': ' .. w.error) or '') .. (w.hint and ('. ' .. w.hint) or '')
       end
     end
-    local tkeys, trecs = scan('t/' .. id .. '/', nil, 1)
-    local qkeys = scan('q/' .. id .. '/', nil, 21)
     local sp = type(st.spawning) == 'table' and st.spawning.run or nil
-    local last = tkeys[1] and type(trecs[tkeys[1]].value) == 'table' and trecs[tkeys[1]].value.run or nil
-    local want = {}
-    if sp then want[#want + 1] = sp end
-    if type(last) == 'string' and last ~= sp then want[#want + 1] = last end
-    local recs = #want > 0 and get(want) or {}
     local status = auto.deleted and 'deleting' or (auto.enabled and 'on' or 'off')
-    local sprun = sp and state_of(recs[sp]) or nil
+    local sprun = sp and state_of(get1(sp)) or nil
     if sprun and sprun.status == 'unknown_start' then
       lines[#lines + 1] = 'Needs action: a worker start has no outcome. Open it to dismiss the start.'
       status = 'needs action'
     elseif sprun then
       lines[#lines + 1] = 'Starting a worker.'
     end
-    -- The spawning run keeps its queue entry, and it is the first one.
-    local queued = #qkeys - (sp and 1 or 0)
+    -- The spawning run keeps its place in the queue, and it is the first one.
+    local queued = A.queue_size(id, 21) - (sp and 1 or 0)
     if queued > 0 then lines[#lines + 1] = 'Queued: ' .. (queued >= 20 and '20+' or tostring(queued)) .. ' runs.' end
-    local lr = type(last) == 'string' and state_of(recs[last]) or nil
-    if lr then lines[#lines + 1] = 'Last run: ' .. tostring(lr.status) .. ' (' .. when(lr.done_at or lr.at) .. ')' end
+    local lr = A.last_run(id)
+    if lr then lines[#lines + 1] = 'Last run: ' .. tostring(lr.value.status) .. ' (' .. when(lr.value.done_at or lr.value.at) .. ')' end
     return {id = id, label = auto.name .. (auto.deleted and ' (deleting)' or ''), detail = table.concat(lines, '\n'), status = status,
       action = nav('open', 'Open…')}
   end
