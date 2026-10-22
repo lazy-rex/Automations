@@ -75,9 +75,10 @@ test('~ expands with HOME, and a path outside watch_roots shows the grant hint',
   expect_error(function() file_save('unclean', F.dir('x') .. '/../x') end, 'invalid_input')
 end)
 
--- Rex Lua: table.concat of more than 2559 items fails with "registry overflow" (hub
--- docs/rex-protocol.md). The save fingerprint encodes its args before they are checked, so a
--- trigger with a long list must get the refusal of a bad trigger, not an internal error.
+-- Rex Lua fails table.concat of 2560 items or more ("registry overflow"); the SDK table.concat
+-- has no limit (hub v0.4.1 or later). The save fingerprint encodes its args before they are
+-- checked, so a trigger with a long list must get the refusal of a bad trigger, not an internal
+-- error.
 test('a trigger with a list of 3000 items is refused as invalid input', function()
   local before = count()
   local list = {}
@@ -88,8 +89,8 @@ test('a trigger with a list of 3000 items is refused as invalid input', function
   expect(count()).to_be(before)
 end)
 
--- The object path of the same join: action.args with 3000 keys. The check of action.args (at most
--- 512 bytes encoded) refuses it after the fingerprint.
+-- The object path of the same fingerprint: action.args with 3000 keys. The check of action.args
+-- (at most 512 bytes encoded) refuses it after the fingerprint.
 test('action args with 3000 keys are refused as invalid input', function()
   local before = count()
   local args = {}
