@@ -905,6 +905,7 @@ local TERMINAL = {done = true, failed = true, cancelled = true, dismissed = true
 local function prune_step(id)
   local out = {}
   atomic(function()
+    if not D.state(id) then D.abort('none') end
     local old = db.query("SELECT run_key, rev FROM runs WHERE automation_id = ? AND t IS NOT NULL "
       .. "AND status IN ('done', 'failed', 'cancelled', 'dismissed') ORDER BY t LIMIT ? OFFSET ?", id, PRUNE_PAGE, KEEP_RUNS)
     if #old == 0 then D.abort('none') end
