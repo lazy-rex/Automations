@@ -543,6 +543,8 @@ local function spawn_step(id, st_rec)
     if not problem then
       run.starts = (run.starts or 0) + 1
       run.restarted = sp.request.key
+      -- A new start: also a run that was unknown_start is starting again.
+      run.status = 'starting'
       st.spawning = {run = sp.run, since = now(), request = spawn_request(sp.run, run.starts, run.task), auto = true}
       batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
       return true

@@ -202,3 +202,30 @@ test('a delete while start 1 waits: not_created gives no second start, and the c
   rex.sleep(5)
   expect(#F.workers('worker')).to_be(before + 1)
 end)
+
+-- The reviewer's case for a79e7f2: a start whose hub row is still prepared reads pending, so it can
+-- become unknown_start, and a durable not_created failure can end it later. The lab cannot hold a
+-- prepared row (that needs a hub store failure), so this test writes the old state as a fixture:
+-- while a gate refuses /1, the run record gets status unknown_start. Then /1 fails as not_created.
+-- The restart is a new start: the run is starting again, and Dismiss does not apply to it.
+test('an unknown_start run whose start fails as not_created is starting again with /2', function()
+  local id = automation('unknown')
+  local run_key = 'run/' .. id .. '/m/000001'
+  local g1 = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 1)})
+  run_now(id, 'unknown-run')
+  wait('the gated first start', function() return fault_fired(g1) end, 10)
+  local rec = store(run_key)
+  expect(rec.value.status).to_be('starting')
+  rec.value.status = 'unknown_start'
+  write({{key = run_key, if_rev = rec.rev, value = rec.value}})
+  local f1 = fault({point = 'spawn-create', mode = 'fail-sending', op = spawn_key(run_key, 1)})
+  local g2 = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate', key = spawn_key(run_key, 2)})
+  fault_release(g1)
+  wait('the gated second start', function() return fault_fired(g2) end, 20)
+  expect(fault_fired(f1)).to_be(true)
+  restarted(id, run_key)
+  expect_error(function() alice:call('automations.dismiss_start', {run_key = run_key, key = 'unknown-dismiss'}) end, 'not_dismissable')
+  fault_release(g2)
+  local run = F.wait_status(run_key, 'delivered')
+  expect(run.starts).to_be(2)
+end)

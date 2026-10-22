@@ -193,7 +193,8 @@ cd ../../Automations && lazyrex-hub test
 - not_created.lua: a start that the hub never sent (error `not_created`) starts again once with a
   new key and delivers; a second `not_created` or another failure fails the run, never
   `unknown_start`, and Retry starts one worker with a new key; a lost reply of the restart batch
-  and a hub crash after it start key /2 once; after a delete there is no restart. It needs
+  and a hub crash after it start key /2 once; after a delete there is no restart; an
+  `unknown_start` run (a written fixture) whose start fails as `not_created` is starting again. It needs
   the spawn-create fault mode `fail-sending` (hub 89cab8f or later); on an older hub, such as the
   live hub fc0cd19, this file fails. Not covered: a hub crash between the admission and the
   sending commits (the hub's own tests cover it), and a `not_created` call error when the hub
