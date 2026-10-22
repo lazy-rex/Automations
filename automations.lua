@@ -362,16 +362,16 @@ local function mark(id)
   S.queue[#S.queue + 1] = id
 end
 
--- ui_changed asks the hub to render the plugin's views again, for a change that is not in the
--- store (a watch state, a worker). The hub renders them after each store commit by itself. One
--- request at a time; a failure is only logged.
+-- ui_changed renders the plugin's views again (app.refresh) after a change of a Lua value that a
+-- render shows: the start gate text, a watch state or error, a worker. The hub renders a view
+-- again by itself after a SQL commit that it read from. One request at a time; app.refresh
+-- ignores a failure.
 local function ui_changed()
   if S.ui_pending then return end
   S.ui_pending = true
   rex.after(0, function()
     S.ui_pending = false
-    local ok, err = pcall(hub, 'hub.ui.invalidate', {})
-    if not ok then print('automations: invalidate: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end
+    app.refresh()
   end)
 end
 local pump -- forward
@@ -1702,6 +1702,7 @@ local function start()
   if state == nil then
     S.not_ready = 'Automations cannot start: the storage state is not known (' .. why .. ')'
     print('automations: refused: ' .. why)
+    ui_changed()
     return
   end
   if state == 'empty' then sql.begin(); state = 'copying' end
