@@ -90,8 +90,11 @@ later cutover (slice 2): no release has SQL reads beside store writes.
 Coordinator decision (2026-10-22): slice 2 keeps each record value of today as one JSON document,
 with the fields that queries need as extra columns. The engine rules stay; the storage layer, the
 column synchronization, the SQL constraints and the import and cutover are the new parts, and the
-tests must prove each of them. Slice 3 normalizes the tables that the engine queries most (runs
-first) and deletes the record logic that each one makes redundant. It is not optional.
+tests must prove each of them. These document tables, with their query columns, are the target
+schema of release 4 (coordinator decision, 2026-10-22): they are domain tables, one for each
+entity, and a JSON document column in a domain table is allowed. Slice 3 deletes the bridge and
+uses direct SQL on these tables; it is not optional. A normalization of `runs.doc` into columns is
+a separate migration with its own decision, only when a query or size need shows it.
 
 ```sql
 CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)
