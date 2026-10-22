@@ -284,11 +284,23 @@ slice 4 deletes when no install can be older than the cutover.
 Code rollback alone is not a rollback. At hub f6f1a03, the first SQL commit with a notice writes
 `sql_notice_plugins` in hub.db (`moveNotices`). After that, the hub refuses every
 `hub.store.batch` with `notify` from the plugin (`notices_moved`), so the slice 1 version cannot
-deliver a task. A rollback needs a procedure from the hub owner (asked): either a backup of
-hub.db and the plugin SQL files, made with the hub stopped before the cutover release, and
-restored with the hub stopped and no pending outbox row of the newer state; or a reverse
-operation that the hub designs. The changes made after the cutover are lost (accepted by the
-coordinator); the release note must say so and name the procedure.
+deliver a task. A restore of hub.db is not the procedure: hub.db holds the records of every
+plugin. The hub lead's procedure (proposed, not built; it goes to hub/sql-r2 before the hub.sql
+release):
+
+1. Before the cutover: back up `<state>/sql/automations.db` with its `-wal` and `-shm` files.
+2. Rollback: stop the plugin; call `hub.admin.sql_notices_return {plugin}` (it refuses while the
+   plugin runs, drains the plugin's outbox, refuses if a row stays, and deletes the plugin's
+   `sql_notice_plugins` and `notice_receipts` rows in one transaction); move the release clone
+   back; start the plugin.
+3. A later forward copies the store again. The SQL file of the earlier cutover must not be open
+   as live: it has `cutover-1:done` and does not have the store changes made after the rollback,
+   and the plugin cannot see those changes. So the rollback moves the SQL file aside (asked of the
+   hub lead: in the same admin call; else a step of the procedure). The moved file stays as
+   evidence.
+
+The changes made after the cutover are lost (accepted by the coordinator); the release note must
+say so and name the procedure.
 
 ## Gaps sent to the SDK owners
 
