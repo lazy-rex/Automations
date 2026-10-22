@@ -84,6 +84,15 @@ local function scan(prefix, after, limit)
   return keys, page.records or {}, page.next
 end
 
+-- join is table.concat(list, sep) in blocks of 1000: in Rex Lua, table.concat of more than 2559
+-- items fails with "registry overflow" (observed on Rex 0.0.1792158932-g88fd41, lab; hub
+-- docs/rex-protocol.md).
+local function join(list, sep)
+  local blocks = {}
+  for i = 1, #list, 1000 do blocks[#blocks + 1] = table.concat(list, sep, i, math.min(i + 999, #list)) end
+  return table.concat(blocks, sep)
+end
+
 -- canon encodes a value with sorted object keys: the fingerprint of an operation's content.
 local function canon(v)
   if type(v) ~= 'table' then return rex.json.encode(v) end
@@ -91,14 +100,14 @@ local function canon(v)
   if #v > 0 then
     local out = {}
     for i = 1, #v do out[i] = canon(v[i]) end
-    return '[' .. table.concat(out, ',') .. ']'
+    return '[' .. join(out, ',') .. ']'
   end
   local keys = {}
   for k in pairs(v) do keys[#keys + 1] = tostring(k) end
   table.sort(keys)
   local out = {}
   for _, k in ipairs(keys) do out[#out + 1] = rex.json.encode(k) .. ':' .. canon(v[k]) end
-  return '{' .. table.concat(out, ',') .. '}'
+  return '{' .. join(out, ',') .. '}'
 end
 
 local function part(value) return tostring(#value) .. ':' .. value end

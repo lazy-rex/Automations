@@ -74,3 +74,16 @@ test('~ expands with HOME, and a path outside watch_roots shows the grant hint',
   expect_error(function() file_save('relative', 'notes/inbox') end, 'invalid_input')
   expect_error(function() file_save('unclean', F.dir('x') .. '/../x') end, 'invalid_input')
 end)
+
+-- Rex Lua: table.concat of more than 2559 items fails with "registry overflow" (hub
+-- docs/rex-protocol.md). The save fingerprint encodes its args before they are checked, so a
+-- trigger with a long list must get the refusal of a bad trigger, not an internal error.
+test('a trigger with a list of 3000 items is refused as invalid input', function()
+  local before = count()
+  local list = {}
+  for n = 1, 3000 do list[n] = n end
+  local err = expect_error(function() alice:call('automations.save', {key = 'long-list', name = 'Long list',
+    trigger = {kind = 'daily', at = '09:00', extra = list}, action = {profile = 'worker'}, instruction = 'Long list task.'}) end, 'invalid_input')
+  expect(err.message:find('registry', 1, true)).to_be(nil)
+  expect(count()).to_be(before)
+end)
