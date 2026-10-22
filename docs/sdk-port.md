@@ -159,59 +159,127 @@ equal; any other conflict stops the import. Until the cutover it runs only on a 
 ## The cutover (slice 2, proposed)
 
 The cutover is one plugin version. From its first start, SQL is the only store: no path reads or
-writes hub.store records after the import, and no path writes hub.store notices.
+writes hub.store records after the copy, and no path writes hub.store notices. The coordinator
+rule for SQL ports applies (2026-10-22): the tables are the target domain tables (no generic
+`records` table), and a temporary code adapter over them is allowed when it adds no new caller
+after the cutover, the plan names each function it replaces and the slice that deletes it, and
+that slice starts right after the cutover is approved on the branch.
 
-1. **Versioned import state.** `meta.import` holds `{version, state}`, version `cutover-1`, state
-   `copying` or `done`. At start, before anything else (in one transaction): when `meta.import`
-   is absent or has another version (for example the lab experiment's `imported = store`), the
-   plugin deletes every row of every table and writes `{cutover-1, copying}`. So stale
-   experimental rows are never taken as an import.
-2. **No other writer during the copy.** The hub runs one instance of a plugin, and its
-   retirement fence ends the old instance's calls before the new one starts (to verify in a lab:
-   a store batch of a retired instance gets `stale_instance`). The new instance is the only
-   writer of the plugin's store, and while the state is `copying` it starts no engine step, no
-   tick, no watch work and no reconcile; each export answers `unavailable` ("starting: importing
-   the automations"); each view shows that text and no action. `hub.changed` only marks. So the
-   store does not change during the copy, and the copy is one moment of it.
-3. **The copy.** The approved import steps. The last step sets `{cutover-1, done}` and
-   `meta.next_id`. Then the engine starts, as at a start today (every automation marked, the
-   sweep, the tick).
-4. **One store after the copy.** A storage layer with the store interface that the engine uses
-   today (`get`, `get1`, `scan`, `batch` with `if_rev`, the op records) runs on the SQL tables:
+1. **The storage state at start.** `meta.import` holds `cutover-1:copying` or `cutover-1:done`.
+   At start, before any other work, the plugin reads the meta table and the row counts, and takes
+   exactly one of these paths:
+
+   | State at start | Path |
+   |---|---|
+   | every table empty | write `cutover-1:copying` and the cursor `1:`, then copy |
+   | `cutover-1:copying` | resume the copy from its committed cursor |
+   | `cutover-1:done` | open SQL: the engine starts on the tables |
+   | the lab import layout: no `meta.import`, the meta names are a subset of `imported` (value `store`), `import_cursor` and `next_id` | delete every row of every table in one transaction, then as "every table empty" |
+   | any other state: another or newer version, another state word, rows without `meta.import` that are not the lab layout | refuse to start: no write; each export answers `unavailable` ("the storage state is not known"); views show that text; the log names the state |
+
+   Only the layout of the lab import (f962e2b, never on main) is rebuilt. A damaged marker or a
+   future version never makes the plugin copy the old store again. Tests: each row of the table,
+   and a restart after SQL-only changes (a save and a delivery after `done`) that keeps them and
+   does not copy again.
+2. **No other writer during the copy.** Every entry point checks one gate (`S.ready`), and the
+   copy sets it only after `done`:
+   - exports: `unavailable` ("starting: importing the automations");
+   - views: `render` shows that text and no action; `view.action` refuses;
+   - `hub.changed`: marks only; no drain, no step;
+   - the startup callback and the tick: no engine step, no reconcile, no sweep; the tick runs only
+     the next copy step.
+
+   The old instance: the hub retires it before the new one starts. A store batch of the old
+   instance that passed the caller check before the retirement must not commit after it. That is
+   the store write fence of hub/store-fence (f0c580c), which is not in f6f1a03. The cutover needs
+   it in the hub release that has hub.sql (asked of the hub lead). Test in a lab: an old-instance
+   batch held at the fence during a plugin reload; it gets `stale_instance`, and the copy does not
+   see its record.
+
+   Watch events: the hub keeps them while the copy runs (the watch, its `watch_id` and its unread
+   page stay in the hub). After `done`, the normal start reconciles (`hub.watch.list`, then
+   `ensure` with the same key, which keeps the `watch_id`) and drains from the hub cursor. To
+   verify in a lab: `ensure` on a live key during a new instance keeps the watch_id and its unread
+   events. Tests: a file that appears during the copy gives one run after `done`; a pending start
+   (stored request, no result) replays its key after `done` and gives one worker.
+3. **The copy.** The approved import steps. Then one store batch writes `meta/cutover` and gives
+   its revision R. The last SQL transaction sets `meta.rev = R`, `meta.next_id` and
+   `cutover-1:done`. A crash between the two writes the marker again (a later R) at the next start.
+   Then the engine starts, as at a start today.
+4. **The bridge** (temporary adapter, see the inventory below). It gives the store interface of
+   today (`get`, `get1`, `scan`, `batch` with `if_rev`, the op records) on the SQL tables:
    - a record key names its table and row (`auto/`, `state/`, `run/`, `preset/`, `seen/`, `rt/`,
      `meta/next_id`);
-   - `if_rev` is checked in the transaction (`rev` equal, or the row absent for `'0'`), and a
-     write stores the next decimal rev;
-   - the index keys (`q/`, `t/`, `dv/`, `box/`) are read from the run columns: a scan of `q/<id>/`
-     is the runs with that `q` in order, and so on. A batch write of an index key is checked
-     against the run that the same batch writes (the same `q`, `t`, status and agent), so the
-     batch keeps its meaning; it writes no row of its own;
+   - revisions: one counter `meta.rev`, initialized to R, which is above every revision that the
+     store gave (R is the store's own next revision). Each written row takes the next value, as
+     each written store record does today. The counter is a decimal string; SQLite adds one in
+     64-bit integers (`CAST(CAST(value AS INTEGER) + 1 AS TEXT)`), so Lua never holds it as a
+     number. No revision is used twice, and an imported revision keeps its text;
+   - `if_rev` is checked in the transaction: the row's `rev` equal, or the row absent for `'0'`;
+   - the derived index records (`q/`, `t/`, `dv/`, `box/`) have no row. A derived record exists
+     when a run has that column value (`q`, `t`; `dv` and `box` for a delivered run with its
+     agent). Its value is computed from the run (`{run}`, `{run, seq = tseq}`, `{agent}`,
+     `{attempt, auto}`). Its revision is the run's revision;
+   - `if_rev` on a derived record: `'0'` holds when no run before the batch gives it; another
+     value holds when the run that gives it has that revision;
+   - a batch write of a derived record holds when the run after the batch gives exactly that
+     value; a delete holds when no run after the batch gives it. Else the batch fails with
+     `conflict` and writes nothing. So a batch that deletes a run and its index records holds, and
+     a batch that writes an index record with no matching run fails;
+   - a stale index record (an entry with no run that gives it) cannot exist in SQL. The prune step
+     deletes such entries today; on the bridge that delete holds with no change;
    - `{notify = {agent, pending}}` becomes `app.notice(agent, pending)` in the same transaction;
-   - an op record (`{op = {key, fingerprint, result}}` of a batch) is an `ops` row in the same
-     transaction, and the replay reads `ops` under every caller ID.
-   This layer is a bridge, not the end state: the engine keeps its record logic, and slice 3
-   deletes the layer table by table.
+   - an op record (`{op = {key, fingerprint, result, result_revs}}`) is an `ops` row in the same
+     transaction, with `result_revs` filled from the revisions of that batch. The replay reads
+     `ops` under every ID of the caller, with the fingerprint check of today.
+
+   Tests for revisions: a conflict after an external call (a save between the spawn request and
+   the result batch makes the result batch fail and retry); a lost commit reply of a result batch,
+   then the replay; terminal pruning on the bridge; a run delete with its index records.
 5. **External calls stay outside a transaction.** Each batch is one transaction. A step that
-   calls `hub.spawn`, `hub.watch.*` or `hub.workers` does it between its batches, as today, so no
-   transaction spans a slow call; the start stores its request first and its result in a later
-   fenced batch.
-6. **Bounded work.** The delete cleanup keeps its pages (at most 50 rows in one batch) and its
-   resume after an error. The 48 KiB request measure of today stays as a bound on one batch.
-7. **Tests.** All 20 files run on the cutover version. The harness store calls of the tests
-   (`store()`, `write()`, `inject` on store batches) change to SQL (`sql()`, `sql_write()`, the
-   commit faults); the assertions stay. New:
-   - a start on a store with automations, runs, a watch, a pending start and saved replies: during
-     the copy, exports and views answer "importing" and nothing else changes; after it, the
-     pending start replays its key, the old Run now key (also under a legacy ID) replays, and the
-     next ID is new;
-   - a crash during the copy, and a start on stale experimental tables: the copy starts again
-     from empty tables;
+   calls `hub.spawn`, `hub.watch.*` or `hub.workers` does it between its batches, as today.
+6. **Bounded work.** The cleanup pages (at most 50 rows in one batch) and the 48 KiB measure of
+   one batch stay.
+7. **Tests.** All 20 files run on the cutover version. The harness store calls (`store()`,
+   `write()`, `inject` on store batches) change to SQL (`sql()`, `sql_write()`, the commit
+   faults); the assertions stay. New, besides the tests in 1 to 4:
+   - a crash during the copy resumes from its committed cursor and copies each record once; only
+     the lab import layout is rebuilt;
+   - an old Run now key replays from `ops` under the identity and under a legacy ID. When it
+     passes, the lazy `hub.store.op` lookup goes; until then it stays;
    - a delivery: the task and its notice commit together; a failed commit has neither; a lost
      commit reply delivers once; a store notice after the cutover is `notices_moved`.
 
-The old records stay in hub.store until a later cleanup commit. Rollback after the cutover goes
-to the slice 1 version and its store, which does not have the changes made after the cutover:
-the release note must say so.
+### The bridge inventory
+
+Each function of today that the bridge replaces, and the slice 3 step that deletes it. Slice 3
+starts when the cutover is approved on the branch. Release 4 can ship the cutover with the
+bridge; slice 3 follows as a plugin release.
+
+| Function today (automations.lua) | Bridge part | Deleted in |
+|---|---|---|
+| `scan` of `q/`, `t/`, `dv/`, `box/` (queue, prune, lost worker, read) | derived index records | 3a: runs queries on the columns (`ORDER BY q`, `ORDER BY t`, `status = 'delivered'`) |
+| `batch` ops on `q/`, `t/`, `dv/`, `box/`; `terminal_op`; the stale-entry prune | derived index checks | 3a: the run write sets the columns; the index ops go |
+| `get1`/`get`/`batch` on `run/` | the runs table, `if_rev` | 3a: run writes with `WHERE rev = ?` |
+| `get1`/`batch` on `auto/`, `state/`, `preset/`, `meta/next_id` | key mapping, `if_rev` | 3b: direct SQL for automations, states, presets, next ID |
+| `scan`/`batch` on `seen/`, `rt/` | key mapping | 3c: direct SQL for the markers |
+| the op records of `batch`, `result_revs`, the `hub.store.op` lookup (line 313) | ops mapping | 3d: the replay reads and writes `ops` directly |
+| `batch` notify | `app.notice` mapping | 3d: the steps call `app.notice` |
+| the bridge module, `fits`, the 48 KiB request measure | all | 3e: deleted; bounds become row counts |
+
+After 3e the plugin has no call to `hub.store.*`, except the copy steps of the import, which
+slice 4 deletes when no install can be older than the cutover.
+
+### Rollback
+
+Code rollback alone is not a rollback. At hub f6f1a03, the first SQL commit with a notice writes
+`sql_notice_plugins` in hub.db (`moveNotices`). After that, the hub refuses every
+`hub.store.batch` with `notify` from the plugin (`notices_moved`), so the slice 1 version cannot
+deliver a task. A rollback needs a procedure from the hub owner (asked): either a backup of
+hub.db and the plugin SQL files, made with the hub stopped before the cutover release, and
+restored with the hub stopped and no pending outbox row of the newer state; or a reverse
+operation that the hub designs. The changes made after the cutover are lost (accepted by the
+coordinator); the release note must say so and name the procedure.
 
 ## Gaps sent to the SDK owners
 
@@ -256,6 +324,8 @@ New in slice 2:
    one cutover commit series. The delivery moves to SQL only when the hub commits SQL notices in
    the same transaction. Nothing of it goes to main before the coordinator announces the launcher
    and hub.sql live.
-4. Slice 3, after Automations runs on SQL live: normalize the runs table first, then the others,
-   and delete the record logic that each one makes redundant.
+4. Slice 3, which starts when the cutover is approved on the branch (coordinator rule,
+   2026-10-22), not when SQL goes live: delete the bridge in the steps 3a to 3e of "The bridge
+   inventory" (runs first), with direct SQL on the same domain tables, and delete the record
+   logic that each step makes redundant.
 5. Remove the bridges that the SDK covers; report the line counts after each slice.
