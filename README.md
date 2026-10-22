@@ -215,6 +215,10 @@ cd ../../Automations && lazyrex-hub test
   4000-byte instruction and full args fits the budget.
 - pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
   turns: no automation delivers its whole backlog before another delivers its first run.
+- sql_import.lua (needs hub.sql: lab branch `hub/sql-r2` f6f1a03 or later): the import copies each
+  store record and saved reply exactly, with its rev, and the run columns equal the document; a
+  crash between pages (a written fixture of that state) resumes from the cursor and copies each
+  record once.
 - presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in

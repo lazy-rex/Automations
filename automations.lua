@@ -1722,7 +1722,11 @@ local agent_handlers = {
 -- The panel and forms are a sibling file (the Templates pattern): debug.getinfo gives the
 -- script's absolute path.
 local here = debug.getinfo(1, 'S').source:gsub('^@', '')
-local views = dofile(assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute') .. '/automations_view.lua')({
+local plugin_dir = assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute')
+-- The SQL storage (slice 2): the schema and the import from hub.store. No path reads it yet.
+local sql = dofile(plugin_dir .. '/automations_sql.lua')({app = app, scan = scan, hub = hub})
+app.db.migrate(sql.migrations)
+local views = dofile(plugin_dir .. '/automations_view.lua')({
   fail = fail, hub = hub, get = get, get1 = get1, scan = scan, size = size, cut = cut, state_of = state_of, USER = USER,
   PAGE_BUDGET = PAGE_BUDGET, PRESETS = PRESETS, PRESET_NAMES = PRESET_NAMES, preset_key = preset_key, run_prefix = run_prefix,
   watch_view = watch_view, watch_key = watch_key, save = save, runs = runs, run_now = run_now, set_enabled = set_enabled,
@@ -1820,6 +1824,18 @@ app.on('hub.changed', function(args)
   end
 end, {tx = false})
 
+-- The import copies hub.store into the SQL tables one page at a time, at start. A failed step
+-- tries again after RECHECK; a done import does nothing.
+local function import_step()
+  local ok, done = pcall(sql.import_step)
+  if not ok then
+    print('automations: import: ' .. (type(done) == 'table' and tostring(done.message) or tostring(done)))
+    rex.after(RECHECK, import_step)
+  elseif not done then
+    rex.after(0, import_step)
+  end
+end
+
 -- Startup work is not in the main chunk: a catch there can split module-level locals.
 rex.after(0, function()
   local ok, err = pcall(function()
@@ -1832,6 +1848,7 @@ rex.after(0, function()
     S.last_sweep = wall()
     tick()
   end)
+  import_step()
   if not ok then print('automations: startup: ' .. (type(err) == 'table' and tostring(err.message) or tostring(err))) end
   rex.every(TICK, function()
     local tick_ok, tick_err = pcall(tick)
