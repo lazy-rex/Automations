@@ -1,6 +1,7 @@
 -- Read tracking (hub 4.2 default): a view that is already open and subscribed gets the new tree
--- with no render request from the test. The test reads only the renderer's snapshot (v:get()) and
--- the render causes (renders()).
+-- with no render request from the test. The test reads the renderer's snapshot (v:get()) and the
+-- render causes (renders()); the profiles case also sends a focus event (v:seen), as the
+-- renderer does.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
 F.profiles()
 F.set_clock(F.at(2026, 11, 3, 10, 0))
@@ -40,17 +41,16 @@ test('a new agent profile shows in an open profile picker with no plugin handler
   wait('the picker drops the profile', function() return options(snapshot(v)).extra == nil end, 10)
 end)
 
-test('the start refusal text replaces the starting text in an open panel', function()
+test('a start refusal asks for an invalidate render of an open panel', function()
   local p = F.panel()
   local base = invalidates(p)
-  -- An unknown import marker: the start refuses and writes nothing.
+  -- An unknown import marker: the start refuses and writes nothing. The registration render can
+  -- also show the refusal text; the invalidate render comes from app.refresh after the refusal.
   F.reload(function() F.sql_write("UPDATE meta SET value = 'refresh-test:unknown' WHERE name = 'import'") end)
-  wait('the panel shows the refusal', function()
+  wait('the refusal text and an invalidate render', function()
     local n = H.node(snapshot(p), 'not_ready')
-    return n and tostring(n.text):find('cannot start', 1, true) ~= nil
+    return n and tostring(n.text):find('cannot start', 1, true) ~= nil and invalidates(p) > base
   end, 20)
-  -- The refusal reached the view through app.refresh, not through a commit or the registration.
-  expect(invalidates(p) > base).to_be(true)
   expect_error(function() agent('alice'):call('automations.list', {}) end, 'unavailable')
   F.reload(function() F.sql_write("UPDATE meta SET value = 'cutover-1:done' WHERE name = 'import'") end)
   wait('the panel opens again', function() return H.node(snapshot(p), 'not_ready') == nil end, 20)
