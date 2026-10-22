@@ -132,6 +132,14 @@ minute and never reads `isdst`.
   worker; stop it with `hub.stop`. The run keeps the dismissed spawn keys in `dismissed`.
 - Each new start checks the profile again. A profile that is no longer an agent profile fails the
   run before `hub.spawn`.
+- A start that the hub never sent fails with an error that starts with `not_created` (hub Fix A,
+  hub 89cab8f or later). Nothing of it exists, so the plugin starts it again once with a new spawn
+  key, without a Retry. That is one automatic restart for each start admission: a second
+  failure fails the run. Retry and the requeue of a lost worker's run are new admissions, so each
+  can restart once again. A delete stops the restart: after the delete fence, the run fails. A
+  disabled automation keeps its admitted runs, so their starts can still restart. Only a stored
+  failed result counts; a call error never restarts. The run shows the replaced spawn key in
+  `restarted`.
 
 ## Run retention
 
@@ -182,8 +190,10 @@ cd ../../Automations && lazyrex-hub test
   listed and refuses changes; retry after a start failure (new spawn key) and an agent failure
   (attempt 2); disable keeps admitted runs and refuses run and retry; cancel of a queued run does
   not block the next run; `unknown_start` after 10 minutes, and dismiss lets the next run start.
-- not_created.lua: a start that the hub never sent (error `not_created`) fails its run as a
-  definite failure, never `unknown_start`; Retry starts one worker with a new spawn key. It needs
+- not_created.lua: a start that the hub never sent (error `not_created`) starts again once with a
+  new key and delivers; a second `not_created` or another failure fails the run, never
+  `unknown_start`, and Retry starts one worker with a new key; a lost reply of the restart batch
+  and a hub crash after it start key /2 once; after a delete there is no restart. It needs
   the spawn-create fault mode `fail-sending` (hub 89cab8f or later); on an older hub, such as the
   live hub fc0cd19, this file fails. Not covered: a hub crash between the admission and the
   sending commits (the hub's own tests cover it), and a `not_created` call error when the hub

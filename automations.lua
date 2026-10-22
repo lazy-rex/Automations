@@ -533,6 +533,22 @@ local function spawn_step(id, st_rec)
     return false
   end
   local run = run_rec.value
+  -- A start that the hub never sent (hub Fix A) created nothing, so the plugin starts it again
+  -- once with a new key: one retry per start admission, never after a delete. Only a stored
+  -- failed result counts, never a call error. The run and the new request commit in one batch
+  -- before the new key is sent.
+  local err = result.status == 'failed' and result.error
+  if ok and type(err) == 'string' and (err == 'not_created' or err:sub(1, 12) == 'not_created:') and not sp.auto and not st.deleted then
+    local problem = profile_problem(run.task)
+    if not problem then
+      run.starts = (run.starts or 0) + 1
+      run.restarted = sp.request.key
+      st.spawning = {run = sp.run, since = now(), request = spawn_request(sp.run, run.starts, run.task), auto = true}
+      batch({{key = sp.run, if_rev = run_rec.rev, value = run}, {key = 'state/' .. id, if_rev = st_rec.rev, value = st}})
+      return true
+    end
+    result.error = problem
+  end
   run.status = 'failed'
   run.error = cut(tostring(result.error or ('The start ended as ' .. tostring(result.status))), MAX_ERROR)
   local q = run.q
@@ -1285,7 +1301,7 @@ local PHASE_NEXT = {S = 'D', D = 'Q', Q = 'T'}
 local function run_view(run_key, run)
   return {run_key = run_key, kind = run.kind, status = run.status, at = run.at, slot = run.slot, item = run.item, by = run.by,
     attempt = run.attempt, starts = run.starts, agent = run.agent, error = run.error, outcome = run.outcome, summary = run.summary,
-    retries = run.retries, dismissed = run.dismissed}
+    retries = run.retries, dismissed = run.dismissed, restarted = run.restarted}
 end
 local function runs_cursor(id, after)
   if after == nil then return 'S', nil end
@@ -1734,7 +1750,7 @@ local exports = {
     description = 'End a run whose worker start has no outcome after 10 minutes (status unknown_start). The plugin never uses that start again, and the next run starts a new worker. Warning: the pane of the dismissed start can still appear, and it can be a duplicate worker. It stays in hub.workers; stop it with hub.stop. The run keeps the dismissed spawn key in dismissed.',
     args = {type = 'object', properties = {run_key = {type = 'string', minLength = 1}, key = key_arg}, required = {'run_key', 'key'}, additionalProperties = false}},
   {name = 'automations.runs', title = 'List the runs of an automation',
-    description = 'List the runs of one automation: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome, summary, retries and dismissed (the spawn keys of dismissed starts). Order: the starting run first, then delivered, queued (queue order) and ended runs (the newest end first). Reading changes nothing. Pages: limit (default 20, at most 50), about 40 KB, and at most 50 index entries read; pass next as after. A page can be empty and still have next: follow next until it is absent. A run that changes status between pages can come twice or not at all; for one consistent view, read again from the first page.',
+    description = 'List the runs of one automation: run_key, kind (f file, d daily, m manual), status, at, slot, item (the file: name, path, seq, watch_id), attempt, starts, agent, error, outcome, summary, retries, dismissed (the spawn keys of dismissed starts) and restarted (the most recent spawn key that an automatic restart replaced: a start that the hub never sent, error not_created, starts again once with a new key in each start admission). Order: the starting run first, then delivered, queued (queue order) and ended runs (the newest end first). Reading changes nothing. Pages: limit (default 20, at most 50), about 40 KB, and at most 50 index entries read; pass next as after. A page can be empty and still have next: follow next until it is absent. A run that changes status between pages can come twice or not at all; for one consistent view, read again from the first page.',
     args = {type = 'object', properties = {id = {type = 'string', minLength = 1}, after = {type = 'string', minLength = 1},
       limit = {type = 'integer', minimum = 1, maximum = 50}}, required = {'id'}, additionalProperties = false}},
   {name = 'automations.read', title = 'Read your automation tasks',
