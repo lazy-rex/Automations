@@ -288,7 +288,7 @@ deliver a task. A restore of hub.db is not the procedure: hub.db holds the recor
 plugin. The hub lead's procedure (proposed, not built; it goes to hub/sql-r2 before the hub.sql
 release):
 
-1. Before the cutover: back up `<state>/sql/automations.db` with its `-wal` and `-shm` files.
+1. Before the cutover: a consistent SQLite backup of `<state>/sql/automations.db` (a backup operation, or a copy after the hub closed its connections; not a file copy of a live database and its `-wal` and `-shm` files).
 2. Rollback: stop the plugin; call `hub.admin.sql_return {plugin}`; move the release clone back;
    start the plugin. The admin call refuses while the plugin is registered or desired running. It
    drains the plugin's outbox and refuses if a row stays. It closes the hub's connections to the
@@ -296,7 +296,7 @@ release):
    `<plugin>.db.returned-<UTC time>`; it never deletes it. Then, in one hub.db transaction, it
    deletes the plugin's `sql_notice_plugins` and `notice_receipts` rows. It answers
    `{returned = <backup name>}`. A retry after a stop between the rename and the transaction finds
-   no file and does only the transaction.
+   no file and does only the transaction. Reviewer requirements (hub-owned, to verify): no crash between the steps lets a start replay the retired outbox or reopen the stale file; the archive is outside the directory of active SQL databases; a test interrupts at each durable boundary, then checks legacy delivery and a later forward import.
 3. A later forward starts with no SQL file and copies the store again. The renamed file is never
    live: it has `cutover-1:done` and does not have the store changes made after the rollback, and
    the plugin cannot see those changes. The file stays as evidence.
