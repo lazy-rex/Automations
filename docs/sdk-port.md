@@ -77,8 +77,10 @@ later cutover (slice 2): no release has SQL reads beside store writes.
 - The hub calls stay on a local wrapper over `app.hub` that keeps today's codes: no code,
   `disconnected`, `timeout`, `client_unavailable` and `unavailable` are `unavailable` (an unknown
   outcome). The SDK maps only `disconnected`.
-- The launcher: until the hub runs `boot.lua`, the plugin puts the SDK directory (test arg
-  `lazyrex_sdk`) in `package.path` itself. So slice 1 can run in a lab, not on the live hub.
+- The launcher: the manifest has `"sdk": "0"`, and the hub starts the plugin through the SDK
+  launcher (`boot.lua`, hub 0ae7451 on the lab branch `hub/sql-r2`), which puts the SDK in
+  `package.path`. The plugin has no path setup of its own. Until the launcher is live, slice 1 runs
+  in a lab only (slice 1 is 6fb8b4a, approved for its branch).
 - Removed: `client.keymap`, `hub.register`, the `exports` table, the dispatch and `agent_caller`'s
   `hub.identify` call. Measured at the end of the slice.
 
@@ -204,7 +206,8 @@ New in slice 2:
 1. This plan (review).
 2. Slice 1, against the current hub (`app.hub`, store engine).
 3. Slice 2 on the lab branch hub/sql-r2: first the storage module and the import, used by no
-   production path, with their tests; then the exports, the engine steps and the views on SQL, in
+   production path, with their tests; (done: f962e2b, approved for its branch; the import runs
+   only on a lab trigger); then the exports, the engine steps and the views on SQL, in
    one cutover commit series. The delivery moves to SQL only when the hub commits SQL notices in
    the same transaction. Nothing of it goes to main before the coordinator announces the launcher
    and hub.sql live.
