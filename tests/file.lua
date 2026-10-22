@@ -156,18 +156,27 @@ test('a file whose run passes the budget gives one failed run without the path',
   expect(#F.runs(alice, id, 'f')).to_be(1)
 end)
 
--- A backlog over several read pages (50 rows each): every file gets exactly one run.
+-- A backlog over several read pages (50 rows each): every file gets exactly one run. The gate
+-- holds the first start, so no run changes its phase while the test lists the pages (a run that
+-- moves from Q to D between two pages is not in the list).
 test('a backlog of 120 files gives 120 runs', function()
   local dir = F.dir('backlog')
   local id = automation('backlog', dir)
+  local gate = fault({point = 'action', action = 'hub.spawn', when = 'before', mode = 'gate'})
   for i = 1, 120 do F.put(string.format('%s/n%03d.md', dir, i)) end
-  local runs = F.wait_runs(alice, id, 120, 60)
+  local function count() return #sql('SELECT run_key FROM runs WHERE automation_id = ?', {id}) end
+  wait('120 file runs', function() return count() >= 120 end, 60)
+  wait('the held start', function() return fault_fired(gate) end, 10)
+  -- No second run of a file comes later.
   rex.sleep(3)
-  runs = F.runs(alice, id, 'f')
+  expect(count()).to_be(120)
+  local runs = F.runs(alice, id, 'f')
   expect(#runs).to_be(120)
   local seen = {}
   for _, r in ipairs(runs) do
     expect(seen[r.item.name]).to_be(nil)
     seen[r.item.name] = true
   end
+  for i = 1, 120 do expect(seen[string.format('n%03d.md', i)]).to_be(true) end
+  fault_release(gate)
 end)
