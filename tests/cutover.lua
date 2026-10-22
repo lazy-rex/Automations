@@ -39,6 +39,8 @@ end
 -- The fixture on SQL: automation a with two delivered runs to one worker and a Run now of that
 -- worker (its spawn ID becomes a legacy ID later), the vault-health preset (b), a deleted
 -- highest ID (c), and a backlog of cancelled runs with their terminal entries.
+-- fixture fills the fields of ids and worker: a closure write to a captured local can be lost
+-- after a caught error (Rex Lua runtime, docs/rex-protocol.md).
 local ids, worker = {}, {}
 local function fixture()
   local made = rex.exec({'mkdir', '-p', H.args.lab .. '/home/knowledge'})
@@ -73,18 +75,18 @@ local function fixture()
   local st = F.store('state/' .. a)
   st.value.next_t = base + BACKLOG
   F.write({{key = 'state/' .. a, if_rev = st.rev, value = st.value}})
-  ids = {a = a, b = b, c = c, first = first.run_key, second = second.run_key}
-  worker = {agent = one.agent, pane = w}
+  ids.a, ids.b, ids.c, ids.first, ids.second = a, b, c, first.run_key, second.run_key
+  worker.agent, worker.pane = one.agent, w
 end
 
 -- check compares every SQL row with its store record, and every store record with its row.
 local function check()
-  local n = 0
+  local seen = {n = 0}
   local function compare(key, row)
     local rec = store(key)
     expect(rec.rev).to_be(row.rev)
     if not same(rex.json.decode(row.doc), rec.value) then error('the document of ' .. key .. ' differs from the store record') end
-    n = n + 1
+    seen.n = seen.n + 1
   end
   for _, r in ipairs(sql('SELECT id, rev, doc FROM automations')) do compare('auto/' .. r.id, r) end
   for _, r in ipairs(sql('SELECT id, rev, doc FROM states')) do compare('state/' .. r.id, r) end
@@ -113,7 +115,7 @@ local function check()
   local drift = sql([[SELECT run_key FROM runs WHERE status IS NOT json_extract(doc, '$.status') OR q IS NOT json_extract(doc, '$.q')
     OR t IS NOT json_extract(doc, '$.t') OR agent IS NOT json_extract(doc, '$.agent')]])
   expect(#drift).to_be(0)
-  return n
+  return seen.n
 end
 local function marker() return meta('import') end
 
@@ -136,12 +138,12 @@ test('the first start copies the store exactly; the gate holds until done', func
   rex.sleep(2)
   F.to_store()
   -- The copy fails at its first run page 10 times (a retry each second), then goes on.
-  local inj
+  local inj = {}
   F.reload(function()
     F.empty_tables()
-    inj = inject({match = {sql_commit_writes = 'runs'}, fail = 'held for the gate test', fail_code = 'unavailable', times = 10})
+    inj.id = inject({match = {sql_commit_writes = 'runs'}, fail = 'held for the gate test', fail_code = 'unavailable', times = 10})
   end)
-  wait('the held run page', function() return injection(inj).consumed >= 1 end, 30)
+  wait('the held run page', function() return injection(inj.id).consumed >= 1 end, 30)
   expect(marker()).to_be('cutover-1:copying')
   expect_closed('importing')
   wait('the copy', function() return marker() == 'cutover-1:done' end, 60)
@@ -293,12 +295,12 @@ end)
 
 test('a crash during the copy resumes from its committed cursor', function()
   -- The hub crash ends the injection with the hub process.
-  local inj
+  local inj = {}
   F.reload(function()
     F.empty_tables()
-    inj = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'held for the crash test', fail_code = 'unavailable', times = 'always'})
+    inj.id = inject({match = {sql_commit_writes = 'runs'}, skip = 1, fail = 'held for the crash test', fail_code = 'unavailable', times = 'always'})
   end)
-  wait('the held second run page', function() return injection(inj).consumed >= 1 end, 60)
+  wait('the held second run page', function() return injection(inj.id).consumed >= 1 end, 60)
   local keys = sql('SELECT run_key FROM runs ORDER BY run_key')
   expect(#keys).to_be(50)
   expect(meta('import_cursor')).to_be('4:' .. keys[50].run_key)

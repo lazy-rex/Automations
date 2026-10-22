@@ -26,13 +26,13 @@ test('a file that appears during the copy and a pending start each run once afte
   F.to_store()
   -- The new instance copies; its first run page fails 10 times, so the copy waits about 10 s. The
   -- file appears while the plugin is stopped, before the copy.
-  local inj
+  local inj = {}
   F.reload(function()
     F.empty_tables()
-    inj = inject({match = {sql_commit_writes = 'runs'}, fail = 'held for the work test', fail_code = 'unavailable', times = 10})
+    inj.id = inject({match = {sql_commit_writes = 'runs'}, fail = 'held for the work test', fail_code = 'unavailable', times = 10})
     F.put(dir .. '/during.md', 'new')
   end)
-  wait('the held run page', function() return injection(inj).consumed >= 1 end, 30)
+  wait('the held run page', function() return injection(inj.id).consumed >= 1 end, 30)
   expect(F.copied()).to_be(false)
   -- No file run while the copy waits (the exports answer unavailable: the tables show it).
   rex.sleep(2)

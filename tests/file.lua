@@ -129,9 +129,9 @@ test('a removed file retires its marker after a lost ack reply and a crash', fun
   wait('the marker to retire', function() return marker(id, runs[1]).rev == '0' end, 20)
   expect(retire(id, runs[1]).rev).to_be('0')
   F.put(dir .. '/r.md')
-  runs = F.wait_runs(alice, id, 2)
-  expect(names(runs)).to_be('r.md r.md')
-  expect(runs[1].run_key).not_to_be(runs[2].run_key)
+  local both = F.wait_runs(alice, id, 2)
+  expect(names(both)).to_be('r.md r.md')
+  expect(both[1].run_key).not_to_be(both[2].run_key)
 end)
 
 -- A run over the 12 KiB budget (amendment 1, detail 1): an 8 KiB encoded instruction, a long

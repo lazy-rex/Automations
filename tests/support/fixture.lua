@@ -354,9 +354,9 @@ return function(H)
   -- instance: the hub process stays, so the injections and faults of setup stay armed.
   F.TABLES = {'meta', 'automations', 'states', 'runs', 'presets', 'seen', 'retired', 'ops'}
   function F.to_store()
-    local ops = {}
-    local function flush() if #ops > 0 then H.write(ops) end ops = {} end
-    local function put(key, value) ops[#ops + 1] = {key = key, value = value} if #ops >= 30 then flush() end end
+    local batch = {ops = {}}
+    local function flush() if #batch.ops > 0 then H.write(batch.ops) end batch.ops = {} end
+    local function put(key, value) batch.ops[#batch.ops + 1] = {key = key, value = value} if #batch.ops >= 30 then flush() end end
     local next_id = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1]
     if next_id then put('meta/next_id', {n = tonumber(next_id.value)}) end
     for _, r in ipairs(H.sql('SELECT id, doc FROM automations')) do put('auto/' .. r.id, rex.json.decode(r.doc)) end
