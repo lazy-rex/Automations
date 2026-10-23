@@ -17,7 +17,8 @@ return function(A)
 
   -- The base step (hub docs/plugin-sdk.md, "A base step") makes schema version 12 on a new
   -- database: the tables of the steps 1 to 12 that release 4.2 shipped, and the revision counter
-  -- at 0. A database at version 12 runs no step. tests/schema.lua compares the two schemas.
+  -- at 0. Step 13 deletes the rows of the copy from hub.store that release 4.2 made
+  -- (meta.import and meta.import_cursor). tests/schema.lua compares the two schemas.
   local SCHEMA = {
     'CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)',
     'CREATE TABLE automations (id TEXT PRIMARY KEY, rev TEXT NOT NULL, doc TEXT NOT NULL)',
@@ -35,7 +36,9 @@ return function(A)
   M.migrations = {base = 12, function(sdb)
     for _, s in ipairs(SCHEMA) do sdb.exec(s) end
     sdb.exec("INSERT INTO meta (name, value) VALUES ('rev', '0')")
-  end}
+  end,
+    "DELETE FROM meta WHERE name IN ('import', 'import_cursor')", -- version 13
+  }
 
   -- --- Revisions ---
 
