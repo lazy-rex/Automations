@@ -12,8 +12,9 @@ return function(H)
   function F.at(y, m, d, hh, mm) return os.time({year = y, month = m, day = d, hour = hh, min = mm, sec = 0}) end
 
   -- The worker profile starts lazyrex-hub testagent in the spawned pane. Its client label names
-  -- the spawn's agent ID (LAZYREX_AGENT, set by the hub, for example spawn:spawn-<hex>) without its
-  -- "spawn:" prefix, so a test can call as the worker. It does not join: an agent spawn opens when
+  -- the pane (REX_BLOCK, set by Rex, without its "block:" prefix), so a test can call as the
+  -- worker. The hub sets no variable for an agent (hub docs/hub.md, "Environment"), and a
+  -- hub.workers row gives the pane as block_id. The worker does not join: an agent spawn opens when
   -- its agent reports its identity from the spawn's pane (hub docs/hub.md, spawn_adopted via
   -- identity). Profile commands are trusted test code (docs/testing.md, "Isolation").
   -- Before the test agent starts, the pane reports the conversation identity claude:w-<that name>,
@@ -23,7 +24,7 @@ return function(H)
   -- profile_list is the base list; a test can add profiles to it and write it.
   -- NAME strips the prefix with sed: the hub reads each "${...}" in a command as a profile arg
   -- token, so the scripts use no "${".
-  local NAME = [=[n=$(printf '%s' "$LAZYREX_AGENT" | sed 's/^spawn://'); ]=]
+  local NAME = [=[n=$(printf '%s' "$REX_BLOCK" | sed 's/^block://'); ]=]
   local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-$n\",\"source\":\"startup\"}"; ]]
   local AGENT = [[exec "$0" testagent -id "$n"]]
   function F.profile_list()
@@ -35,9 +36,10 @@ return function(H)
     }
   end
   function F.silent() return {id = 'silent', name = 'Silent', kind = 'agent', command = {'/bin/sh', '-c', NAME .. AGENT, H.args.hub_bin}} end
-  -- identity is the identity that a worker profile reports for a spawn's agent ID.
-  local function name(agent_id) return (agent_id:gsub('^spawn:', '')) end
-  function F.identity(agent_id) return 'claude:w-' .. name(agent_id) end
+  -- name is the pane name of a hub.workers row. identity is the identity that a worker profile
+  -- reports in the row's pane.
+  local function name(row) return (assert(row.block_id, 'the worker has no pane'):gsub('^block:', '')) end
+  function F.identity(row) return 'claude:w-' .. name(row) end
   function F.profiles() H.write_profiles({profiles = F.profile_list()}) end
 
   function F.workers(profile)
@@ -57,9 +59,15 @@ return function(H)
 
   -- worker returns a caller for the test agent in a spawned pane: call goes through the agent
   -- face (the MCP path), as an agent's tool call. id is the identity that the profile reported
-  -- (a run's agent) or the spawn's agent ID. The caller's id is the given id.
+  -- (a run's agent), or a hub.workers row (a worker with no identity yet). The caller's id is the
+  -- identity, or the row's agent_id.
   function F.worker(id)
-    local agent_id = id:match('^claude:w%-(.+)$') or name(id)
+    local agent_id
+    if type(id) == 'table' then
+      agent_id, id = name(id), id.agent_id
+    else
+      agent_id = assert(id:match('^claude:w%-(.+)$'), 'not a worker identity: ' .. id)
+    end
     local client = H.wait('the worker ' .. agent_id .. ' to start', function() return H.resolve('lazyrex-testagent:' .. agent_id) end, 20)
     return {id = id,
       call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end,

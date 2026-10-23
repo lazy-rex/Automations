@@ -44,7 +44,7 @@ test('a daily run starts one worker, which reads and completes its task', functi
   expect(st.worker.spawn_id).to_be(run.spawn_id)
   local row = alice:hub('hub.workers', {spawn_id = run.spawn_id}).workers[1]
   expect(run.agent).to_be(row.identity_id)
-  expect(run.agent).to_be(F.identity(row.agent_id))
+  expect(run.agent).to_be(F.identity(row))
   expect(st.daily_high).to_be('2026-11-03')
   expect(st.spawning).to_be(nil)
   -- One box entry and the notice intent.
