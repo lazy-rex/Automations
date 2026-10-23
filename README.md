@@ -86,8 +86,10 @@ notice text into the worker's pane when the worker is ready. The worker reads it
   report. The admitted start keeps its run until the pane has an identity, and waits for
   `hub.changed {what = "workers"}`. A delete or an action edit during that wait keeps the
   admitted run. After 10 minutes with no identity the run is `unknown_start`, as a pending start.
-  A spawn that is gone before its first identity got no task: its run goes back to its place in
-  the queue (no notice, no attempt), or is cancelled after a delete.
+  A spawn that is gone before its first identity got no task (no notice, no attempt): its run
+  fails, as a refused start does, and Retry starts it again. After a delete it is cancelled. The
+  plugin never starts it again by itself: a profile whose program exits before it reports would
+  loop (observed in the lab on 2026-10-23: 64 spawns in about 2 s, until Rex's window limit).
 - A `/clear` in the worker pane makes a new identity there. The tasks of the old identity go to
   the new identity in the same spawn as attempt + 1 (the coordinator, 2026-10-23).
 - An agent is its identity only. An ID that it had before (a legacy roster ID) gives it no task
@@ -354,7 +356,8 @@ cd ../../Automations && lazyrex-hub test
   tries again; a stopped worker is replaced.
 - identity.lua: an open worker with no identity gets no task and no second worker, and its first
   report delivers; a stop
-  before the report queues the run again at its place; a delete or an action edit during the wait
+  before the report fails the run, and Retry starts it again; a program that exits before it
+  reports is started once; a delete or an action edit during the wait
   keeps the admitted run; a hub restart during the wait; no report for 10 minutes is
   `unknown_start`, and after a dismiss a late report gets nothing; a resume in another pane and an
   agent exit move the task; a legacy roster ID gets no saved reply and no task. Test limit: the

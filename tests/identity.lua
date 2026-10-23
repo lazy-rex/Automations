@@ -5,6 +5,8 @@
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
 local list = F.profile_list()
 list[#list + 1] = F.silent()
+-- quitter is an agent profile whose program exits at once, before any report.
+list[#list + 1] = {id = 'quitter', name = 'Quitter', kind = 'agent', command = {'/bin/sh', '-c', 'exit 0'}}
 H.write_profiles({profiles = list})
 local T0 = F.at(2026, 11, 3, 10, 0)
 F.set_clock(T0)
@@ -56,28 +58,43 @@ test('an open worker with no identity gets no task and no second worker; its fir
   expect(#pane:call('automations.read', {}).tasks).to_be(2)
 end)
 
--- A stop before the first report: nothing was delivered. The run goes back to its place at the
--- head of the queue with no agent and no attempt, and the next start has a new key.
-test('a worker stopped before its first report: the run is queued again at the head, with a new start', function()
+-- A stop before the first report: nothing was delivered. The run fails with no agent and no
+-- attempt, as a refused start does, and the next queued run starts its own worker. Retry starts
+-- the failed run again with a new key.
+test('a worker stopped before its first report: the run fails, and Retry starts it again', function()
   local id = automation('stop')
   local first = run_now(id, 'stop-1')
   local row = opened(id)
   local second = run_now(id, 'stop-2')
-  local q, tries = F.run(first).q, F.run(first).attempt
+  local tries = F.run(first).attempt
   expect(alice:hub('hub.stop', {spawn_id = row.spawn_id}).status).to_be('closed')
-  local run = wait('the second start of ' .. first, function()
-    local r = F.run(first)
-    return r.starts == 2 and r
-  end, 20)
+  local run = F.wait_status(first, 'failed')
+  expect(run.error).to_be('The worker ended before it reported its conversation identity')
   expect(run.unstarted.spawn_id).to_be(row.spawn_id)
   expect(run.unstarted.key).to_be('automations/spawn/' .. first .. '/1')
-  expect(run.q).to_be(q)
+  expect(run.q).to_be(nil)
   expect(run.agent).to_be(nil)
   expect(run.attempt).to_be(tries)
   expect(run.lost).to_be(nil)
-  expect(F.run(second).status).to_be('queued')
-  expect(F.state(id).spawning.run).to_be(first)
-  expect(F.state(id).spawning.request.key).to_be('automations/spawn/' .. first .. '/2')
+  expect(run.starts).to_be(1)
+  local st = wait('the start of ' .. second, function()
+    local s = F.state(id)
+    return s.spawning and s.spawning.run == second and s
+  end, 20)
+  expect(st.spawning.request.key).to_be('automations/spawn/' .. second .. '/1')
+  alice:call('automations.retry', {run_key = first, key = 'stop-retry'})
+  expect(F.run(first).status).to_be('queued')
+end)
+
+-- A profile whose program exits before it reports: one start, and the run fails. The plugin never
+-- starts it again by itself (a start again at once would loop until Rex's window limit).
+test('a worker that exits before it reports is started once, and the run fails', function()
+  local id = automation('quit', 'quitter')
+  local first = run_now(id, 'quit-1')
+  F.wait_status(first, 'failed', 20)
+  rex.sleep(3)
+  expect(F.run(first).starts).to_be(1)
+  expect(F.run(first).status).to_be('failed')
 end)
 
 -- A delete during the wait: the admitted run is not cancelled and is delivered at the report;

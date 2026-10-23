@@ -502,17 +502,18 @@ local function wait_start(id, sp, run, run_rev)
 end
 
 -- unstarted (in a commit): the spawn of an admitted start is gone before its pane had an identity.
--- Nothing was delivered: no agent, no attempt, no notice. The run keeps its queue key (the
--- admission keeps q; only deliver clears it), so it stays first in the queue, and keeps starts, so
--- a later start has a new key. After a delete it is cancelled.
+-- Nothing was delivered: no agent, no attempt, no notice. The run fails, as a refused start does:
+-- a start again at once would loop when the profile's program exits before it reports. Retry
+-- starts it again with a new key (starts is kept). After a delete it is cancelled.
 local function unstarted(id, st, sp, run, run_rev)
   run.unstarted = {spawn_id = sp.spawn_id, key = sp.request.key, at = now()}
   if st.deleted then
-    run.status, run.error, run.q = 'cancelled', 'worker gone before it started, after delete', nil
-    terminal(st, id, run)
+    run.status, run.error = 'cancelled', 'worker gone before it started, after delete'
   else
-    run.status = 'queued'
+    run.status, run.error = 'failed', 'The worker ended before it reported its conversation identity'
   end
+  run.q = nil
+  terminal(st, id, run)
   D.put_run(sp.run, run_rev, run)
 end
 
