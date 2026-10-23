@@ -641,7 +641,8 @@ end
 -- --- File watches ---
 
 -- Each trigger generation has its own watch key, so a changed trigger never meets the old spec
--- (watch_conflict). settle_ms is fixed per plugin run: a test sets it short (manifest).
+-- (hub.watch.ensure answers operation_conflict). settle_ms is fixed per plugin run: a test sets
+-- it short (manifest).
 local SETTLE_MS = tonumber(rex.args.settle_ms) or 1000
 local WATCH_PAGE = 50
 local function watch_key(id, gen) return 'a-' .. id .. '-' .. tostring(gen) end
