@@ -192,7 +192,7 @@ return function(A)
     local a = auto.action
     lines[#lines + 1] = 'Profile: ' .. tostring(a.profile) .. (a.cwd and (' · in ' .. a.cwd) or '') .. (a.title and (' · tab ' .. a.title) or '')
     if auto.preset then lines[#lines + 1] = 'Preset: ' .. auto.preset end
-    if type(st.worker) == 'table' then lines[#lines + 1] = 'Worker: ' .. tostring(st.worker.agent_id) end
+    if type(st.worker) == 'table' then lines[#lines + 1] = 'Worker: spawn ' .. tostring(st.worker.spawn_id) end
     lines[#lines + 1] = 'Instruction: ' .. cut(auto.instruction or '', 500)
     return table.concat(lines, '\n')
   end

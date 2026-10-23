@@ -14,16 +14,24 @@ return function(H)
   -- The worker profile starts lazyrex-hub testagent in the spawned pane. It joins as the spawn's
   -- agent ID (LAZYREX_AGENT, set by the hub), and its client label names that ID, so a test can
   -- call as the worker. Profile commands are trusted test code (docs/testing.md, "Isolation").
+  -- Before the test agent starts, the pane reports the conversation identity
+  -- claude:w-<spawn's agent ID>, as an agent CLI's start hook does; the plugin delivers to that
+  -- identity. The pane's process is the same before and after exec. F.silent is a profile that
+  -- reports nothing: its worker has no identity until a test reports one. A test adds it to the list.
   -- profile_list is the base list; a test can add profiles to it and write it.
+  local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-$LAZYREX_AGENT\",\"source\":\"startup\"}"; ]]
+  local AGENT = [[exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"]]
   function F.profile_list()
     return {
-      {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c',
-        'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin}},
+      {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin}},
       {id = 'tasked', name = 'Tasked', kind = 'agent', args = {{name = 'task', label = 'Task', required = true}},
-        command = {'/bin/sh', '-c', 'exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"', H.args.hub_bin, '${task}'}},
+        command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin, '${task}'}},
       {id = 'logtail', name = 'Log tail', kind = 'accessory', command = {'/bin/sh', '-c', 'exec tail -f /dev/null'}},
     }
   end
+  function F.silent() return {id = 'silent', name = 'Silent', kind = 'agent', command = {'/bin/sh', '-c', AGENT, H.args.hub_bin}} end
+  -- identity is the identity that a worker profile reports for a spawn's agent ID.
+  function F.identity(agent_id) return 'claude:w-' .. agent_id end
   function F.profiles() H.write_profiles({profiles = F.profile_list()}) end
 
   function F.workers(profile)
@@ -42,19 +50,23 @@ return function(H)
   end
 
   -- worker returns a caller for the test agent in a spawned pane: call goes through the agent
-  -- face (the MCP path), as an agent's tool call.
-  function F.worker(agent_id)
+  -- face (the MCP path), as an agent's tool call. id is the identity that the profile reported
+  -- (a run's agent) or the spawn's agent ID. The caller's id is the given id.
+  function F.worker(id)
+    local agent_id = id:match('^claude:w%-(.+)$') or id
     local client = H.wait('the worker ' .. agent_id .. ' to start', function() return H.resolve('lazyrex-testagent:' .. agent_id) end, 20)
     H.wait('the worker ' .. agent_id .. ' to join', function()
       local s = H.perform(client, 'agent.status', {})
       return s.joined
     end, 20)
-    return {id = agent_id,
+    return {id = id,
       call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end,
       -- report sends hub.identity.report from a new process in the worker's pane, as an agent hook.
       report = function(_, kind, conversation_id)
         return H.perform(client, 'agent.report', {args = {kind = kind, conversation_id = conversation_id, source = 'startup'}}, 20000)
-      end}
+      end,
+      -- exit ends the test agent process, as the user quits an agent CLI.
+      exit = function() pcall(H.perform, client, 'agent.exit', {}) end}
   end
 
   -- Files: the manifest grants LAB/inbox (test.watch_roots). dir makes a directory under it.

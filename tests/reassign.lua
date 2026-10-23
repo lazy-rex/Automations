@@ -46,25 +46,36 @@ test('a stopped worker: the task goes to a new worker as attempt 2', function()
   expect(notice(two.agent).pending).to_be(false)
 end)
 
-test('a new conversation in the worker pane: the old one loses its task, and its late done is refused', function()
+-- A /clear (or any new conversation) in the worker pane: the pane's identity changes. The tasks of
+-- the old identity go to the new identity in the same spawn, as attempt 2 (the coordinator,
+-- 2026-10-23); no new worker starts. The two runs of one spawn name different identities while
+-- the first moves, so each run is checked against its own agent.
+test('a new conversation in the worker pane: its tasks go to the new conversation in the same spawn, and the old attempt is refused', function()
   local id = automation('identity')
   local first = alice:call('automations.run', {id = id, key = 'identity-1'})
   local one = F.wait_status(first.run_key, 'delivered')
+  local other = alice:call('automations.run', {id = id, key = 'identity-2'})
+  expect(F.wait_status(other.run_key, 'delivered').agent).to_be(one.agent)
+  local before = F.running('worker')
   local pane = F.worker(one.agent)
-  -- The pane's first conversation.
-  pane:report('claude', 'automations-reassign-1')
-  rex.sleep(2.5)
-  -- A second conversation in the same pane: the first one is no longer current. The worker does
-  -- not count as running, so the task moves.
   pane:report('claude', 'automations-reassign-2')
   local two = delivered_again(first.run_key, 2)
-  expect(two.agent).not_to_be(one.agent)
+  local three = delivered_again(other.run_key, 2)
+  expect(two.agent).to_be('claude:automations-reassign-2')
+  expect(two.spawn_id).to_be(one.spawn_id)
+  expect(two.lost.agent).to_be(one.agent)
+  expect(three.agent).to_be(two.agent)
+  expect(F.running('worker')).to_be(before)
+  expect(F.state(id).worker.spawn_id).to_be(one.spawn_id)
   expect(F.held(one.agent, first.run_key)).to_be(nil)
-  -- The old pane, now another conversation, sees nothing and cannot complete the old attempt.
-  expect(#pane:call('automations.read', {}).tasks).to_be(0)
+  expect(notice(one.agent).pending).to_be(false)
+  expect(notice(two.agent).pending).to_be(true)
+  -- The pane, now the new conversation, has both tasks as attempt 2 and cannot complete attempt 1.
+  local tasks = pane:call('automations.read', {}).tasks
+  expect(#tasks).to_be(2)
+  expect(tasks[1].attempt).to_be(2)
   expect_error(function() pane:call('automations.done', {run_key = first.run_key, attempt = 1, key = 'identity-late'}) end, 'stale_delivery')
-  expect(F.run(first.run_key).status).to_be('delivered')
-  F.worker(two.agent):call('automations.done', {run_key = first.run_key, attempt = 2, key = 'identity-done'})
+  expect(pane:call('automations.done', {run_key = first.run_key, attempt = 2, key = 'identity-done'}).status).to_be('done')
 end)
 
 test('two delivered tasks of a lost worker both move', function()

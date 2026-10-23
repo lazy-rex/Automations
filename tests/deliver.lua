@@ -40,7 +40,11 @@ test('a daily run starts one worker, which reads and completes its task', functi
   expect(run.task.instruction).to_be('Check the vault for first.')
   expect(#F.workers('worker')).to_be(before + 1)
   local st = F.state(id)
-  expect(st.worker.agent_id).to_be(run.agent)
+  -- The worker key is the spawn; the run goes to the identity that the worker pane reported.
+  expect(st.worker.spawn_id).to_be(run.spawn_id)
+  local row = alice:hub('hub.workers', {spawn_id = run.spawn_id}).workers[1]
+  expect(run.agent).to_be(row.identity_id)
+  expect(run.agent).to_be(F.identity(row.agent_id))
   expect(st.daily_high).to_be('2026-11-03')
   expect(st.spawning).to_be(nil)
   -- One box entry and the notice intent.

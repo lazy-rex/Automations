@@ -1,26 +1,10 @@
--- Whether the worker runs. Only a definite observation counts: a lookup that
--- fails for another reason keeps the worker, and the step tries again later. A wrong "absent"
+-- Whether the worker runs (hub.workers {spawn_id}). Only a definite observation counts: a read that
+-- fails keeps the worker, and the step tries again later. A wrong "absent"
 -- would start a second worker.
 local F = assert(loadfile(H.args.file:match('^(.*)/[^/]*$') .. '/support/fixture.lua'))()(H)
 F.profiles()
 F.set_clock(F.at(2026, 11, 3, 10, 0))
 local alice = agent('alice')
-
-test('an unavailable identity lookup does not replace a running worker', function()
-  local saved = alice:call('automations.save', {key = 'lookup-save', name = 'Lookup',
-    trigger = {kind = 'daily', at = '09:00'}, action = {profile = 'worker'}, instruction = 'Lookup task.'})
-  local first = alice:call('automations.run', {id = saved.id, key = 'lookup-first'})
-  local delivered = F.wait_status(first.run_key, 'delivered')
-  F.worker(delivered.agent)
-  local before = #F.workers('worker')
-  local injected = fault({point = 'action', action = 'hub.agents.resolve', when = 'before', mode = 'fail', fail_code = 'unavailable'})
-  local second = alice:call('automations.run', {id = saved.id, key = 'lookup-second'})
-  local next_run = F.wait_status(second.run_key, 'delivered')
-  expect(fault_fired(injected)).to_be(true)
-  expect(#F.workers('worker')).to_be(before)
-  expect(next_run.agent).to_be(delivered.agent)
-  expect(next_run.starts).to_be(0)
-end)
 
 test('a failed hub.workers read does not replace a running worker', function()
   local saved = alice:call('automations.save', {key = 'workers-save', name = 'Workers',

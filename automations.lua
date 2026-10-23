@@ -409,37 +409,41 @@ end
 
 -- --- Workers ---
 
--- worker_runs: the spawn row is running (open, with a live process), and its agent is current.
--- A spawned agent that has not joined yet is current too: its box entry waits, and the hub
--- writes the notice when it is ready. So a second run never starts a second worker during a slow
--- join. An identity is current only in state current: after /clear in the pane, the spawn ID's
--- alias stays with the superseded conversation (hub docs, "Agent actions through Rex").
-local function worker_runs(worker)
-  if type(worker) ~= 'table' then return false end
-  local row
-  for _, w in ipairs(hub('hub.workers').workers or {}) do
-    if w.spawn_id == worker.spawn_id then row = w end
-  end
-  -- In hub.workers, state is the row's lifecycle (starting, running, exited, failed); status is
-  -- the pane's program status, not the spawn row's (hub/cmd/hub/workers.go at 06b22ca).
-  if not row or row.state ~= 'running' then return false end
-  -- Only a definite answer says that the agent is gone: the hub knows no such agent, or the
-  -- identity is not current. Any other failure raises, so the step keeps the worker and tries
-  -- again later. hub.workers and hub.agents raise the same way.
-  local ok, resolved = pcall(hub, 'hub.agents.resolve', {to = worker.agent_id})
+-- A worker is an agent spawn: its spawn ID is the worker key, and a task goes to the current
+-- identity in its pane (hub docs, hub.workers: identity_id, identity_seen). observe reads one
+-- spawn (hub.workers {spawn_id}) and answers its kind:
+--   gone: not_found (closed or unknown), or state exited or failed. identity_id is not read then.
+--   alive: running with an identity_id; .identity is that ID.
+--   waiting: no identity_id, and the pane never had one (a new pane before its first report).
+--   ended: no identity_id, and the pane had one (the program left, or the conversation resumed in
+--   another pane).
+-- "open" from hub.spawn says nothing about the identity; the hub sends hub.changed workers when
+-- it changes. Only a definite answer counts: any other failure raises, so the step keeps the
+-- worker and tries again later. A row that breaks the contract also raises.
+local function observe(spawn_id)
+  if type(spawn_id) ~= 'string' or spawn_id == '' then return {kind = 'gone'} end
+  local ok, out = pcall(hub, 'hub.workers', {spawn_id = spawn_id})
   if not ok then
-    local message = type(resolved) == 'table' and tostring(resolved.message) or tostring(resolved)
-    if message:find('no agent matches', 1, true) then return false end
-    error(resolved, 0)
+    if type(out) == 'table' and out.code == 'not_found' then return {kind = 'gone'} end
+    error(out, 0)
   end
-  if type(resolved.id) ~= 'string' or resolved.id == '' then fail('internal', 'hub.agents.resolve gave no id') end
-  for _, a in ipairs(hub('hub.agents', {all = true}).agents or {}) do
-    if a.id == resolved.id then
-      if a.legacy then return a.alias_of == nil end
-      return a.state == 'current'
-    end
+  local row = type(out) == 'table' and type(out.workers) == 'table' and out.workers[1]
+  if type(row) ~= 'table' or row.spawn_id ~= spawn_id then fail('internal', 'hub.workers gave no row for spawn ' .. spawn_id) end
+  if row.state == 'exited' or row.state == 'failed' then return {kind = 'gone'} end
+  local id, seen = row.identity_id, row.identity_seen
+  if type(seen) ~= 'boolean' or (id ~= nil and (type(id) ~= 'string' or id == '')) then
+    fail('internal', 'hub.workers gave no valid identity_id or identity_seen for spawn ' .. spawn_id)
   end
-  fail('unavailable', 'hub.agents does not list ' .. resolved.id .. ' yet')
+  if id then return row.state == 'running' and {kind = 'alive', identity = id} or {kind = 'waiting'} end
+  return {kind = seen and 'ended' or 'waiting'}
+end
+
+-- An established worker (the current worker, or the spawn of a delivered run) had an identity, and
+-- identity_seen never goes back to false. A waiting answer for it breaks that contract: the step
+-- raises and moves nothing.
+local function established(o, spawn_id)
+  if o.kind == 'waiting' then fail('internal', 'hub.workers says that spawn ' .. spawn_id .. ' never had an identity') end
+  return o
 end
 
 -- other_task says whether the agent ID has a delivered run other than run_key. A notice row
@@ -498,33 +502,71 @@ end
 
 -- --- Engine steps ---
 
--- spawn_step replays the stored spawn request (never a new key) and applies its result.
+-- wait_start keeps a start that has no worker identity yet. After UNKNOWN_AFTER from the
+-- admission the run is unknown_start, and dismiss can end it.
+local function wait_start(id, sp, run, run_rev)
+  if run.status == 'starting' and now() - sp.since >= UNKNOWN_AFTER then
+    run.status = 'unknown_start'
+    commit(function() D.put_run(sp.run, run_rev, run) end)
+  end
+  S.retry_at[id] = wall() + RECHECK
+  return false
+end
+
+-- unstarted (in a commit): the spawn of an admitted start is gone before its pane had an identity.
+-- Nothing was delivered: no agent, no attempt, no notice. The run keeps its queue key (the
+-- admission keeps q; only deliver clears it), so it stays first in the queue, and keeps starts, so
+-- a later start has a new key. After a delete it is cancelled.
+local function unstarted(id, st, sp, run, run_rev)
+  run.unstarted = {spawn_id = sp.spawn_id, key = sp.request.key, at = now()}
+  if st.deleted then
+    run.status, run.error, run.q = 'cancelled', 'worker gone before it started, after delete', nil
+    terminal(st, id, run)
+  else
+    run.status = 'queued'
+  end
+  D.put_run(sp.run, run_rev, run)
+end
+
+-- spawn_step replays the stored spawn request (never a new key) and applies its result. An open
+-- spawn is stored in st.spawning.spawn_id; from then on the step reads that spawn, not hub.spawn,
+-- until its pane has an identity. The admitted start keeps st.spawning during that wait: a delete
+-- does not cancel it, and an action edit starts no other worker. Then the run goes to the
+-- identity with the spec that it was started with.
 local function spawn_step(id, st, st_rev)
   local sp = st.spawning
   local run, run_rev = D.run(sp.run)
   if not run then fail('internal', 'The spawning run ' .. sp.run .. ' is missing') end
+  if sp.spawn_id then
+    local o = observe(sp.spawn_id)
+    if o.kind == 'alive' then
+      st.worker = {spawn_id = sp.spawn_id, spec = spec(run.task)}
+      st.spawning = nil
+      commit(function()
+        deliver(sp.run, run, run_rev, o.identity, sp.spawn_id)
+        D.put_state(id, st_rev, st)
+      end)
+      return true
+    end
+    if o.kind == 'gone' then
+      st.spawning = nil
+      commit(function() unstarted(id, st, sp, run, run_rev); D.put_state(id, st_rev, st) end)
+      return true
+    end
+    return wait_start(id, sp, run, run_rev)
+  end
   local ok, result = pcall(hub, 'hub.spawn', sp.request)
   if not ok then
     local code = type(result) == 'table' and result.code or 'unavailable'
     if code == 'unavailable' then S.retry_at[id] = wall() + RECHECK; return false end
     result = {status = 'failed', error = type(result) == 'table' and result.message or tostring(result)}
   end
-  if result.status == 'open' and type(result.agent_id) == 'string' and result.agent_id ~= '' then
-    st.worker = {spawn_id = result.spawn_id, agent_id = result.agent_id, spec = spec(run.task)}
-    st.spawning = nil
-    commit(function()
-      deliver(sp.run, run, run_rev, result.agent_id, result.spawn_id)
-      D.put_state(id, st_rev, st)
-    end)
+  if result.status == 'open' and type(result.spawn_id) == 'string' and result.spawn_id ~= '' then
+    sp.spawn_id = result.spawn_id
+    commit(function() D.put_state(id, st_rev, st) end)
     return true
   end
-  if result.status == 'pending' then
-    if run.status == 'starting' and now() - sp.since >= UNKNOWN_AFTER then
-      run.status = 'unknown_start'
-      commit(function() D.put_run(sp.run, run_rev, run) end)
-    end
-    S.retry_at[id] = wall() + RECHECK
-    return false
+  if result.status == 'pending' then return wait_start(id, sp, run, run_rev)
   end
   -- A start that the hub never sent (not_created) created nothing, so the plugin starts it again
   -- once with a new key: one retry per start admission, never after a delete. Only a stored
@@ -574,11 +616,13 @@ local function lose(id, st, run_key, run, run_rev)
   app.notice(agent, other_task(agent, run_key))
 end
 
--- lost_step requeues one delivered run whose worker is gone (after a delete it cancels it). A
--- run of an older worker (an action change starts a new current worker) is checked against its
--- own spawn: that worker finishes the tasks that it has. When the current worker definitely does
--- not run, it is forgotten. An uncertain observation raises (worker_runs), so nothing is
--- requeued on a guess.
+-- lost_step requeues one delivered run whose worker no longer holds it (after a delete it cancels
+-- it). A run is held while its spawn is alive and the pane's identity is the run's agent. After a
+-- /clear the pane has a new identity: the run is lost, and the next step delivers it to the new
+-- identity in the same spawn (the coordinator, 2026-10-23). A run of an older worker (an action
+-- change starts a new current worker) is checked against its own spawn: that worker finishes
+-- the tasks that it has. When the current worker is gone or ended, it is forgotten. An uncertain
+-- observation raises (observe), so nothing is requeued on a guess.
 -- The scan goes one page at a time from S.dv_after[id] and wraps at the end, so a page of live
 -- tasks never hides a later lost one. A page with a requeue is
 -- read again by the next step. It returns nil when the page has no lost run.
@@ -587,16 +631,16 @@ local function lost_step(id, st, st_rev)
   local page, more = delivered_runs(id, S.dv_after[id], DV_PAGE)
   if #page == 0 then S.dv_after[id] = nil; return nil end
   local current = type(st.worker) == 'table' and st.worker.spawn_id or nil
+  -- One read for each spawn on the page. The answer is the spawn's kind and identity, not a
+  -- yes or no: runs of one spawn can name different identities.
   local seen = {}
   for _, r in ipairs(page) do
     local run = r.value
     local sid = tostring(run.spawn_id)
-    if seen[sid] == nil then
-      if run.spawn_id == current then seen[sid] = worker_runs(st.worker)
-      else seen[sid] = worker_runs({spawn_id = run.spawn_id, agent_id = run.agent}) end
-    end
-    if not seen[sid] then
-      if run.spawn_id == current then st.worker = nil end
+    if seen[sid] == nil then seen[sid] = established(observe(run.spawn_id), sid) end
+    local o = seen[sid]
+    if not (o.kind == 'alive' and o.identity == run.agent) then
+      if run.spawn_id == current and o.kind ~= 'alive' then st.worker = nil end
       commit(function() lose(id, st, r.key, run, r.rev); D.put_state(id, st_rev, st) end)
       return true
     end
@@ -925,12 +969,17 @@ local function step(id)
   if not first then return S.dv_after[id] ~= nil end
   local run_key, run, run_rev = first.key, first.value, first.rev
   if run.status ~= 'queued' then fail('internal', 'The first run in the queue, ' .. run_key .. ', is ' .. tostring(run.status)) end
-  if type(st.worker) == 'table' and st.worker.spec == spec(run.task) and worker_runs(st.worker) then
-    commit(function()
-      deliver(run_key, run, run_rev, st.worker.agent_id, st.worker.spawn_id)
-      D.put_state(id, st_rev, st)
-    end)
-    return true
+  -- The current worker takes the run while it is alive, at its current identity. A worker that is
+  -- gone or ended is replaced by the start below.
+  if type(st.worker) == 'table' and st.worker.spec == spec(run.task) then
+    local o = established(observe(st.worker.spawn_id), tostring(st.worker.spawn_id))
+    if o.kind == 'alive' then
+      commit(function()
+        deliver(run_key, run, run_rev, o.identity, st.worker.spawn_id)
+        D.put_state(id, st_rev, st)
+      end)
+      return true
+    end
   end
   -- Start admission: a new start counter gives a new key; the request is stored before the call.
   -- The profile can change after save, so a new start checks it again. A replay
