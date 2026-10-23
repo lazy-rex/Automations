@@ -265,39 +265,27 @@ end
 -- --- Callers ---
 
 -- Management is open to every caller (decision "Agents may act on anything"). Task access
--- (read, done) belongs to the agent that holds the delivery. caller.ids are every ID of the agent:
--- its identity and the legacy IDs it took over.
-local USER = {id = 'user', ids = {'user'}}
--- The SDK identifies an agent caller (hub.identify): ctx.agent and its legacy IDs in ctx.aliases.
+-- (read, done) belongs to the agent that holds the delivery: the identity that the run names.
+-- An ID that the agent had before (a legacy roster ID) gives it nothing: rows saved under such an
+-- ID before 4.3 do not move (the coordinator, 2026-10-23: the loss is accepted).
+local USER = {id = 'user'}
+-- The SDK identifies an agent caller (hub.identify): ctx.agent.
 local function caller_of(ctx)
   if ctx.user then return USER end
-  local ids = {ctx.agent}
-  for _, l in ipairs(type(ctx.aliases) == 'table' and ctx.aliases or {}) do
-    if type(l) == 'string' and l ~= '' then ids[#ids + 1] = l end
-  end
-  for _, id in ipairs(ids) do
-    if #id > 128 or id:find('[%c/]') then fail('refused', 'An ID of this agent has a slash or control characters, or is over 128 bytes') end
-  end
-  return {id = ctx.agent, ids = ids}
+  local id = ctx.agent
+  if #id > 128 or id:find('[%c/]') then fail('refused', 'The ID of this agent has a slash or control characters, or is over 128 bytes') end
+  return {id = id}
 end
-local function holds(caller, agent)
-  for _, id in ipairs(caller.ids) do if id == agent then return true end end
-  return false
-end
+local function holds(caller, agent) return caller.id == agent end
 
--- Operations replay by key. The op key holds the caller ID, so two agents never share one; a
--- replay looks under every ID of the caller (also a reply saved under a legacy ID).
+-- Operations replay by key. The op key holds the caller ID, so two agents never share one.
 local function op_key(kind, id, key) return kind .. '/' .. part(id) .. part(key) end
 local function replay(kind, caller, key, fingerprint)
   text_arg(key, 'key', 128)
-  for _, id in ipairs(caller.ids) do
-    local saved = D.op(op_key(kind, id, key))
-    if saved then
-      if saved.fingerprint ~= nil and saved.fingerprint ~= fingerprint then fail('conflict', 'The key ' .. key .. ' was used for other content') end
-      return saved.reply
-    end
-  end
-  return nil
+  local saved = D.op(op_key(kind, caller.id, key))
+  if not saved then return nil end
+  if saved.fingerprint ~= nil and saved.fingerprint ~= fingerprint then fail('conflict', 'The key ' .. key .. ' was used for other content') end
+  return saved.reply
 end
 
 -- --- Records ---
@@ -1491,40 +1479,31 @@ local function read(caller, args)
   local limit = args.limit or 20
   if type(limit) ~= 'number' or limit % 1 ~= 0 or limit < 1 or limit > 50 then fail('invalid_input', 'limit is an integer from 1 to 50') end
   if args.after ~= nil then text_arg(args.after, 'after', 1024) end
-  local prefixes = {}
-  for _, id in ipairs(caller.ids) do prefixes[#prefixes + 1] = 'box/' .. id .. '/' end
-  table.sort(prefixes)
+  local prefix = 'box/' .. caller.id .. '/'
   local tasks, used, cursor = {}, 64, nil
-  -- Prefixes end with "/", so the keys of one prefix are contiguous. A cursor in a later prefix
-  -- skips this one; a cursor in this prefix starts after it.
-  for _, prefix in ipairs(prefixes) do
-    local after, skip = nil, false
-    if args.after then
-      if args.after:sub(1, #prefix) == prefix then after = args.after
-      elseif args.after > prefix then skip = true end
-    end
-    local page, more = {}, false
-    if not skip then
-      page, more = D.run_page("status = 'delivered' AND agent = ? AND run_key > ? ORDER BY run_key",
-        {prefix:sub(5, -2), after and after:sub(#prefix + 1) or ''}, limit + 1)
-    end
-    for _, rec in ipairs(page) do
-      if #tasks >= limit then cursor = tasks[#tasks].box break end
-      local key = prefix .. rec.key
-      local view = task_view(rec.key, rec.value)
-      local n = size(view) + 1
-      if used + n > PAGE_BUDGET then
-        if #tasks == 0 then fail('too_large', 'Task ' .. rec.key .. ' is too large to list; use after = "' .. key .. '"') end
-        cursor = tasks[#tasks].box
-        break
-      end
-      view.box = key
-      tasks[#tasks + 1] = view
-      used = used + n
-    end
-    if cursor then break end
-    if #tasks >= limit and more then cursor = tasks[#tasks].box break end
+  -- The box keys sort by box/<agent ID>/<run key>. A cursor in the caller's box starts after it; a
+  -- cursor that sorts after the box gives an empty page, and one before it starts at the box start.
+  local after = ''
+  if args.after then
+    if args.after:sub(1, #prefix) == prefix then after = args.after:sub(#prefix + 1)
+    elseif args.after > prefix then return {tasks = tasks} end
   end
+  local page, more = D.run_page("status = 'delivered' AND agent = ? AND run_key > ? ORDER BY run_key", {caller.id, after}, limit + 1)
+  for _, rec in ipairs(page) do
+    if #tasks >= limit then cursor = tasks[#tasks].box break end
+    local key = prefix .. rec.key
+    local view = task_view(rec.key, rec.value)
+    local n = size(view) + 1
+    if used + n > PAGE_BUDGET then
+      if #tasks == 0 then fail('too_large', 'Task ' .. rec.key .. ' is too large to list; use after = "' .. key .. '"') end
+      cursor = tasks[#tasks].box
+      break
+    end
+    view.box = key
+    tasks[#tasks + 1] = view
+    used = used + n
+  end
+  if not cursor and #tasks >= limit and more then cursor = tasks[#tasks].box end
   for _, task in ipairs(tasks) do task.box = nil end
   return {tasks = tasks, next = cursor}
 end

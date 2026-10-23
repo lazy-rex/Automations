@@ -189,3 +189,31 @@ test('a worker whose agent exits: its task moves to a new worker', function()
   local two = attempt(first, 2)
   expect(two.spawn_id).not_to_be(one.spawn_id)
 end)
+
+-- An ID that the worker had before its identity (the spawn's roster ID, which the hub still names
+-- in ctx.aliases) gives it nothing: a reply saved under it does not replay, and a task delivered
+-- to it is not the worker's. Such a task is lost once and goes to the identity as attempt + 1.
+-- The coordinator accepted this loss for rows from before 4.3 (2026-10-23).
+test('a legacy roster ID gives the worker no saved reply and no task; its delivered run moves once', function()
+  local id = automation('legacy', 'worker')
+  local first = run_now(id, 'legacy-1')
+  local one = F.wait_status(first, 'delivered')
+  local roster = alice:hub('hub.workers', {spawn_id = one.spawn_id}).workers[1].agent_id
+  local w = F.worker(one.agent)
+  local function key(k) return 'run/' .. #roster .. ':' .. roster .. #k .. ':' .. k end
+  F.sql_write('INSERT INTO ops (key, fingerprint, reply) VALUES (?, ?, ?)',
+    {key('legacy-op'), 'run-v1/' .. rex.json.encode({id = id}), rex.json.encode({run_key = 'run/' .. id .. '/m/000099'})})
+  local fresh = w:call('automations.run', {id = id, key = 'legacy-op'})
+  expect(fresh.run_key).not_to_be('run/' .. id .. '/m/000099')
+  -- A delivered run of the roster ID: the worker does not list it, and the plugin moves it.
+  local run, rev = F.run(first), F.rev('runs', first)
+  run.agent = roster
+  F.write({{tbl = 'runs', key = first, if_rev = rev, value = run}})
+  -- The plugin can move it at once, so a listed task of that run is the new attempt.
+  for _, t in ipairs(w:call('automations.read', {}).tasks) do
+    if t.run_key == first then expect(t.attempt).to_be(2) end
+  end
+  local two = attempt(first, 2)
+  expect(two.agent).to_be(one.agent)
+  expect(two.lost.agent).to_be(roster)
+end)
