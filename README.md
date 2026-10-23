@@ -210,27 +210,19 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   20 queued runs, or 50 markers or terminal runs. No transaction spans `hub.spawn` or another
   slow hub call: a start stores its request, calls the hub, then stores the result in a second,
   fenced transaction.
-- The schema has one base step (hub `docs/plugin-sdk.md`, "A base step") and step 13. A new
-  database runs both in one migration transaction and ends at version 13: the base makes the
-  tables above (version 12) and sets `meta.rev` = 0, then step 13 runs. Step 13 deletes the import
-  rows that the copy from hub.store of release 4.2 left (`meta.import`, `meta.import_cursor`). A
-  database of release 4.2 is at version 12: it runs only step 13 and keeps every other row.
-- The base is `base = 12`: it folds the steps 1 to 12 of release 4.2 (plugin commit 4fc4938, schema
-  version 12). The live database was at version 12 when the coordinator checked a read-only copy on
-  2026-10-23. The base alone changes no live database, and step 13 moves it to version 13. The
-  plugin owns the eight tables above and their four indexes (`runs_auto`, `runs_delivered`, `runs_q`,
-  `runs_t`). The `lazyrex_*` objects belong to the hub SDK; the plugin does not make them.
-- Release dependency: this plugin needs the SDK of hub release 4.3. It must not run on the hub of
-  release 4.2: that SDK ignores `base`, runs the base as step 1 and sets a wrong `user_version`. So
-  the 4.3 hub is deployed first. The releases 4.2 and 4.2.1 keep the plugin at 4fc4938. The 4.3
-  rehearsal on a read-only copy of live data covers this change.
-- Fix forward: step 13 deletes rows, so a return to release 4.2 after step 13 loses data. A defect
-  in release 4.3 is fixed forward with a new commit. A rollback of the hub and this plugin to
-  release 4.2 is not a supported recovery after step 13.
+- The schema is one base step, `base = 13` (hub `docs/plugin-sdk.md`, "A base step"). A new
+  database gets the tables above and `meta.rev` = 0, at version 13. It folds the old steps 1 to 13
+  (the old step 13 deleted only the import rows of the copy from hub.store). A database at version
+  13 runs nothing and keeps every row. A database at a version from 1 to 12 refuses to start, and
+  nothing changes. The live database was at version 13 when the coordinator deployed main on
+  2026-10-23 (about 19:28 UTC). The plugin owns the eight tables above and their four indexes
+  (`runs_auto`, `runs_delivered`, `runs_q`, `runs_t`). The `lazyrex_*` objects belong to the hub
+  SDK; the plugin does not make them.
+- The plugin needs a hub SDK with the base step (hub main a407e08a and later). An older SDK runs
+  the base as step 1 and sets a wrong `user_version`.
 - After the migrations, the start checks the counters: `meta.rev` must be a valid counter, and
   `next_id` and `next_id_rev` both canonical or both absent. Otherwise the engine starts no work
-  and writes nothing, each tool answers `unavailable`, and the panel says why. The SDK runs the
-  migrations before this check, so step 13 and the new `user_version` can be committed already.
+  and writes nothing, each tool answers `unavailable`, and the panel says why.
 
 ## Agents
 
@@ -251,7 +243,7 @@ isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No
 own Rex server.
 
 Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on a hub whose SDK
-has the base step `app.db.migrate {base = N}` (hub main a407e08a and later; the hub of release 4.3).
+has the base step `app.db.migrate {base = N}` (hub main a407e08a and later).
 An older SDK runs the base as step 1 of a new database. The suite passes on hub main a407e08a
 (observed 2026-10-23, on the Linux lab host): it uses the SQL test hooks, the test renderer and the
 render counts of `renders()`.
@@ -307,9 +299,8 @@ cd ../../Automations && lazyrex-hub test
   change and no saved reply, and the same key then makes the change once; manual runs take the
   numbers 1 and 2 from the state, and a replay makes no run.
 - schema.lua: the schema of a new database (the base step) equals the schema that the old steps
-  1 to 12 make (`sqlite_master`, the columns and the index columns); a version-12 database from
-  the old steps, with the import rows of release 4.2, gets step 13: the import rows go, and it keeps
-  every other row, its revision counter and its next ID; an old key replays, and a new automation
+  1 to 13 make (`sqlite_master`, the columns and the index columns); a version-13 database from
+  the old steps keeps every row, its revision counter and its next ID; an old key replays, and a new automation
   takes the next ID and a higher revision.
 - storage.lua: a new database starts `meta.rev` at 0; an old key replays, and the next ID is
   new; while a delivery commit is held, the worker has no task

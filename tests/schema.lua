@@ -1,7 +1,6 @@
--- The schema steps (docs/plugin-sdk.md in the hub, "A base step"): a new database gets the schema
--- of the old steps 1 to 12, and a database that the old steps made keeps its rows. Step 13
--- deletes only the import rows of release 4.2. Without step 13 (09a9a43 and VERSION = 12), both
--- tests also pass on the old steps themselves (4fc4938), where the first start copies hub.store.
+-- The schema (docs/plugin-sdk.md in the hub, "A base step"): base = 13. A new database gets the
+-- schema of the old steps 1 to 13 (the old step 13 deleted only rows, so the schema is that of
+-- steps 1 to 12), and a database that the old steps made, at version 13, keeps its rows.
 local dir = H.args.file:match('^(.*)/[^/]*$')
 local F = assert(loadfile(dir .. '/support/fixture.lua'))()(H)
 local OLD = assert(loadfile(dir .. '/support/schema12.lua'))()
@@ -33,8 +32,8 @@ local function dump()
   for _, t in ipairs(F.TABLES) do out[t] = sql('SELECT * FROM ' .. t .. ' ORDER BY 1') end
   return out
 end
--- rebuild makes a version-12 database from the old steps and inserts rows (a dump), all while the
--- plugin is stopped.
+-- rebuild makes a version-13 database from the old steps and inserts rows (a dump), all while the
+-- plugin is stopped. The old step 13 changed no schema.
 local function rebuild(rows)
   for _, t in ipairs(F.TABLES) do sql_write('DROP TABLE ' .. t) end
   sql_write('PRAGMA user_version = 0')
@@ -50,7 +49,7 @@ local function rebuild(rows)
       sql_write('INSERT INTO ' .. t .. ' (' .. table.concat(cols, ', ') .. ') VALUES (' .. table.concat(marks, ', ') .. ')', params)
     end
   end
-  sql_write('PRAGMA user_version = 12')
+  sql_write('PRAGMA user_version = 13')
 end
 local function answers() return (pcall(alice.call, alice, 'automations.list', {})) end
 -- A revision is a decimal string: compare by length, then as text.
@@ -59,7 +58,7 @@ local function above(a, b)
   return a > b
 end
 
-test('a new database has the schema of the old steps 1 to 12', function()
+test('a new database has the schema of the old steps 1 to 13', function()
   local new = schema()
   expect(user_version()).to_be(VERSION)
   local names = {}
@@ -70,10 +69,8 @@ test('a new database has the schema of the old steps 1 to 12', function()
   expect(schema()).to_equal(new)
 end)
 
-test('a version-12 database from the old steps keeps its rows, its revision and its next ID', function()
-  -- An empty database as the copy left it: the done marker and a revision counter.
-  F.reload(function() rebuild({meta = {{name = 'import', value = 'cutover-1:done'}, {name = 'import_cursor', value = '9:'},
-    {name = 'rev', value = '0'}}}) end)
+test('a version-13 database from the old steps keeps its rows, its revision and its next ID', function()
+  F.reload(function() rebuild({meta = {{name = 'rev', value = '0'}}}) end)
   wait('the start', answers, 30)
   local made = rex.exec({'mkdir', '-p', H.args.lab .. '/home/knowledge'})
   assert(made and made.ok, 'mkdir failed')
@@ -89,21 +86,10 @@ test('a version-12 database from the old steps keeps its rows, its revision and 
   -- No other work: no daily slot comes, and the delivered run waits for its worker's done.
   for _, id in ipairs({a, b}) do alice:call('automations.set_enabled', {id = id, enabled = false, key = 'keep-off-' .. id}) end
   rex.sleep(2)
-  -- rows.kept: the rows without the import rows. rows.before adds the import rows of a database
-  -- that the copy made (their live values); step 13 deletes them.
   local rows = {}
   F.reload(function()
-    rows.kept, rows.before = dump(), dump()
-    local meta, kept = {}, {}
-    for _, r in ipairs(rows.before.meta) do
-      if r.name ~= 'import' and r.name ~= 'import_cursor' then meta[#meta + 1] = r; kept[#kept + 1] = r end
-    end
-    rows.kept.meta = kept
-    meta[#meta + 1] = {name = 'import', value = 'cutover-1:done'}
-    meta[#meta + 1] = {name = 'import_cursor', value = '9:'}
-    table.sort(meta, function(x, y) return x.name < y.name end)
-    rows.before.meta = meta
-    rebuild(rows.before)
+    rows.kept = dump()
+    rebuild(rows.kept)
   end)
   wait('the start', answers, 30)
   expect(user_version()).to_be(VERSION)
