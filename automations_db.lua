@@ -1,4 +1,4 @@
--- The storage of Automations: typed reads and writes of the domain
+-- The storage of Automations: the schema, typed reads and writes of the domain
 -- tables, the revision counter, and commit(fn, op), the transaction of one engine step or one
 -- operation. Load it with dofile(...)(A): A.app (the SDK app), A.fail.
 --
@@ -13,10 +13,35 @@ return function(A)
   -- automations.lua).
   local T = {}
 
+  -- --- Schema ---
+
+  -- The base step (hub docs/plugin-sdk.md, "A base step") makes schema version 12 on a new
+  -- database: the tables of the steps 1 to 12 that release 4.2 shipped, and the revision counter
+  -- at 0. A database at version 12 runs no step. tests/schema.lua compares the two schemas.
+  local SCHEMA = {
+    'CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)',
+    'CREATE TABLE automations (id TEXT PRIMARY KEY, rev TEXT NOT NULL, doc TEXT NOT NULL)',
+    'CREATE TABLE states (id TEXT PRIMARY KEY, rev TEXT NOT NULL, doc TEXT NOT NULL)',
+    'CREATE TABLE runs (run_key TEXT PRIMARY KEY, automation_id TEXT NOT NULL, rev TEXT NOT NULL, status TEXT NOT NULL, q TEXT, t TEXT, agent TEXT, doc TEXT NOT NULL)',
+    'CREATE UNIQUE INDEX runs_q ON runs (q) WHERE q IS NOT NULL',
+    'CREATE UNIQUE INDEX runs_t ON runs (t) WHERE t IS NOT NULL',
+    "CREATE INDEX runs_delivered ON runs (agent, run_key) WHERE status = 'delivered'",
+    'CREATE INDEX runs_auto ON runs (automation_id, status)',
+    'CREATE TABLE presets (name TEXT PRIMARY KEY, rev TEXT NOT NULL, automation_id TEXT NOT NULL)',
+    'CREATE TABLE seen (key TEXT PRIMARY KEY, rev TEXT NOT NULL, doc TEXT NOT NULL)',
+    'CREATE TABLE retired (key TEXT PRIMARY KEY, rev TEXT NOT NULL, doc TEXT NOT NULL)',
+    'CREATE TABLE ops (key TEXT PRIMARY KEY, fingerprint TEXT, reply TEXT NOT NULL)',
+  }
+  M.migrations = {base = 12, function(sdb)
+    for _, s in ipairs(SCHEMA) do sdb.exec(s) end
+    sdb.exec("INSERT INTO meta (name, value) VALUES ('rev', '0')")
+  end}
+
   -- --- Revisions ---
 
-  -- One counter, meta.rev, a canonical decimal string. The copy sets it above every revision
-  -- that hub.store gave. Each written row takes the next value. Lua never holds it as a number: the
+  -- One counter, meta.rev, a canonical decimal string. A new database starts it at 0; a database
+  -- of release 4.2 keeps the value that its copy from hub.store set, above every revision that
+  -- hub.store gave. Each written row takes the next value. Lua never holds it as a number: the
   -- increment is on the text. A commit reads it once and writes it back once, guarded by the
   -- value that it read. At the int64 maximum a write fails; the commit then rolls back, also the
   -- counter.
@@ -190,6 +215,16 @@ return function(A)
     local new = stamp()
     db.exec("INSERT INTO meta (name, value) VALUES ('next_id', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", tostring(n))
     db.exec("INSERT INTO meta (name, value) VALUES ('next_id_rev', ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", new)
+  end
+
+  -- check answers nil when the stored counters are valid, else the reason to refuse the start:
+  -- meta.rev is a valid counter, and meta.next_id and meta.next_id_rev are both canonical, or
+  -- both absent (no automation was ever made).
+  function M.check()
+    local function value(name) local row = db.first('SELECT value FROM meta WHERE name = ?', name) return row and row.value end
+    if not M.valid_counter(value('rev')) then return 'the revision counter is not valid: ' .. tostring(value('rev')) end
+    local n, r = value('next_id'), value('next_id_rev')
+    if (n == nil) ~= (r == nil) or (n and not (M.canonical(n) and M.canonical(r))) then return 'a next ID that is not valid' end
   end
 
   -- --- Operations ---
