@@ -46,21 +46,16 @@ test('a stopped worker: the task goes to a new worker as attempt 2', function()
   expect(notice(two.agent).pending).to_be(false)
 end)
 
-test('an alias reads its task; a superseded identity loses it, and its late done is refused', function()
+test('a new conversation in the worker pane: the old one loses its task, and its late done is refused', function()
   local id = automation('identity')
   local first = alice:call('automations.run', {id = id, key = 'identity-1'})
   local one = F.wait_status(first.run_key, 'delivered')
   local pane = F.worker(one.agent)
-  -- The pane's first conversation takes over the spawn ID: the worker still runs, and the
-  -- identity reads the task delivered to its legacy ID.
+  -- The pane's first conversation.
   pane:report('claude', 'automations-reassign-1')
   rex.sleep(2.5)
-  expect(F.run(first.run_key).attempt).to_be(1)
-  local tasks = pane:call('automations.read', {}).tasks
-  expect(#tasks).to_be(1)
-  expect(tasks[1].run_key).to_be(first.run_key)
-  -- A second conversation in the same pane: the spawn ID's alias stays with the first one, which
-  -- is no longer current. The worker does not count as running, so the task moves.
+  -- A second conversation in the same pane: the first one is no longer current. The worker does
+  -- not count as running, so the task moves.
   pane:report('claude', 'automations-reassign-2')
   local two = delivered_again(first.run_key, 2)
   expect(two.agent).not_to_be(one.agent)

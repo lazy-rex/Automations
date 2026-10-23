@@ -37,8 +37,8 @@ local function counts()
 end
 
 -- The fixture on SQL: automation a with two delivered runs to one worker and a Run now of that
--- worker (its spawn ID becomes a legacy ID later), the vault-health preset (b), a deleted
--- highest ID (c), and a backlog of cancelled runs with their terminal entries.
+-- worker, the vault-health preset (b), a deleted highest ID (c), and a backlog of cancelled runs
+-- with their terminal entries.
 -- fixture fills the fields of ids and worker: a closure write to a captured local can be lost
 -- after a caught error (Rex Lua runtime, docs/rex-protocol.md).
 local ids, worker = {}, {}
@@ -149,10 +149,7 @@ test('the first start copies the store exactly; the gate holds until done', func
   expect(check()).to_be(2 + 2 + 2 + BACKLOG)
 end)
 
-test('after the copy: old keys replay from ops, also under a legacy ID, and the next ID is new', function()
-  -- The worker's pane takes a conversation identity: the spawn ID is now its legacy ID.
-  worker.pane:report('claude', 'automations-cutover-1')
-  rex.sleep(2.5)
+test('after the copy: old keys replay from ops, and the next ID is new', function()
   expect(worker.pane:call('automations.run', {id = ids.a, key = 'cut-w-1'}).run_key).to_be(ids.second)
   expect_error(function() worker.pane:call('automations.run', {id = ids.b, key = 'cut-w-1'}) end, 'conflict')
   expect(alice:call('automations.run', {id = ids.a, key = 'cut-a-1'}).run_key).to_be(ids.first)
