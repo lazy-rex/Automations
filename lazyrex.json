@@ -4,9 +4,6 @@
  "sdk": "0",
  "notice": "Automation task. Call automations_read.",
  "test": {
-  "agents": [
-   {"id": "alice", "name": "Alice"}
-  ],
   "args": {
    "automations": {"clock_file": "${LAB}/clock", "tick": "1", "recheck": "1", "settle_ms": "200"}
   },

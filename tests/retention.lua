@@ -166,9 +166,9 @@ test('a crash between prune batches leaves exactly the newest 100', function()
   local function records(from, upto)
     local ops = {}
     for n = from, upto do
-      ops[#ops + 1] = {tbl = 'runs', key = rk(n), new = true, value = {v = 1, auto = id, name = 'Keep crash', kind = 'm', by = 'alice', at = T0,
+      ops[#ops + 1] = {tbl = 'runs', key = rk(n), new = true, value = {v = 1, auto = id, name = 'Keep crash', kind = 'm', by = alice.id, at = T0,
         task = {instruction = 'Keep task.', profile = 'worker'}, status = 'cancelled', attempt = 0, starts = 0,
-        cancelled = {by = 'alice', at = T0}, t = tkey(id, n), tseq = n}}
+        cancelled = {by = alice.id, at = T0}, t = tkey(id, n), tseq = n}}
     end
     return ops
   end
@@ -220,8 +220,8 @@ test('a retry that commits before the prune transaction keeps the oldest run', f
   local gate = hold(id, 'race')
   local function rk(n) return 'run/' .. id .. '/m/' .. string.format('%06d', 500 + n) end
   local function cancelled(n)
-    return {v = 1, auto = id, name = 'Keep race', kind = 'm', by = 'alice', at = T0, task = {instruction = 'Keep task.', profile = 'worker'},
-      status = 'cancelled', attempt = 0, starts = 0, cancelled = {by = 'alice', at = T0}, t = tkey(id, n), tseq = n}
+    return {v = 1, auto = id, name = 'Keep race', kind = 'm', by = alice.id, at = T0, task = {instruction = 'Keep task.', profile = 'worker'},
+      status = 'cancelled', attempt = 0, starts = 0, cancelled = {by = alice.id, at = T0}, t = tkey(id, n), tseq = n}
   end
   for lo = 1, 81, 40 do
     local ops = {}
