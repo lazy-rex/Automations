@@ -11,16 +11,18 @@ return function(H)
   end
   function F.at(y, m, d, hh, mm) return os.time({year = y, month = m, day = d, hour = hh, min = mm, sec = 0}) end
 
-  -- The worker profile starts lazyrex-hub testagent in the spawned pane. It joins as the spawn's
-  -- agent ID (LAZYREX_AGENT, set by the hub), and its client label names that ID, so a test can
-  -- call as the worker. Profile commands are trusted test code (docs/testing.md, "Isolation").
+  -- The worker profile starts lazyrex-hub testagent in the spawned pane. Its client label names
+  -- the spawn's agent ID (LAZYREX_AGENT, set by the hub), so a test can call as the worker. It does
+  -- not join: an agent spawn opens when its agent reports its identity from the spawn's pane
+  -- (hub docs/hub.md, spawn_adopted via identity). Profile commands are trusted test code
+  -- (docs/testing.md, "Isolation").
   -- Before the test agent starts, the pane reports the conversation identity
   -- claude:w-<spawn's agent ID>, as an agent CLI's start hook does; the plugin delivers to that
   -- identity. The pane's process is the same before and after exec. F.silent is a profile that
   -- reports nothing: its worker has no identity until a test reports one. A test adds it to the list.
   -- profile_list is the base list; a test can add profiles to it and write it.
   local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-$LAZYREX_AGENT\",\"source\":\"startup\"}"; ]]
-  local AGENT = [[exec "$0" testagent -id "$LAZYREX_AGENT" -join "$LAZYREX_AGENT"]]
+  local AGENT = [[exec "$0" testagent -id "$LAZYREX_AGENT"]]
   function F.profile_list()
     return {
       {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin}},
@@ -55,10 +57,6 @@ return function(H)
   function F.worker(id)
     local agent_id = id:match('^claude:w%-(.+)$') or id
     local client = H.wait('the worker ' .. agent_id .. ' to start', function() return H.resolve('lazyrex-testagent:' .. agent_id) end, 20)
-    H.wait('the worker ' .. agent_id .. ' to join', function()
-      local s = H.perform(client, 'agent.status', {})
-      return s.joined
-    end, 20)
     return {id = id,
       call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end,
       -- report sends hub.identity.report from a new process in the worker's pane, as an agent hook.
