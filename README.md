@@ -185,12 +185,15 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   20 queued runs, or 50 markers or terminal runs. No transaction spans `hub.spawn` or another
   slow hub call: a start stores its request, calls the hub, then stores the result in a second,
   fenced transaction.
-- The schema has one base step (hub `docs/plugin-sdk.md`, "A base step"): a new database gets
-  schema version 12, the tables above, and `meta.rev` = 0. Step 13 deletes the import rows that
-  the copy from hub.store of release 4.2 left (`meta.import`, `meta.import_cursor`). A database of
-  release 4.2 is at version 12 and keeps every other row. A start checks the counters: `meta.rev` must be a valid counter, and
-  `next_id` and `next_id_rev` both canonical or both absent. Otherwise the start changes nothing,
-  each tool answers `unavailable`, and the panel says why.
+- The schema has one base step (hub `docs/plugin-sdk.md`, "A base step") and step 13. A new
+  database runs both in one migration transaction and ends at version 13: the base makes the
+  tables above (version 12) and sets `meta.rev` = 0, then step 13 runs. Step 13 deletes the import
+  rows that the copy from hub.store of release 4.2 left (`meta.import`, `meta.import_cursor`). A
+  database of release 4.2 is at version 12: it runs only step 13 and keeps every other row.
+- After the migrations, the start checks the counters: `meta.rev` must be a valid counter, and
+  `next_id` and `next_id_rev` both canonical or both absent. Otherwise the engine starts no work
+  and writes nothing, each tool answers `unavailable`, and the panel says why. The SDK runs the
+  migrations before this check, so step 13 and the new `user_version` can be committed already.
 
 ## Agents
 
