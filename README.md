@@ -190,6 +190,16 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   tables above (version 12) and sets `meta.rev` = 0, then step 13 runs. Step 13 deletes the import
   rows that the copy from hub.store of release 4.2 left (`meta.import`, `meta.import_cursor`). A
   database of release 4.2 is at version 12: it runs only step 13 and keeps every other row.
+- The base is `base = 12`: it folds the steps 1 to 12 of release 4.2 (plugin commit 4fc4938, schema
+  version 12). The live database was at version 12 when the coordinator checked a read-only copy on
+  2026-10-23. The base alone changes no live database, and step 13 moves it to version 13. The
+  plugin owns the eight tables above and their four indexes (`runs_auto`, `runs_delivered`, `runs_q`,
+  `runs_t`). The `lazyrex_*` objects belong to the hub SDK; the plugin does not make them.
+- Release dependency: this plugin needs the SDK of hub release 4.3. It must not run on the hub of
+  release 4.2: that SDK ignores `base`, runs the base as step 1 and sets a wrong `user_version`. So
+  the 4.3 hub is deployed first. A rollback of the hub to 4.2 also rolls back this plugin, and every
+  other plugin with a base step, in the same step. The releases 4.2 and 4.2.1 keep the plugin at
+  4fc4938. The 4.3 rehearsal on a read-only copy of live data covers this change.
 - After the migrations, the start checks the counters: `meta.rev` must be a valid counter, and
   `next_id` and `next_id_rev` both canonical or both absent. Otherwise the engine starts no work
   and writes nothing, each tool answers `unavailable`, and the panel says why. The SDK runs the
@@ -274,8 +284,8 @@ cd ../../Automations && lazyrex-hub test
   the old steps, with the import rows of release 4.2, gets step 13: the import rows go, and it keeps
   every other row, its revision counter and its next ID; an old key replays, and a new automation
   takes the next ID and a higher revision.
-- storage.lua: a new database starts `meta.rev` at 0; an old key replays under the identity and
-  under a legacy ID, and the next ID is new; while a delivery commit is held, the worker has no task
+- storage.lua: a new database starts `meta.rev` at 0; an old key replays, and the next ID is
+  new; while a delivery commit is held, the worker has no task
   and no notice, and after it one of each, with no hub.store call; a lost reply delivers once; a
   start with a missing or malformed `meta.rev` or next ID refuses with no write, and a restart keeps
   the rows; the revision counter refuses at the int64 maximum, above it and on a malformed value
