@@ -62,19 +62,10 @@ end
 -- The sibling files (the Templates pattern): debug.getinfo gives the script's absolute path.
 local here = debug.getinfo(1, 'S').source:gsub('^@', '')
 local plugin_dir = assert(here:match('^(/.*)/[^/]*$'), 'the plugin path must be absolute')
--- The engine's storage is SQL (automations_db.lua). hub.store is read only by the copy
--- (store_scan below).
+-- The engine's storage is SQL (automations_db.lua): the schema and the reads and writes.
 local D = dofile(plugin_dir .. '/automations_db.lua')({app = app, fail = fail})
 local commit, atomic = D.commit, D.atomic
-
--- store_scan reads hub.store, for the copy only.
-local function store_scan(prefix, after, limit)
-  local page = hub('hub.store.scan', {prefix = prefix, after = after, limit = limit or 100})
-  local keys = {}
-  for key in pairs(page.records or {}) do keys[#keys + 1] = key end
-  table.sort(keys)
-  return keys, page.records or {}, page.next
-end
+app.db.migrate(D.migrations)
 
 -- canon encodes a value with sorted object keys: the fingerprint of an operation's content. The
 -- SDK (hub v0.4.1 or later) gives table.concat with no length limit, so a long list or object
@@ -295,8 +286,7 @@ local function holds(caller, agent)
 end
 
 -- Operations replay by key. The op key holds the caller ID, so two agents never share one; a
--- replay looks under every ID of the caller (also a reply that the copy imported under a legacy
--- ID).
+-- replay looks under every ID of the caller (also a reply saved under a legacy ID).
 local function op_key(kind, id, key) return kind .. '/' .. part(id) .. part(key) end
 local function replay(kind, caller, key, fingerprint)
   text_arg(key, 'key', 128)
@@ -1545,10 +1535,6 @@ local agent_handlers = {
   ['automations.read'] = read,
   ['automations.done'] = done,
 }
--- The SQL storage (slice 2): the schema and the copy from hub.store.
-local sql = dofile(plugin_dir .. '/automations_sql.lua')({app = app, fail = fail, scan = store_scan, hub = hub,
-  canonical = D.canonical, valid_counter = D.valid_counter})
-app.db.migrate(sql.migrations)
 local views = dofile(plugin_dir .. '/automations_view.lua')({
   fail = fail, hub = hub, D = D, size = size, cut = cut, USER = USER,
   queue_size = queue_size, last_run = last_run, PAGE_BUDGET = PAGE_BUDGET, PRESETS = PRESETS, PRESET_NAMES = PRESET_NAMES, run_prefix = run_prefix,
@@ -1605,9 +1591,9 @@ local exports = {
       required = {'run_key', 'attempt', 'key'}, additionalProperties = false}},
 }
 
--- The gate (plan, "The cutover", point 2): until the copy is done, S.ready is false, and no entry
--- point changes anything. S.not_ready is the text that the exports and the views give.
-S.not_ready = 'Starting: Automations is importing the automations'
+-- The gate: until the start ends, S.ready is false, and no entry point changes anything.
+-- S.not_ready is the text that the exports and the views give.
+S.not_ready = 'Automations is starting'
 local function closed() fail('unavailable', S.not_ready) end
 
 -- Each export is an SDK action without SDK saved replies: the engine and its replay by key (the
@@ -1645,7 +1631,7 @@ app.command({id = 'new_automation', title = 'New Automation…', description = '
   keywords = {'schedule', 'watch'}, route = '/forms/automation/new', action = 'automations.save'})
 
 app.on('hub.changed', function(args)
-  -- Before the copy is done, nothing: the start after it marks every automation, and its
+  -- Before the start ends, nothing: the start marks every automation, and its
   -- reconcile drains each watch (the hub keeps the watch events).
   if not S.ready then return end
   -- A worker change can finish a pending start or show a lost worker. The SDK replies after this
@@ -1663,10 +1649,8 @@ app.on('hub.changed', function(args)
   end
 end, {tx = false})
 
--- The start (plan, "The cutover", points 1 to 3). The storage state picks one path: the copy
--- from hub.store (on empty tables, or to resume it), SQL as it is (done), or a refusal with no
--- write. The copy runs one step per callback; a failed step tries again after RECHECK. When the
--- copy is done, the engine starts as at a start before the cutover.
+-- The start: the stored counters are checked, and then the engine starts. A database whose
+-- counters are not valid is refused with no write, and the exports and views give the reason.
 local function message(err) return type(err) == 'table' and tostring(err.message) or tostring(err) end
 local function open()
   S.ready = true
@@ -1676,28 +1660,14 @@ local function open()
   tick()
   ui_changed()
 end
-local function copy_step()
-  local ok, done = pcall(sql.copy_step)
-  if not ok then
-    print('automations: copy: ' .. message(done))
-    rex.after(RECHECK, copy_step)
-  elseif not done then
-    rex.after(0, copy_step)
-  else
-    local open_ok, err = pcall(open)
-    if not open_ok then print('automations: startup: ' .. message(err)) end
-  end
-end
 local function start()
-  local state, why = sql.state()
-  if state == nil then
+  local why = D.check()
+  if why then
     S.not_ready = 'Automations cannot start: the storage state is not known (' .. why .. ')'
     print('automations: refused: ' .. why)
     ui_changed()
     return
   end
-  if state == 'empty' then sql.begin(); state = 'copying' end
-  if state == 'copying' then rex.after(0, copy_step); return end
   open()
 end
 

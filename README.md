@@ -185,10 +185,12 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   20 queued runs, or 50 markers or terminal runs. No transaction spans `hub.spawn` or another
   slow hub call: a start stores its request, calls the hub, then stores the result in a second,
   fenced transaction.
-- The first start of this version copies the hub.store records of the earlier version into the
-  tables, one page at a time; until the copy is done, each tool answers `unavailable`
-  ("importing") and the panel says so. A start on a database that the plugin does not recognize
-  changes nothing and says why.
+- The schema has one base step (hub `docs/plugin-sdk.md`, "A base step"): a new database gets
+  schema version 12, the tables above, and `meta.rev` = 0. A database of release 4.2 is at version
+  12 and keeps its rows. A start checks the counters: `meta.rev` must be a valid counter, and
+  `next_id` and `next_id_rev` both canonical or both absent. Otherwise the start changes nothing,
+  each tool answers `unavailable`, and the panel says why.
+
 ## Agents
 
 The exports are agent tools: `automations.save`, `automations.list`, `automations.run`,
@@ -207,9 +209,11 @@ The tests are Lua files in `tests/`. `lazyrex-hub test` runs them against the re
 isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No test touches your
 own Rex server.
 
-Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on hub v0.4.1
-(release 4.1) or later. The suite passes on hub main d912148 (observed 2026-10-22): it uses the
-SQL test hooks, the test renderer and the render counts of `renders()`.
+Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on a hub whose SDK
+has the base step `app.db.migrate {base = N}` (hub 454fb3e, branch sdk/migrate-base; it comes to
+hub main for release 4.3). An older SDK runs the base as step 1 of a new database. The suite
+passes on hub 454fb3e (observed 2026-10-22): it uses the SQL test hooks, the test renderer and the
+render counts of `renders()`.
 
 ```sh
 cd ../LazyRex/hub && go build -o ~/bin/lazyrex-hub ./cmd/hub
@@ -252,8 +256,8 @@ cd ../../Automations && lazyrex-hub test
   4000-byte instruction and full args fits the budget.
 - pump.lua: three backlogs that are ready at once (after a gate on the worker check) deliver in
   turns: no automation delivers its whole backlog before another delivers its first run.
-- cutover_work.lua: a file that appears during the copy gives one run after it, and a pending
-  start replays its key once.
+- reload_work.lua: a file that appears while the plugin is stopped gives one run after its start,
+  and a pending start replays its key once.
 - large_page.lua: one watch page of 50 file runs of more than 8000 bytes each commits in one
   transaction, within the hub's transaction time; a failed page commit leaves no run and no marker.
 - refresh.lua: an open profile picker shows a new agent profile with no plugin handler; a start
@@ -261,15 +265,17 @@ cd ../../Automations && lazyrex-hub test
 - transaction.lua: a failed commit of a create or of a manual run leaves no row, no revision
   change and no saved reply, and the same key then makes the change once; manual runs take the
   numbers 1 and 2 from the state, and a replay makes no run.
-- cutover.lua: the first start on an old store copies each record and saved reply exactly, with
-  its rev, below the new revision counter, and the run columns equal the document; while the copy
-  waits, every tool and the panel answer "importing" and nothing changes; after it, an old key
-  replays under the identity and under a legacy ID, and the next ID is new; while a delivery commit
-  is held, the worker has no task and no notice, and after it one of each; a lost reply delivers
-  once; the revision counter refuses at the int64 maximum, above it and on a malformed value with
-  no change, and a commit whose later write finds the maximum rolls back its earlier writes; each
-  unknown start state refuses with no write, and a start on a done copy keeps the SQL changes; a
-  crash during the copy resumes from its cursor.
+- schema.lua: the schema of a new database (the base step) equals the schema that the old steps
+  1 to 12 make (`sqlite_master`, the columns and the index columns); a version-12 database from
+  the old steps, with the import rows of release 4.2, keeps every row, its revision counter and its
+  next ID, an old key replays, and a new automation takes the next ID and a higher revision. It
+  also passes on the old steps (4fc4938).
+- storage.lua: a new database starts `meta.rev` at 0; an old key replays under the identity and
+  under a legacy ID, and the next ID is new; while a delivery commit is held, the worker has no task
+  and no notice, and after it one of each, with no hub.store call; a lost reply delivers once; a
+  start with a missing or malformed `meta.rev` or next ID refuses with no write, and a restart keeps
+  the rows; the revision counter refuses at the int64 maximum, above it and on a malformed value
+  with no change, and a commit whose later write finds the maximum rolls back its earlier writes.
 - presets.lua: the preset fields; install, replay, a second install, an edit that keeps the
   preset; a concurrent install (an injection) stores nothing; delete and reinstall, also while the
   old cleanup waits for a run; the preset through the forms and Run now starts its worker in

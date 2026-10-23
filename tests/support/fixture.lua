@@ -311,55 +311,23 @@ return function(H)
     end, timeout or 20)
   end
 
-  -- The cutover fixtures (cutover.lua, cutover_work.lua). F.to_store writes every row to hub.store
-  -- in the layout of the slice 1 version (with the index records q/, t/, dv/ and box/) and each
-  -- saved reply as an operation record; the store gives new revisions. F.empty_tables deletes
-  -- every row. F.reload stops the plugin, runs setup (fixtures, injections), and starts a new
-  -- instance: the hub process stays, so the injections and faults of setup stay armed.
+  -- F.TABLES are the plugin's tables. F.reload stops the plugin, runs setup (fixtures,
+  -- injections), and starts a new instance: the hub process stays, so the injections and faults of
+  -- setup stay armed. F.started is true when the panel shows no start text (the start ended).
   F.TABLES = {'meta', 'automations', 'states', 'runs', 'presets', 'seen', 'retired', 'ops'}
-  function F.to_store()
-    local batch = {ops = {}}
-    local function flush() if #batch.ops > 0 then H.write(batch.ops) end batch.ops = {} end
-    local function put(key, value) batch.ops[#batch.ops + 1] = {key = key, value = value} if #batch.ops >= 30 then flush() end end
-    local next_id = H.sql("SELECT value FROM meta WHERE name = 'next_id'")[1]
-    if next_id then put('meta/next_id', {n = tonumber(next_id.value)}) end
-    for _, r in ipairs(H.sql('SELECT id, doc FROM automations')) do put('auto/' .. r.id, rex.json.decode(r.doc)) end
-    for _, r in ipairs(H.sql('SELECT id, doc FROM states')) do put('state/' .. r.id, rex.json.decode(r.doc)) end
-    for _, r in ipairs(H.sql('SELECT name, automation_id FROM presets')) do put('preset/' .. r.name, {id = r.automation_id}) end
-    for _, r in ipairs(H.sql('SELECT key, doc FROM seen')) do put(r.key, rex.json.decode(r.doc)) end
-    for _, r in ipairs(H.sql('SELECT key, doc FROM retired')) do put(r.key, rex.json.decode(r.doc)) end
-    for _, r in ipairs(H.sql('SELECT run_key, automation_id, status, q, t, agent, doc FROM runs')) do
-      local run = rex.json.decode(r.doc)
-      put(r.run_key, run)
-      if r.q then put(r.q, {run = r.run_key}) end
-      if r.t then put(r.t, {run = r.run_key, seq = run.tseq}) end
-      if r.status == 'delivered' then
-        put('dv/' .. r.automation_id .. '/' .. r.run_key, {agent = r.agent})
-        put('box/' .. r.agent .. '/' .. r.run_key, {attempt = run.attempt, auto = r.automation_id})
-      end
-    end
-    flush()
-    for _, r in ipairs(H.sql('SELECT key, fingerprint, reply FROM ops')) do
-      H.put_operation({key = r.key, fingerprint = r.fingerprint, result = rex.json.decode(r.reply)})
-    end
-  end
-  function F.empty_tables()
-    for _, t in ipairs(F.TABLES) do sql_write('DELETE FROM ' .. t) end
-  end
   function F.reload(setup)
     H.hub('hub.admin.stop', {plugin = 'automations'})
     if setup then setup() end
     H.hub('hub.admin.start', {plugin = 'automations'})
     H.wait('the plugin', function() return H.hub('hub.test.status', {}).plugins.automations.registered end, 30)
   end
-  function F.copied()
-    local r = H.sql("SELECT value FROM meta WHERE name = 'import'")[1]
-    return r and r.value == 'cutover-1:done'
+  function F.started()
+    local ok, tree = pcall(function() local _, t = F.panel() return t end)
+    return ok and type(tree) == 'table' and H.node(tree, 'not_ready') == nil
   end
 
-  -- The plugin's first start copies hub.store (empty in a new lab) into the SQL tables; until the
-  -- copy is done, every export answers unavailable. Each file starts after it.
-  H.wait('the first copy', F.copied, 30)
+  -- Until the start ends, every export answers unavailable. Each file starts after it.
+  H.wait('the start', F.started, 30)
 
   return F
 end
