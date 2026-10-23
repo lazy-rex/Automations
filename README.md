@@ -197,9 +197,11 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   `runs_t`). The `lazyrex_*` objects belong to the hub SDK; the plugin does not make them.
 - Release dependency: this plugin needs the SDK of hub release 4.3. It must not run on the hub of
   release 4.2: that SDK ignores `base`, runs the base as step 1 and sets a wrong `user_version`. So
-  the 4.3 hub is deployed first. A rollback of the hub to 4.2 also rolls back this plugin, and every
-  other plugin with a base step, in the same step. The releases 4.2 and 4.2.1 keep the plugin at
-  4fc4938. The 4.3 rehearsal on a read-only copy of live data covers this change.
+  the 4.3 hub is deployed first. The releases 4.2 and 4.2.1 keep the plugin at 4fc4938. The 4.3
+  rehearsal on a read-only copy of live data covers this change.
+- Fix forward: step 13 deletes rows, so a return to release 4.2 after step 13 loses data. A defect
+  in release 4.3 is fixed forward with a new commit. A rollback of the hub and this plugin to
+  release 4.2 is not a supported recovery after step 13.
 - After the migrations, the start checks the counters: `meta.rev` must be a valid counter, and
   `next_id` and `next_id_rev` both canonical or both absent. Otherwise the engine starts no work
   and writes nothing, each tool answers `unavailable`, and the panel says why. The SDK runs the
