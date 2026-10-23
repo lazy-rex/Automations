@@ -21,17 +21,20 @@ return function(H)
   -- identity. The pane's process is the same before and after exec. F.silent is a profile that
   -- reports nothing: its worker has no identity until a test reports one. A test adds it to the list.
   -- profile_list is the base list; a test can add profiles to it and write it.
-  local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-${LAZYREX_AGENT#spawn:}\",\"source\":\"startup\"}"; ]]
-  local AGENT = [[exec "$0" testagent -id "${LAZYREX_AGENT#spawn:}"]]
+  -- NAME strips the prefix with sed: the hub reads each "${...}" in a command as a profile arg
+  -- token, so the scripts use no "${".
+  local NAME = [=[n=$(printf '%s' "$LAZYREX_AGENT" | sed 's/^spawn://'); ]=]
+  local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-$n\",\"source\":\"startup\"}"; ]]
+  local AGENT = [[exec "$0" testagent -id "$n"]]
   function F.profile_list()
     return {
-      {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin}},
+      {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c', NAME .. REPORT .. AGENT, H.args.hub_bin}},
       {id = 'tasked', name = 'Tasked', kind = 'agent', args = {{name = 'task', label = 'Task', required = true}},
-        command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin, '${task}'}},
+        command = {'/bin/sh', '-c', NAME .. REPORT .. AGENT, H.args.hub_bin, '${task}'}},
       {id = 'logtail', name = 'Log tail', kind = 'accessory', command = {'/bin/sh', '-c', 'exec tail -f /dev/null'}},
     }
   end
-  function F.silent() return {id = 'silent', name = 'Silent', kind = 'agent', command = {'/bin/sh', '-c', AGENT, H.args.hub_bin}} end
+  function F.silent() return {id = 'silent', name = 'Silent', kind = 'agent', command = {'/bin/sh', '-c', NAME .. AGENT, H.args.hub_bin}} end
   -- identity is the identity that a worker profile reports for a spawn's agent ID.
   local function name(agent_id) return (agent_id:gsub('^spawn:', '')) end
   function F.identity(agent_id) return 'claude:w-' .. name(agent_id) end
