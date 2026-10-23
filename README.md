@@ -186,8 +186,9 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
   slow hub call: a start stores its request, calls the hub, then stores the result in a second,
   fenced transaction.
 - The schema has one base step (hub `docs/plugin-sdk.md`, "A base step"): a new database gets
-  schema version 12, the tables above, and `meta.rev` = 0. A database of release 4.2 is at version
-  12 and keeps its rows. A start checks the counters: `meta.rev` must be a valid counter, and
+  schema version 12, the tables above, and `meta.rev` = 0. Step 13 deletes the import rows that
+  the copy from hub.store of release 4.2 left (`meta.import`, `meta.import_cursor`). A database of
+  release 4.2 is at version 12 and keeps every other row. A start checks the counters: `meta.rev` must be a valid counter, and
   `next_id` and `next_id_rev` both canonical or both absent. Otherwise the start changes nothing,
   each tool answers `unavailable`, and the panel says why.
 
@@ -267,9 +268,9 @@ cd ../../Automations && lazyrex-hub test
   numbers 1 and 2 from the state, and a replay makes no run.
 - schema.lua: the schema of a new database (the base step) equals the schema that the old steps
   1 to 12 make (`sqlite_master`, the columns and the index columns); a version-12 database from
-  the old steps, with the import rows of release 4.2, keeps every row, its revision counter and its
-  next ID, an old key replays, and a new automation takes the next ID and a higher revision. It
-  also passes on the old steps (4fc4938).
+  the old steps, with the import rows of release 4.2, gets step 13: the import rows go, and it keeps
+  every other row, its revision counter and its next ID; an old key replays, and a new automation
+  takes the next ID and a higher revision.
 - storage.lua: a new database starts `meta.rev` at 0; an old key replays under the identity and
   under a legacy ID, and the next ID is new; while a delivery commit is held, the worker has no task
   and no notice, and after it one of each, with no hub.store call; a lost reply delivers once; a

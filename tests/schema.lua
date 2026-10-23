@@ -1,13 +1,14 @@
 -- The schema steps (docs/plugin-sdk.md in the hub, "A base step"): a new database gets the schema
--- of the old steps 1 to 12, and a database that the old steps made keeps its rows. Both tests
--- also pass on the old steps themselves (4fc4938), where the first start copies hub.store.
+-- of the old steps 1 to 12, and a database that the old steps made keeps its rows. Step 13
+-- deletes only the import rows of release 4.2. Without step 13 (09a9a43 and VERSION = 12), both
+-- tests also pass on the old steps themselves (4fc4938), where the first start copies hub.store.
 local dir = H.args.file:match('^(.*)/[^/]*$')
 local F = assert(loadfile(dir .. '/support/fixture.lua'))()(H)
 local OLD = assert(loadfile(dir .. '/support/schema12.lua'))()
 F.profiles()
 F.set_clock(F.at(2026, 11, 3, 10, 0))
 local alice = agent('alice')
-local VERSION = 12
+local VERSION = 13
 
 -- The plugin's schema objects: sqlite_master (type, name, the SQL with its white space made
 -- one space; not the sqlite_ and lazyrex_ objects), each table's columns and each index's
@@ -88,12 +89,16 @@ test('a version-12 database from the old steps keeps its rows, its revision and 
   -- No other work: no daily slot comes, and the delivered run waits for its worker's done.
   for _, id in ipairs({a, b}) do alice:call('automations.set_enabled', {id = id, enabled = false, key = 'keep-off-' .. id}) end
   rex.sleep(2)
-  -- The old import rows of a database that the copy made (their live values).
+  -- rows.kept: the rows without the import rows. rows.before adds the import rows of a database
+  -- that the copy made (their live values); step 13 deletes them.
   local rows = {}
   F.reload(function()
-    rows.before = dump()
-    local meta = {}
-    for _, r in ipairs(rows.before.meta) do if r.name ~= 'import' and r.name ~= 'import_cursor' then meta[#meta + 1] = r end end
+    rows.kept, rows.before = dump(), dump()
+    local meta, kept = {}, {}
+    for _, r in ipairs(rows.before.meta) do
+      if r.name ~= 'import' and r.name ~= 'import_cursor' then meta[#meta + 1] = r; kept[#kept + 1] = r end
+    end
+    rows.kept.meta = kept
     meta[#meta + 1] = {name = 'import', value = 'cutover-1:done'}
     meta[#meta + 1] = {name = 'import_cursor', value = '9:'}
     table.sort(meta, function(x, y) return x.name < y.name end)
@@ -102,7 +107,7 @@ test('a version-12 database from the old steps keeps its rows, its revision and 
   end)
   wait('the start', answers, 30)
   expect(user_version()).to_be(VERSION)
-  expect(dump()).to_equal(rows.before)
+  expect(dump()).to_equal(rows.kept)
   local function meta(name) local r = sql('SELECT value FROM meta WHERE name = ?', {name})[1] return r and r.value end
   local rev = meta('rev')
   -- An old operation key replays its saved reply; a new automation takes the next ID and a
