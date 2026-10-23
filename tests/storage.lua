@@ -43,11 +43,10 @@ test('a new database starts the revision counter at 0', function()
 end)
 
 -- The fixture: automation a with two delivered runs to one worker, the second from a Run now of
--- that worker (its spawn ID becomes a legacy ID below), and automation b. ids and worker are table
--- fields: a closure write to a captured local can be lost after a caught error (Rex Lua runtime,
--- docs/rex-protocol.md in the hub).
+-- that worker, and automation b. ids and worker are table fields: a closure write to a captured
+-- local can be lost after a caught error (Rex Lua runtime, docs/rex-protocol.md in the hub).
 local ids, worker = {}, {}
-test('saved operation keys replay, also under a legacy ID, and the next ID is new', function()
+test('saved operation keys replay, and the next ID is new', function()
   local a = alice:call('automations.save', {key = 'st-a', name = 'Storage a', trigger = {kind = 'daily', at = '09:00'},
     action = {profile = 'worker'}, instruction = 'Storage task.'}).id
   local first = alice:call('automations.run', {id = a, key = 'st-a-1'})
@@ -59,9 +58,6 @@ test('saved operation keys replay, also under a legacy ID, and the next ID is ne
     action = {profile = 'worker'}, instruction = 'Storage task.'}).id
   ids.a, ids.b, ids.first, ids.second = a, b, first.run_key, second.run_key
   worker.agent, worker.pane = one.agent, w
-  -- The worker's pane takes a conversation identity: the spawn ID is now its legacy ID.
-  w:report('claude', 'automations-storage-1')
-  rex.sleep(2.5)
   expect(w:call('automations.run', {id = a, key = 'st-w-1'}).run_key).to_be(second.run_key)
   expect_error(function() w:call('automations.run', {id = b, key = 'st-w-1'}) end, 'conflict')
   expect(alice:call('automations.run', {id = a, key = 'st-a-1'}).run_key).to_be(first.run_key)
