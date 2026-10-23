@@ -214,9 +214,9 @@ isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No
 own Rex server.
 
 Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on a hub whose SDK
-has the base step `app.db.migrate {base = N}` (hub 454fb3e, branch sdk/migrate-base; it comes to
-hub main for release 4.3). An older SDK runs the base as step 1 of a new database. The suite
-passes on hub 454fb3e (observed 2026-10-22): it uses the SQL test hooks, the test renderer and the
+has the base step `app.db.migrate {base = N}` (hub main a407e08a and later; the hub of release 4.3).
+An older SDK runs the base as step 1 of a new database. The suite passes on hub main a407e08a
+(observed 2026-10-23, on the Linux lab host): it uses the SQL test hooks, the test renderer and the
 render counts of `renders()`.
 
 ```sh
