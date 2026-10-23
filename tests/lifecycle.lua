@@ -75,6 +75,7 @@ test('a crash between delete cleanup batches cancels every queued run once and d
     expect(run.agent).to_be(nil)
     expect(run.attempt).to_be(0)
     expect(F.queued(qkey(id, n))).to_be(nil)
+    expect(run.tseq).not_to_be(nil)
     expect(seqs[tostring(run.tseq)]).to_be(nil)
     seqs[tostring(run.tseq)] = true
   end
