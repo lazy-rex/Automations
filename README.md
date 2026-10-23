@@ -313,7 +313,7 @@ cd ../../Automations && lazyrex-hub test
   takes the next ID and a higher revision.
 - storage.lua: a new database starts `meta.rev` at 0; an old key replays, and the next ID is
   new; while a delivery commit is held, the worker has no task
-  and no notice, and after it one of each, with no hub.store call; a lost reply delivers once; a
+  and no notice, and after it one of each; a lost reply delivers once; a
   start with a missing or malformed `meta.rev` or next ID refuses with no write, and a restart keeps
   the rows; the revision counter refuses at the int64 maximum, above it and on a malformed value
   with no change, and a commit whose later write finds the maximum rolls back its earlier writes.
