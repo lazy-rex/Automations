@@ -190,8 +190,8 @@ test('a worker whose agent exits: its task moves to a new worker', function()
   expect(two.spawn_id).not_to_be(one.spawn_id)
 end)
 
--- An ID that the worker had before its identity (the spawn's roster ID, which the hub still names
--- in ctx.aliases) gives it nothing: a reply saved under it does not replay, and a task delivered
+-- An ID that the worker had before its identity (the spawn's agent ID, a roster ID before the hub
+-- removed the roster) gives it nothing: a reply saved under it does not replay, and a task delivered
 -- to it is not the worker's. Such a task is lost once and goes to the identity as attempt + 1.
 -- The coordinator accepted this loss for rows from before 4.3 (2026-10-23).
 test('a legacy roster ID gives the worker no saved reply and no task; its delivered run moves once', function()

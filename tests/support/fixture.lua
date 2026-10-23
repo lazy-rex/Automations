@@ -12,17 +12,17 @@ return function(H)
   function F.at(y, m, d, hh, mm) return os.time({year = y, month = m, day = d, hour = hh, min = mm, sec = 0}) end
 
   -- The worker profile starts lazyrex-hub testagent in the spawned pane. Its client label names
-  -- the spawn's agent ID (LAZYREX_AGENT, set by the hub), so a test can call as the worker. It does
-  -- not join: an agent spawn opens when its agent reports its identity from the spawn's pane
-  -- (hub docs/hub.md, spawn_adopted via identity). Profile commands are trusted test code
-  -- (docs/testing.md, "Isolation").
-  -- Before the test agent starts, the pane reports the conversation identity
-  -- claude:w-<spawn's agent ID>, as an agent CLI's start hook does; the plugin delivers to that
+  -- the spawn's agent ID (LAZYREX_AGENT, set by the hub, for example spawn:spawn-<hex>) without its
+  -- "spawn:" prefix, so a test can call as the worker. It does not join: an agent spawn opens when
+  -- its agent reports its identity from the spawn's pane (hub docs/hub.md, spawn_adopted via
+  -- identity). Profile commands are trusted test code (docs/testing.md, "Isolation").
+  -- Before the test agent starts, the pane reports the conversation identity claude:w-<that name>,
+  -- as an agent CLI's start hook does (a conversation ID has no ":"); the plugin delivers to that
   -- identity. The pane's process is the same before and after exec. F.silent is a profile that
   -- reports nothing: its worker has no identity until a test reports one. A test adds it to the list.
   -- profile_list is the base list; a test can add profiles to it and write it.
-  local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-$LAZYREX_AGENT\",\"source\":\"startup\"}"; ]]
-  local AGENT = [[exec "$0" testagent -id "$LAZYREX_AGENT"]]
+  local REPORT = [["$0" testagent report "{\"kind\":\"claude\",\"conversation_id\":\"w-${LAZYREX_AGENT#spawn:}\",\"source\":\"startup\"}"; ]]
+  local AGENT = [[exec "$0" testagent -id "${LAZYREX_AGENT#spawn:}"]]
   function F.profile_list()
     return {
       {id = 'worker', name = 'Worker', kind = 'agent', command = {'/bin/sh', '-c', REPORT .. AGENT, H.args.hub_bin}},
@@ -33,7 +33,8 @@ return function(H)
   end
   function F.silent() return {id = 'silent', name = 'Silent', kind = 'agent', command = {'/bin/sh', '-c', AGENT, H.args.hub_bin}} end
   -- identity is the identity that a worker profile reports for a spawn's agent ID.
-  function F.identity(agent_id) return 'claude:w-' .. agent_id end
+  local function name(agent_id) return (agent_id:gsub('^spawn:', '')) end
+  function F.identity(agent_id) return 'claude:w-' .. name(agent_id) end
   function F.profiles() H.write_profiles({profiles = F.profile_list()}) end
 
   function F.workers(profile)
@@ -55,7 +56,7 @@ return function(H)
   -- face (the MCP path), as an agent's tool call. id is the identity that the profile reported
   -- (a run's agent) or the spawn's agent ID. The caller's id is the given id.
   function F.worker(id)
-    local agent_id = id:match('^claude:w%-(.+)$') or id
+    local agent_id = id:match('^claude:w%-(.+)$') or name(id)
     local client = H.wait('the worker ' .. agent_id .. ' to start', function() return H.resolve('lazyrex-testagent:' .. agent_id) end, 20)
     return {id = id,
       call = function(_, action, args) return H.perform(client, 'agent.call', {action = action, args = args or {}}) end,
