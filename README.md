@@ -74,15 +74,40 @@ notice text into the worker's pane when the worker is ready. The worker reads it
   action of its time, and a pending start replays its stored request.
 - The plugin checks the delivered runs a page at a time and wraps at the end, so a page of live
   tasks never hides a lost one.
-- A worker runs when its `hub.workers` row has state `running` and its agent is current. In
-  `hub.workers`, `status` is the pane's program status; the row's lifecycle is `state`.
+- The worker key is the spawn ID. A task goes to the current identity in the worker's pane
+  (`identity_id`), never to the spawn's agent ID. The plugin reads one spawn with
+  `hub.workers {spawn_id}` (hub docs, hub.workers). It reads `state` first: `exited` or `failed`,
+  or `not_found` (a closed or unknown spawn), means gone, and `identity_id` is not read then.
+  `running` with an `identity_id` is alive. With no `identity_id`, the pane is waiting when
+  `identity_seen` is false, and ended (the program left, or the conversation resumed in another
+  pane) when it is true. Ended is gone for the plugin. In `hub.workers`, `status` is the pane's
+  program status; the row's lifecycle is `state`.
+- "open" from `hub.spawn` says nothing about the identity: a spawn can be open before its first
+  report. The admitted start keeps its run until the pane has an identity, and waits for
+  `hub.changed {what = "workers"}`. A delete or an action edit during that wait keeps the
+  admitted run. After 10 minutes with no identity the run is `unknown_start`, as a pending start.
+  A spawn that is gone before its first identity got no task: its run goes back to its place in
+  the queue (no notice, no attempt), or is cancelled after a delete.
+- A `/clear` in the worker pane makes a new identity there. The tasks of the old identity go to
+  the new identity in the same spawn as attempt + 1 (the coordinator, 2026-10-23).
+- An agent is its identity only. An ID that it had before (a legacy roster ID) gives it no task
+  and no saved reply. A task that names such an ID is lost once and goes to the identity as
+  attempt + 1; a reply saved under it does not replay. The coordinator accepted this loss for rows
+  from before release 4.3 (2026-10-23). Observation, dated: a read-only copy of the live database
+  had 0 runs and 0 operation replies at about 18:00 UTC on 2026-10-23. That count does not hold
+  for later data.
+- Known hub defects (hub docs, hub.workers): after a hub restart, a pane whose agent exited during
+  the downtime can keep a stale identity; an agent CLI that runs under a shell that stays gives no
+  exit event, so its row stays `running` with its `identity_id`. The plugin then counts that
+  worker alive. The hub owner fixes both; the plugin tests do not cover the shell form.
 - The plugin starts a worker with `hub.spawn` and `for: "user"`, from its own timer. It stores
   the spawn request before the call and replays it with the same key after a lost reply, so a lost
   reply never starts a second worker.
 - A task has an attempt. `automations.done` needs the current attempt.
 - When the worker no longer runs, its delivered tasks go back to the queue and to the next worker
-  with attempt + 1. Only a definite answer counts as "no longer runs": a failed lookup keeps the
-  worker, and the plugin tries again later.
+  with attempt + 1. Only a definite answer counts as "no longer runs": a failed read, or a row
+  that breaks the hub contract (no valid `identity_seen`, or a waiting answer for a worker that had
+  an identity), keeps the worker, and the plugin tries again later.
 
 ## File triggers
 
@@ -312,10 +337,10 @@ cd ../../Automations && lazyrex-hub test
   gives the same result; a file run pruned before its ack makes no second run; a crash between
   prune batches (a backlog written to the tables, an injection that fails the second batch)
   leaves exactly the newest 100; a retry between the prune read and its batch keeps the oldest run.
-- reassign.lua: a lost worker (stopped, or its identity superseded) gives its tasks to the next
-  worker as attempt 2; the old box entry and notice go, and the old attempt is refused; an alias
-  reads its task; a hub crash after the loss (fixed by a gate on the second start) moves the task
-  once.
+- reassign.lua: a lost worker (stopped) gives its tasks to the next
+  worker as attempt 2; the old box entry and notice go, and the old attempt is refused; a new
+  conversation in the worker pane gets the tasks in the same spawn; a hub crash after the loss
+  (fixed by a gate on the second start) moves the task once.
 - save.lua: save checks the action against the hub contract (a tab title of at most 60
   characters) and stores nothing when it refuses; the 9th enabled file automation is refused; `~`
   expands with HOME, and a path outside `watch_roots` shows the grant hint.
@@ -336,6 +361,13 @@ cd ../../Automations && lazyrex-hub test
   and lost remove and ensure replies, converge; files from a disabled time make no run.
 - worker.lua: a failed observation (a hub call that fails) keeps the running worker, and the step
   tries again; a stopped worker is replaced.
+- identity.lua: an open worker with no identity gets no task and no second worker, and its first
+  report delivers; a stop
+  before the report queues the run again at its place; a delete or an action edit during the wait
+  keeps the admitted run; a hub restart during the wait; no report for 10 minutes is
+  `unknown_start`, and after a dismiss a late report gets nothing; a resume in another pane and an
+  agent exit move the task; a legacy roster ID gets no saved reply and no task. Test limit: the
+  harness cannot fake a `hub.workers` reply, so the contract check has no test.
 
 The parity fixture (`tests/parity_fixture.lua`, manifest `test.parity_fixture`) renders the
 views that open only from another view; `test.parity_routes` lists them.
@@ -347,4 +379,5 @@ time zone. Observed on Rex 0.0.1792158932-g88fd41 (lab): Rex Lua honors a zone n
 POSIX rule string (for example `PST8PDT,M3.2.0,M11.1.0`) gives UTC. A `test.env` value with a `/`
 is a path, so `America/Los_Angeles` is refused. Retries use the real clock, so they continue while a test holds
 the test clock still. `tests/support/fixture.lua` writes an agent profile whose worker is
-a real test agent (`lazyrex-hub testagent`), so a test can call the plugin as the worker.
+a real test agent (`lazyrex-hub testagent`), so a test can call the plugin as the worker. The
+pane first reports the identity `claude:w-<spawn's agent ID>`, as an agent CLI's start hook does.
