@@ -65,7 +65,9 @@ test('a crash between delete cleanup batches cancels every queued run once and d
     end
     return true
   end, 30)
-  -- Each run is cancelled once: one terminal sequence each, all different.
+  -- Each run is cancelled once: one terminal sequence each, all different. The map key is a
+  -- string: a large integer key is slow in Rex Lua (docs/rex-protocol.md in the hub, "Rex Lua
+  -- runtime").
   local seqs = {}
   for n = 2, QUEUED + 1 do
     local run = F.run(manual(id, n))
@@ -73,8 +75,8 @@ test('a crash between delete cleanup batches cancels every queued run once and d
     expect(run.agent).to_be(nil)
     expect(run.attempt).to_be(0)
     expect(F.queued(qkey(id, n))).to_be(nil)
-    expect(seqs[run.tseq]).to_be(nil)
-    seqs[run.tseq] = true
+    expect(seqs[tostring(run.tseq)]).to_be(nil)
+    seqs[tostring(run.tseq)] = true
   end
   expect(F.running('worker')).to_be(0)
   -- The started run continues after the delete. Its start has no outcome; dismiss it, and the
