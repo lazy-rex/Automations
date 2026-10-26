@@ -1,32 +1,48 @@
 # Automations
 
-A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. An automation is a trigger and an action:
+A [LazyRex](https://github.com/lazy-rex/LazyRex) plugin. Give your agents recurring work: when a
+new file appears in a directory, or at a daily time, Automations gives a task to an agent. If the
+agent does not run, the plugin starts it from an agent profile first. An automation is a trigger
+and an action:
 
 - Triggers: a new file in a directory, or a schedule (daily at a local time).
 - Action: deliver the run to the automation's worker if it runs; else start a worker from the
   automation's agent profile, then deliver.
 
-Status: in progress. Built: file and daily triggers, manual runs, the worker start, the delivery,
-enable and disable, delete, retry, cancel, dismiss, run retention, the panel and forms, and the
-presets.
+Triggers: a new file and a daily time. The plugin has no other trigger kinds. You can also run an
+automation by hand.
 
-## Install
+## Get it
 
-Check this repository out next to LazyRex, and add the plugin to the hub config:
+Automations is not a core plugin: LazyRex setup does not install it. Add it in **LazyRex:
+Plugins…**, or add an entry to the `plugins` list of the hub config:
 
 ```json
-{"name": "automations", "path": "/path/to/Automations/automations.lua",
- "notice": "Automation task. Call automations_read.",
- "watch_roots": ["/path/to/a/watched/parent"]}
+{"source": "/path/to/Automations", "watch_roots": ["/path/to/a/watched/parent"]}
 ```
 
+The source is the plugin directory. The notice text that a worker gets ("Automation task. Call
+automations_read.") comes from `lazyrex.json`. The plugin uses the LazyRex Plugin SDK
+(`"sdk": "0"`). It needs LazyRex hub v0.5.0-rc.1 or later (the base migration step of the SDK).
+
 A file automation can watch only a directory inside `watch_roots`. The hub reads the config at
-start, so restart the hub after a change. `automations.list` shows a refused watch with a hint.
-The hub refuses a directory that does not exist (`watch_missing`) before it checks the grant.
+start, so restart the hub after a change. If the config gives the plugin no `watch_roots`, the hub
+refuses every watch (`watch_not_granted`). Otherwise the hub refuses a missing directory
+(`watch_missing`) before it checks the root. `automations.list` shows a refused watch with its
+error code. A watch outside `watch_roots` also gets a hint.
+
+## Settings
+
+Plugin args (hub config `plugins[].args`):
+
+- `tick` (default 60): seconds between schedule checks.
+- `recheck` (default 300): seconds before a failed hub step runs again.
+- `settle_ms` (default 1000): the watch settle time, in milliseconds.
+- `clock_file`: a test clock, for tests only.
 
 ## Panel and forms
 
-The palette command "Automations…" opens the side panel. "New Automation…" opens the form.
+**LazyRex: Automations…** opens the side panel. **LazyRex: New Automation…** opens the form.
 
 - The panel lists 20 automations a page (Next page, First page). Each item shows the trigger, the
   watch state, a start that needs action, the queued runs and the last run. A deleting automation
@@ -37,7 +53,7 @@ The palette command "Automations…" opens the side panel. "New Automation…" o
   without a path. A deleting automation shows only its runs, with Cancel and Dismiss.
 - A form has two steps: step 1 chooses the agent profile (50 a page), step 2 has the fields and
   that profile's args. "Change profile…" goes back to step 1 and does not keep the entered fields.
-  A profile whose form is over 40 KB gets a refusal: use `automations.save`.
+  A profile whose form is over 40 KiB gets a refusal: use `automations.save`.
 - The edit route carries the rev. A save after another change is refused (conflict), and the
   message says to reopen the automation.
 - Delete asks for confirmation and says that the run history goes too.
@@ -50,10 +66,13 @@ The palette command "Automations…" opens the side panel. "New Automation…" o
 and `preset`, or with Add on the panel. You choose the profile.
 
 - Vault inbox (`vault-inbox`): a run for each new `*.md` file in `~/knowledge/inbox`, in
-  `~/knowledge`. The live hub must grant `~/knowledge/inbox` in `watch_roots`.
+  `~/knowledge`.
 - Vault health (`vault-health`): a run every day at 22:00, in `~/knowledge`.
 
-A preset installs once: `preset/<name>` names the automation that installed it, and a second
+The vault presets expect a note vault in `~/knowledge`. The hub config must list
+`~/knowledge/inbox`, or a parent of it, in `watch_roots`.
+
+A preset installs once: the row `presets.name` names the automation that installed it, and a second
 install is a conflict. An edit keeps the preset. Delete makes it available again at once; the old
 automation's cleanup never removes a newer install.
 
@@ -88,20 +107,13 @@ notice text into the worker's pane when the worker is ready. The worker reads it
   admitted run. After 10 minutes with no identity the run is `unknown_start`, as a pending start.
   A spawn that is gone before its first identity got no task (no notice, no attempt): its run
   fails, as a refused start does, and Retry starts it again. After a delete it is cancelled. The
-  plugin never starts it again by itself: a profile whose program exits before it reports would
-  loop (observed in the lab on 2026-10-23: 64 spawns in about 2 s, until Rex's window limit).
+  plugin never starts it again by itself. Otherwise, a profile whose program exits before it
+  reports would start new workers without end.
 - A `/clear` in the worker pane makes a new identity there. The tasks of the old identity go to
-  the new identity in the same spawn as attempt + 1 (the coordinator, 2026-10-23).
-- An agent is its identity only. An ID that it had before (a legacy roster ID) gives it no task
-  and no saved reply. A task that names such an ID is lost once and goes to the identity as
-  attempt + 1; a reply saved under it does not replay. The coordinator accepted this loss for rows
-  from before release 4.3 (2026-10-23). Observation, dated: a read-only copy of the live database
-  had 0 runs and 0 operation replies at about 18:00 UTC on 2026-10-23. That count does not hold
-  for later data.
-- Known hub defects (hub docs, hub.workers): after a hub restart, a pane whose agent exited during
-  the downtime can keep a stale identity; an agent CLI that runs under a shell that stays gives no
-  exit event, so its row stays `running` with its `identity_id`. The plugin then counts that
-  worker alive. The hub owner fixes both; the plugin tests do not cover the shell form.
+  the new identity in the same spawn, with attempt + 1.
+- A task goes only to the identity that holds it. A task that names an older agent ID goes back
+  to the queue once, and then to the current identity with attempt + 1. A reply saved under an
+  older ID does not replay.
 - The plugin starts a worker with `hub.spawn` and `for: "user"`, from its own timer. It stores
   the spawn request before the call and replays it with the same key after a lost reply, so a lost
   reply never starts a second worker.
@@ -115,7 +127,8 @@ notice text into the worker's pane when the worker is ready. The worker reads it
 
 A file trigger is `{kind = "file", path, glob?}`: one directory (not recursive) and a glob for the
 file name (default `*`). Save expands a leading `~` with `HOME`. The hub watches the directory
-(`hub.watch`, LazyRex `docs/hub.md`, "File watches").
+(`hub.watch`, LazyRex
+[File watches](https://github.com/lazy-rex/LazyRex/blob/main/docs/hub.md#file-watches-hubwatch)).
 
 - One run for each appearance of a matching file. A file that changes makes no new run. A file that
   is removed and comes back is a new appearance.
@@ -148,7 +161,7 @@ minute and never reads `isdst`.
   stays as a tombstone, and no new run, start or delivery of a queued run commits after it. Then
   the plugin cancels the queued runs. A run that is starting or delivered continues until it ends;
   a lost worker's run is cancelled, not requeued. Then the plugin deletes the markers, the runs and
-  the automation. Each cleanup batch is measured complete and has the state fence. A crash resumes
+  the automation. Each cleanup batch reads and writes its rows in one transaction. A crash resumes
   the cleanup.
 - Retry queues a failed, dismissed or cancelled run again. Its next start uses a new spawn key, and
   its next delivery has attempt + 1. A disabled automation refuses a retry. A file run without a
@@ -156,11 +169,11 @@ minute and never reads `isdst`.
 - Cancel takes only a queued run.
 - A start without an outcome for 10 minutes becomes `unknown_start`. Dismiss ends that run, and the
   plugin never uses that start again. The pane of that start can still appear and be a duplicate
-  worker; stop it with `hub.stop`. The run keeps the dismissed spawn keys in `dismissed`.
+  worker; stop it with `hub.stop`. The run keeps the dismissed spawn keys in `dismissed` (at most 10).
 - Each new start checks the profile again. A profile that is no longer an agent profile fails the
   run before `hub.spawn`.
-- A start that the hub never sent fails with an error that starts with `not_created` (hub Fix A,
-  hub 89cab8f or later). Nothing of it exists, so the plugin starts it again once with a new spawn
+- A start that the hub never sent fails with an error that starts with `not_created` (hub v0.2.0
+  or later). Nothing of it exists, so the plugin starts it again once with a new spawn
   key, without a Retry. That is one automatic restart for each start admission: a second
   failure fails the run. Retry and the requeue of a lost worker's run are new admissions, so each
   can restart once again. A delete stops the restart: after the delete fence, the run fails. A
@@ -204,24 +217,22 @@ The plugin keeps its data in its own SQL database (hub.sql), in one table for ea
 - A marker stays after its run is pruned, until the hub acknowledges the removal of its file.
 - A deleted highest ID is never used again (`meta.next_id`).
 - Saved replies have no expiry (the exports use `store = false` and the `ops` table). An operation
-  key holds the operation kind, the caller ID and the key; a replay looks under every ID of the
-  caller.
+  key holds the operation kind, the caller ID and the key. A replay looks only under the caller's
+  current ID.
 - The engine reads and writes the tables with SQL (`automations_db.lua`): one transaction for each
   engine step or operation, with its notices and its saved reply. An operation reads its rows in
   its own transaction. A cleanup or prune step reads and writes in one transaction: at most
   20 queued runs, or 50 markers or terminal runs. No transaction spans `hub.spawn` or another
   slow hub call: a start stores its request, calls the hub, then stores the result in a second,
   fenced transaction.
-- The schema is one base step, `base = 13` (hub `docs/plugin-sdk.md`, "A base step"). A new
-  database gets the tables above and `meta.rev` = 0, at version 13. It folds the old steps 1 to 13
-  (the old step 13 deleted only the import rows of the copy from hub.store). A database at version
-  13 runs nothing and keeps every row. A database at a version from 1 to 12 refuses to start, and
-  nothing changes. The live database was at version 13 when the coordinator deployed main on
-  2026-10-23 (about 19:28 UTC). The plugin owns the eight tables above and their four indexes
+- The schema is one base step, `base = 13` (LazyRex [docs/plugin-sdk.md](https://github.com/lazy-rex/LazyRex/blob/main/docs/plugin-sdk.md#a-complete-plugin), "A base step"). A new
+  database gets the eight tables, four indexes and `meta.rev` = 0, at version 13. A database at
+  version 13 runs no step. A database at versions 1 to 12 refuses to start and is not changed.
+  The plugin owns the eight tables above and their four indexes
   (`runs_auto`, `runs_delivered`, `runs_q`, `runs_t`). The `lazyrex_*` objects belong to the hub
   SDK; the plugin does not make them.
-- The plugin needs a hub SDK with the base step (hub main a407e08a and later). An older SDK runs
-  the base as step 1 and sets a wrong `user_version`.
+- The plugin needs LazyRex hub v0.5.0-rc.1 or later. An older SDK runs the base as step 1 and
+  sets a wrong `user_version`.
 - After the migrations, the start checks the counters: `meta.rev` must be a valid counter, and
   `next_id` and `next_id_rev` both canonical or both absent. Otherwise the engine starts no work
   and writes nothing, each tool answers `unavailable`, and the panel says why.
@@ -241,19 +252,18 @@ with other content is a conflict.
 ## Tests
 
 The tests are Lua files in `tests/`. `lazyrex-hub test` runs them against the real hub, on an
-isolated lab Rex server that it starts and stops (LazyRex `docs/testing.md`). No test touches your
-own Rex server.
-
-Automations runs on the LazyRex Plugin SDK (manifest `"sdk": "0"`) and hub.sql, on a hub whose SDK
-has the base step `app.db.migrate {base = N}` (hub main a407e08a and later).
-An older SDK runs the base as step 1 of a new database. The suite passes on hub main a407e08a
-(observed 2026-10-23, on the Linux lab host): it uses the SQL test hooks, the test renderer and the
-render counts of `renders()`.
+isolated lab Rex server that it starts and stops (LazyRex
+[docs/testing.md](https://github.com/lazy-rex/LazyRex/blob/main/docs/testing.md#run)). No test
+touches your own Rex server. The suite needs the SQL test hooks, the test renderer and the
+`renders()` counts of hub v0.5.0-rc.1 or later. Run it from the Automations directory, with
+`lazyrex-hub` on `PATH`:
 
 ```sh
-cd ../LazyRex/hub && go build -o ~/bin/lazyrex-hub ./cmd/hub
-cd ../../Automations && lazyrex-hub test
+lazyrex-hub test
 ```
+
+`lazyrex-hub test` needs a LazyRex checkout: `-lazyrex <dir>`, `LAZYREX_DIR`, or `../LazyRex` beside
+the plugin directory.
 
 - deliver.lua: a daily tick starts one worker, which reads and completes its task; a second run
   goes to the running worker; a lost `hub.spawn` reply starts one worker; `done` from another agent
@@ -275,7 +285,7 @@ cd ../../Automations && lazyrex-hub test
   `unknown_start`, and Retry starts one worker with a new key; a lost reply of the restart batch
   and a hub crash after it start key /2 once; after a delete there is no restart; an
   `unknown_start` run (a written fixture) whose start fails as `not_created` is starting again. It
-  needs the spawn-create fault mode `fail-sending` (hub 89cab8f or later). Not covered: a hub
+  needs the spawn-create fault mode `fail-sending` (hub v0.2.0 or later). Not covered: a hub
   crash between the admission and the sending commits (the hub's own tests cover it), and a
   `not_created` call error when the hub cannot store the failure.
 - list.lua: pages of only deleted automations (first and in the middle) keep the cursor going;
@@ -369,9 +379,9 @@ views that open only from another view; `test.parity_routes` lists them.
 The test manifest sets the plugin args `clock_file` (a file with epoch seconds: the test clock),
 `tick` and `recheck` (seconds), and `settle_ms` (the watch settle time). It grants the watch root
 `LAB/inbox` (`test.watch_roots`). It sets `TZ=PST8PDT` (`test.env`), so every lab has the same
-time zone. Observed on Rex 0.0.1792158932-g88fd41 (lab): Rex Lua honors a zone name in `TZ`, and a
+time zone. Observed on Rex build 0.0.1792158932-g88fd41 (lab): Rex Lua honors a zone name in `TZ`, and a
 POSIX rule string (for example `PST8PDT,M3.2.0,M11.1.0`) gives UTC. A `test.env` value with a `/`
 is a path, so `America/Los_Angeles` is refused. Retries use the real clock, so they continue while a test holds
 the test clock still. `tests/support/fixture.lua` writes an agent profile whose worker is
 a real test agent (`lazyrex-hub testagent`), so a test can call the plugin as the worker. The
-pane first reports the identity `claude:w-<spawn's agent ID>`, as an agent CLI's start hook does.
+pane first reports the identity `claude:w-<pane block ID>`, as an agent CLI's start hook does.
